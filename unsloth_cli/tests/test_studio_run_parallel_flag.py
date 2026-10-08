@@ -1028,3 +1028,152 @@ def test_in_venv_path_passes_api_only_to_run_server(
     assert (
         captured.get("emit_tauri_port") is False
     ), f"run_server got emit_tauri_port={captured.get('emit_tauri_port')!r}, expected False"
+
+
+# --allow-memory-overcommit: the load guardrail's override (routes/inference.py
+# _enforce_load_guardrail). It must reach the load payload, the re-exec'd child and,
+# when the guardrail refuses anyway, read as advice rather than a raw JSON body.
+
+_OVERCOMMIT_DETAIL = {
+    "error": "memory_overcommit",
+    "code": "memory_overcommit",
+    "message": "This model probably won't fit: Needs ~38.0 GiB on GPU 0; 23.5 GiB is free. "
+    "Retry with allow_memory_overcommit to load anyway, or change "
+    "Settings > Resources > Load guardrails.",
+    "verdict": {"level": "red", "needs_confirmation": True},
+}
+_OVERCOMMIT_MESSAGE = (
+    "Model load stopped: This model probably won't fit: Needs ~38.0 GiB on GPU 0; "
+    "23.5 GiB is free.\n"
+    "Re-run with --allow-memory-overcommit to load it anyway, or change "
+    "Settings > Resources > Load guardrails in Studio."
+)
+
+
+def test_allow_memory_overcommit_option_is_registered():
+    studio_mod = _load_run_command()
+    import inspect
+
+    opt = inspect.signature(studio_mod.run).parameters["allow_memory_overcommit"].default
+    assert set(getattr(opt, "param_decls", None) or []) == {"--allow-memory-overcommit"}
+    assert getattr(opt, "default", None) is False
+    assert getattr(opt, "rich_help_panel", None) == "Model"
+
+
+@pytest.mark.parametrize("extra,present", [(["--allow-memory-overcommit"], True), ([], False)])
+def test_reexec_forwards_allow_memory_overcommit(monkeypatch, extra, present):
+    """Forwarded only when typed, so an older child never sees an unknown flag by default."""
+    result, captured = _invoke_run(monkeypatch, _BASE + extra)
+    assert len(captured) == 1, result.output
+    argv = captured[0]["argv"]
+    assert ("--allow-memory-overcommit" in argv) is present, argv
+
+
+@pytest.mark.parametrize("allow", [False, True])
+def test_load_model_http_payload_for_allow_memory_overcommit(monkeypatch, allow):
+    studio_mod = _load_run_command()
+    captured = {}
+
+    def urlopen(request, timeout):
+        captured["request"] = request
+        return BytesIO(b'{"model": "owner/model-GGUF"}')
+
+    monkeypatch.setattr(studio_mod, "_direct_urlopen", urlopen)
+    studio_mod._load_model_via_http(
+        port = 8888,
+        api_key = "sk-test",
+        model = "owner/model-GGUF",
+        gguf_variant = None,
+        max_seq_length = 0,
+        load_in_4bit = True,
+        allow_memory_overcommit = allow,
+    )
+
+    payload = json.loads(captured["request"].data)
+    assert payload.get("allow_memory_overcommit", "omitted") == (True if allow else "omitted")
+
+
+@pytest.mark.parametrize("arrives", ["http_409", "in_band"])
+def test_load_model_http_reports_a_memory_overcommit_refusal(monkeypatch, arrives):
+    studio_mod = _load_run_command()
+
+    def urlopen(request, timeout):
+        if arrives == "http_409":
+            body = json.dumps({"detail": _OVERCOMMIT_DETAIL}).encode()
+            raise studio_mod.urllib.error.HTTPError(
+                request.full_url, 409, "Conflict", None, BytesIO(body)
+            )
+        return BytesIO(
+            b"  "
+            + json.dumps(
+                {"_deferred_error": {"status_code": 409, "detail": _OVERCOMMIT_DETAIL}}
+            ).encode()
+        )
+
+    monkeypatch.setattr(studio_mod, "_direct_urlopen", urlopen)
+    with pytest.raises(studio_mod._LoadRefused) as excinfo:
+        studio_mod._load_model_via_http(
+            port = 8888,
+            api_key = "sk-test",
+            model = "owner/model-GGUF",
+            gguf_variant = None,
+            max_seq_length = 0,
+            load_in_4bit = True,
+        )
+    assert str(excinfo.value) == _OVERCOMMIT_MESSAGE
+
+
+def test_in_venv_run_prints_a_memory_overcommit_refusal_cleanly(
+    monkeypatch, tmp_path, stub_tool_policy_state
+):
+    """The flag reaches the load, and the refusal is printed as-is, without 'Error: '."""
+    import types
+
+    studio_mod = _load_run_command()
+    fake_venv = tmp_path / "studio" / "venv" / "unsloth_studio"
+    monkeypatch.setattr(sys, "prefix", str(fake_venv))
+    monkeypatch.setattr(studio_mod, "STUDIO_HOME", fake_venv.parent)
+
+    from unsloth_cli import _tool_policy as _tp_mod
+
+    monkeypatch.setattr(_tp_mod, "resolve_tool_policy", lambda host, flag, yes, silent: False)
+
+    class _App:
+        class state:
+            server_port = 8888
+            server_request_host = "127.0.0.1"
+
+    backend = types.ModuleType("studio.backend.run")
+    backend.run_server = lambda **_kwargs: _App()
+    backend._server = object()
+    backend._graceful_shutdown = lambda server: None
+    monkeypatch.setitem(sys.modules, "studio.backend.run", backend)
+    monkeypatch.setattr(studio_mod, "_RUN_MODULE", backend)
+    monkeypatch.setattr(studio_mod, "_wait_for_server", lambda port, **_kwargs: True)
+    monkeypatch.setattr(studio_mod, "_create_api_key_inprocess", lambda name: "sk-unsloth-test")
+    loads = []
+
+    def refuse(**kwargs):
+        loads.append(kwargs)
+        raise studio_mod._LoadRefused(_OVERCOMMIT_MESSAGE)
+
+    monkeypatch.setattr(studio_mod, "_load_model_via_http", refuse)
+
+    import typer as _typer
+
+    app = _typer.Typer()
+    app.command(
+        context_settings = {
+            "allow_extra_args": True,
+            "ignore_unknown_options": True,
+        },
+    )(studio_mod.run)
+    result = CliRunner().invoke(
+        app, _BASE + ["--silent", "--allow-memory-overcommit"], catch_exceptions = True
+    )
+
+    assert result.exit_code == 1, result.output
+    assert loads and loads[0]["allow_memory_overcommit"] is True
+    combined = (result.output or "") + (getattr(result, "stderr", "") or "")
+    assert _OVERCOMMIT_MESSAGE + "\n" in combined
+    assert "Error: Model load stopped" not in combined

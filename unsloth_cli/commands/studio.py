@@ -1660,6 +1660,10 @@ def _enforce_password_change_before_exposure(
         conn.close()
 
 
+class _LoadRefused(RuntimeError):
+    """A load the server declined before evicting anything; its text is the whole message."""
+
+
 def _load_model_via_http(
     port: int,
     api_key: str,
@@ -1676,12 +1680,17 @@ def _load_model_via_http(
     request_host: str = "127.0.0.1",
     engine: str = "auto",
     engine_precision: str = "auto",
+    allow_memory_overcommit: bool = False,
 ) -> dict:
     import json
     import urllib.request
     import urllib.error
 
-    from unsloth_cli._inference import raise_for_deferred_error, require_completed_padded_body
+    from unsloth_cli._inference import (
+        memory_overcommit_refusal,
+        raise_for_deferred_error,
+        require_completed_padded_body,
+    )
 
     payload: dict = {
         "model_path": model,
@@ -1704,6 +1713,8 @@ def _load_model_via_http(
     if engine != "auto":
         payload["engine"] = engine
         payload["engine_precision"] = engine_precision
+    if allow_memory_overcommit:
+        payload["allow_memory_overcommit"] = True
 
     data = json.dumps(payload).encode()
     url = f"http://{_url_host(request_host)}:{port}/api/inference/load"
@@ -1726,6 +1737,9 @@ def _load_model_via_http(
         return require_completed_padded_body(url, raise_for_deferred_error(url, body))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors = "replace")
+        refusal = memory_overcommit_refusal(body)
+        if refusal:
+            raise _LoadRefused(refusal) from exc
         raise RuntimeError(f"Model load failed (HTTP {exc.code}): {body}") from exc
 
 
@@ -2480,6 +2494,13 @@ def run(
             "decode speed, MoE usually don't."
         ),
     ),
+    allow_memory_overcommit: bool = typer.Option(
+        False,
+        "--allow-memory-overcommit",
+        rich_help_panel = _RUN_PANEL_MODEL,
+        help = "Load even if Studio's memory check says the model probably won't fit. The "
+        "load may fail with an out-of-memory error.",
+    ),
     engine: Literal["auto", "vllm", "sglang"] = typer.Option(
         "auto",
         "--engine",
@@ -2767,6 +2788,9 @@ def run(
             args.append("--no-cloudflare")
         args.append("--secure" if secure else "--no-secure")
         args.append("--tensor-parallel" if tensor_parallel else "--no-tensor-parallel")
+        # Only when set: a child too old to know the flag would pass it on to llama-server.
+        if allow_memory_overcommit:
+            args.append("--allow-memory-overcommit")
         if engine != "auto":
             args.extend(["--engine", engine, "--engine-precision", engine_precision])
         if verbose:
@@ -2869,9 +2893,10 @@ def run(
                 request_host = request_host,
                 engine = engine,
                 engine_precision = engine_precision,
+                allow_memory_overcommit = allow_memory_overcommit,
             )
         except RuntimeError as exc:
-            typer.echo(f"Error: {exc}", err = True)
+            typer.echo(str(exc) if isinstance(exc, _LoadRefused) else f"Error: {exc}", err = True)
             raise typer.Exit(1)
     except BaseException:
         _graceful_shutdown(_server)

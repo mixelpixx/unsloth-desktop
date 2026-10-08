@@ -2132,6 +2132,228 @@ def test_server_load_sends_load_in_4bit_only_when_typed(monkeypatch, command, fl
     assert payloads[0].get("load_in_4bit", "omitted") == expected
 
 
+@pytest.mark.parametrize("command", ["chat", "inference"])
+@pytest.mark.parametrize(
+    ("flags", "expected"), [([], "omitted"), (["--allow-memory-overcommit"], True)]
+)
+def test_server_load_sends_allow_memory_overcommit_only_when_typed(
+    monkeypatch, command, flags, expected
+):
+    from unsloth_cli import _inference
+
+    module, app, argv = _command_and_argv(command)
+    opt = _option(getattr(module, command), "allow_memory_overcommit")
+    assert tuple(getattr(opt, "param_decls", None) or ()) == ("--allow-memory-overcommit",)
+    assert getattr(opt, "default", None) is False
+    payloads = []
+
+    def fake_request(
+        self,
+        method,
+        path,
+        payload = None,
+        timeout = None,
+    ):
+        payloads.append(payload)
+        return _FakeLoadResponse()
+
+    monkeypatch.delenv("UNSLOTH_STUDIO_URL", raising = False)
+    monkeypatch.setattr(_inference, "find_studio_server", lambda: "http://127.0.0.1:8888")
+    monkeypatch.setattr(_inference, "verify_studio_identity", lambda base: True)
+    monkeypatch.setattr(_inference, "_studio_token", lambda: "token")
+    monkeypatch.setattr(HttpChatBackend, "_request", fake_request)
+    monkeypatch.setattr(HttpChatBackend, "stream", lambda self, *a, **k: iter(["answer"]))
+    monkeypatch.setattr(module, "load_chat_backend", lambda *a, **k: pytest.fail("loaded locally"))
+    if command == "chat":
+        monkeypatch.setattr(chatmod, "resolve_model_config", lambda *a, **k: _FakeConfig())
+        monkeypatch.setattr(chatmod, "_compare_needs_second_model", lambda: False)
+
+    result = CliRunner().invoke(app, [*argv, *flags], input = "/exit\n")
+
+    assert result.exit_code == 0, result.output
+    payloads = [p for p in payloads if p is not None]
+    assert len(payloads) == 1
+    assert payloads[0].get("allow_memory_overcommit", "omitted") == expected
+
+
+@pytest.mark.parametrize("command", ["chat", "inference"])
+def test_in_process_load_never_sees_allow_memory_overcommit(monkeypatch, command):
+    """The in-process loader has no guardrail to override, and no such keyword."""
+    module, app, argv = _command_and_argv(command)
+    local_loads = []
+
+    class _LocalBackend:
+        def stream(self, messages, **kwargs):
+            return iter(["answer"])
+
+        def close(self):
+            pass
+
+    def load_chat_backend(model, **kwargs):
+        local_loads.append(kwargs)
+        return _LocalBackend()
+
+    monkeypatch.setattr(module, "load_chat_backend", load_chat_backend)
+    if command == "chat":
+        monkeypatch.setattr(chatmod, "resolve_model_config", lambda *a, **k: _FakeConfig())
+        monkeypatch.setattr(chatmod, "_compare_needs_second_model", lambda: False)
+
+    result = CliRunner().invoke(
+        app, [*argv, "--no-server", "--allow-memory-overcommit"], input = "/exit\n"
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(local_loads) == 1
+    assert "allow_memory_overcommit" not in local_loads[0]
+
+
+# ── The load guardrail's refusal (routes/inference.py _enforce_load_guardrail) ──
+
+_OVERCOMMIT_DETAIL = {
+    "error": "memory_overcommit",
+    "code": "memory_overcommit",
+    "message": "This model probably won't fit: Needs ~38.0 GiB on GPU 0; 23.5 GiB is free. "
+    "Retry with allow_memory_overcommit to load anyway, or change "
+    "Settings > Resources > Load guardrails.",
+    "verdict": {"level": "red", "needs_confirmation": True},
+}
+_OVERCOMMIT_MESSAGE = (
+    "Model load stopped: This model probably won't fit: Needs ~38.0 GiB on GPU 0; "
+    "23.5 GiB is free.\n"
+    "Re-run with --allow-memory-overcommit to load it anyway, or change "
+    "Settings > Resources > Load guardrails in Studio."
+)
+
+
+def _overcommit_conflict():
+    import io
+    import urllib.error
+
+    body = json.dumps({"detail": _OVERCOMMIT_DETAIL}).encode()
+    return urllib.error.HTTPError(
+        "http://x/api/inference/load", 409, "Conflict", None, io.BytesIO(body)
+    )
+
+
+def _deferred_overcommit():
+    import urllib.error
+
+    from unsloth_cli._inference import raise_for_deferred_error
+
+    try:
+        raise_for_deferred_error(
+            "http://x/api/inference/load",
+            {"_deferred_error": {"status_code": 409, "detail": _OVERCOMMIT_DETAIL}},
+        )
+    except urllib.error.HTTPError as exc:
+        return exc
+    raise AssertionError("raise_for_deferred_error passed a deferred error through")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(_overcommit_conflict, id = "http_error_409"),
+        pytest.param(_deferred_overcommit, id = "http_error_in_band"),
+        pytest.param(lambda: json.dumps({"detail": _OVERCOMMIT_DETAIL}), id = "body_text"),
+        pytest.param(lambda: {"detail": _OVERCOMMIT_DETAIL}, id = "body"),
+        pytest.param(lambda: dict(_OVERCOMMIT_DETAIL), id = "detail"),
+        # What _http_error_detail returns for an in-band refusal: the detail as JSON text.
+        pytest.param(lambda: json.dumps(_OVERCOMMIT_DETAIL), id = "detail_text"),
+    ],
+)
+def test_memory_overcommit_refusal_reads_every_shape(error):
+    from unsloth_cli._inference import memory_overcommit_refusal
+
+    assert memory_overcommit_refusal(error()) == _OVERCOMMIT_MESSAGE
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        None,
+        "CUDA out of memory",
+        "null",
+        {"detail": "A chat is still generating."},
+        {"detail": {"error": "active_generations", "message": "Stop the chats first."}},
+        RuntimeError("Model load failed"),
+    ],
+)
+def test_memory_overcommit_refusal_ignores_other_errors(error):
+    from unsloth_cli._inference import memory_overcommit_refusal
+
+    assert memory_overcommit_refusal(error) is None
+
+
+def test_memory_overcommit_refusal_without_a_message_still_names_the_flag():
+    from unsloth_cli._inference import memory_overcommit_refusal
+
+    message = memory_overcommit_refusal({"code": "memory_overcommit"})
+    assert message.startswith("Model load stopped: ")
+    assert "--allow-memory-overcommit" in message.splitlines()[1]
+
+
+def test_http_backend_load_sends_allow_memory_overcommit_only_when_set(monkeypatch):
+    backend = HttpChatBackend("http://localhost:8888", "token")
+    requests = []
+    monkeypatch.setattr(
+        backend,
+        "_request",
+        lambda method, path, payload = None, timeout = None: (
+            requests.append(payload),
+            _FakeLoadResponse(),
+        )[1],
+    )
+
+    backend.ensure_loaded("org/model-GGUF", hf_token = None, max_seq_length = 0, load_in_4bit = True)
+    backend.ensure_loaded(
+        "org/model-GGUF",
+        hf_token = None,
+        max_seq_length = 0,
+        load_in_4bit = True,
+        allow_memory_overcommit = True,
+    )
+
+    loads = [p for p in requests if p is not None]
+    assert "allow_memory_overcommit" not in loads[0]
+    assert loads[1]["allow_memory_overcommit"] is True
+
+
+@pytest.mark.parametrize("arrives", ["http_409", "in_band"])
+def test_http_backend_load_reports_a_memory_overcommit_refusal(monkeypatch, capsys, arrives):
+    backend = HttpChatBackend("http://localhost:8888", "token")
+
+    def fake_request(
+        method,
+        path,
+        payload = None,
+        timeout = None,
+    ):
+        if path != "/api/inference/load":
+            raise OSError("status unavailable")
+        if arrives == "http_409":
+            raise _overcommit_conflict()
+        return _FakeLoadResponse(
+            b"  "
+            + json.dumps(
+                {"_deferred_error": {"status_code": 409, "detail": _OVERCOMMIT_DETAIL}}
+            ).encode()
+        )
+
+    monkeypatch.setattr(backend, "_request", fake_request)
+
+    with pytest.raises(typer.Exit) as excinfo:
+        backend.ensure_loaded(
+            "org/model-GGUF", hf_token = None, max_seq_length = 0, load_in_4bit = True
+        )
+
+    assert excinfo.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert err.endswith(_OVERCOMMIT_MESSAGE + "\n")
+    assert "Model load failed" not in err
+    assert "Retry with allow_memory_overcommit" not in err
+
+
 @pytest.mark.parametrize(
     ("model", "display_name", "picked", "resident", "banner"),
     [

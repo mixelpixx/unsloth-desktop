@@ -123,6 +123,62 @@ def test_bare_attach_does_not_query_status(monkeypatch):
     assert not any(url.endswith("/api/inference/status") for _, url in server.requests)
 
 
+def test_allow_memory_overcommit_alone_still_attaches_without_status(monkeypatch):
+    """A permission for the load, not a load setting: alone it must not infer a reload."""
+    server = FakeServer(
+        [dict(RESIDENT)],
+        {"is_gguf": True, "active_model": RESIDENT["id"], "model_identifier": RESIDENT["id"]},
+    ).install(monkeypatch)
+
+    load = start_cli.LoadOptions(allow_memory_overcommit = True)
+    entry = start_cli._resolve_model(BASE, KEY, None, load)
+
+    assert load.overrides() == frozenset()
+    assert server.loads == []
+    assert entry["id"] == RESIDENT["id"]
+    assert not any(url.endswith("/api/inference/status") for _, url in server.requests)
+
+
+def test_allow_memory_overcommit_does_not_reload_the_named_resident(loads):
+    start_cli._resolve_model(
+        BASE, KEY, RESIDENT["id"], start_cli.LoadOptions(allow_memory_overcommit = True)
+    )
+    assert loads == []
+
+
+def test_allow_memory_overcommit_rides_on_a_load_the_command_makes(monkeypatch):
+    server = FakeServer(
+        [dict(RESIDENT)],
+        {"is_gguf": False, "active_model": RESIDENT["id"], "model_identifier": RESIDENT["id"]},
+    ).install(monkeypatch)
+
+    start_cli._resolve_model(
+        BASE, KEY, "unsloth/Qwen3-14B", start_cli.LoadOptions(allow_memory_overcommit = True)
+    )
+
+    assert sent(server) == {"model_path": "unsloth/Qwen3-14B", "allow_memory_overcommit": True}
+
+
+def test_allow_memory_overcommit_is_not_a_resident_mismatch(monkeypatch):
+    """Riding on an inferred reload, it neither counts as a difference nor gets carried."""
+    status = {
+        "is_gguf": True,
+        "active_model": RESIDENT["id"],
+        "model_identifier": RESIDENT["id"],
+        "gguf_variant": "Q4_K_M",
+        "requested_context_length": 32768,
+    }
+    load = start_cli.LoadOptions(max_seq_length = 32768, allow_memory_overcommit = True)
+    assert start_cli._load_settings_differ(status, load, load.overrides()) is False
+    server = FakeServer([dict(RESIDENT)], status).install(monkeypatch)
+
+    start_cli._resolve_model(BASE, KEY, None, load)
+
+    assert server.loads[0]["allow_memory_overcommit"] is True
+    assert "force_reload" not in server.loads[0]
+    assert "allow_memory_overcommit" not in start_cli._RESIDENT_RUNTIME_FIELDS.values()
+
+
 def test_path_loaded_resident_is_reloaded_by_its_real_path(monkeypatch):
     """The load carries the identifier from status, not the advertised basename."""
     path = "/srv/models/Foo-Q4_K_M.gguf"
@@ -494,6 +550,15 @@ class TestExplicitFlagsThroughTheRealCli:
         assert "max_seq_length" in load.supplied
         # overrides() is what _resolve_model reads; supplied alone never reaches the load.
         assert "max_seq_length" in load.overrides()
+
+    @pytest.mark.parametrize("command", AGENT_COMMANDS)
+    def test_every_agent_command_takes_allow_memory_overcommit(self, command):
+        load = self._load_for([command, "--no-launch", "--allow-memory-overcommit"])
+        assert load.allow_memory_overcommit is True
+        # A per-request permission: typing it must not make the command reload the resident.
+        assert load.supplied == frozenset()
+        assert load.overrides() == frozenset()
+        assert self._load_for([command, "--no-launch"]).allow_memory_overcommit is False
 
 
 def test_inferred_reload_carries_the_resident_runtime_settings(monkeypatch):

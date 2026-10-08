@@ -234,6 +234,12 @@ def chat(
             "tokens, e.g. --llama-extra-arg=--top-k --llama-extra-arg 20."
         ),
     ),
+    allow_memory_overcommit: bool = typer.Option(
+        False,
+        "--allow-memory-overcommit",
+        help = "Load even if Studio's memory check says the model probably won't fit. The "
+        "load may fail with an out-of-memory error. Applies to a running Unsloth server.",
+    ),
     think: bool = typer.Option(
         False,
         "--think/--no-think",
@@ -315,7 +321,10 @@ def chat(
     chat_backend = (
         None
         if (no_server or is_mlx_distributed)
-        else connect_studio_server(model, **server_load_opts(ctx, load_opts))
+        else connect_studio_server(
+            model,
+            **server_load_opts(ctx, load_opts, allow_memory_overcommit = allow_memory_overcommit),
+        )
     )
     server_mode = chat_backend is not None
     if server_mode and should_print:

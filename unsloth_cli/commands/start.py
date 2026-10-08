@@ -41,6 +41,7 @@ from unsloth_cli._inference import (
     ensure_studio_backend_path,
     find_studio_server,
     is_loopback_url,
+    memory_overcommit_refusal,
     raise_for_deferred_error,
     require_completed_padded_body,
     urlopen_no_redirect,
@@ -236,6 +237,13 @@ _GPU_MEMORY_MODE_OPTION = typer.Option(
         "placement and sizing to llama.cpp --fit. Omit when attaching to preserve "
         "the running model's mode."
     ),
+)
+_ALLOW_MEMORY_OVERCOMMIT_OPTION = typer.Option(
+    False,
+    "--allow-memory-overcommit",
+    rich_help_panel = _PANEL_MODEL,
+    help = "Load even if Studio's memory check says the model probably won't fit. The load "
+    "may fail with an out-of-memory error.",
 )
 
 # Server knobs. Tool flags only configure a server `unsloth start` auto-starts (--serve); reasoning rides in the agent's own config where it can.
@@ -648,6 +656,8 @@ class LoadOptions(NamedTuple):
     gpu_memory_mode: Optional[Literal["auto", "manual"]] = None
     # Names the user actually typed: --context-length 0 equals the declared default yet is a reset the server must hear. Appended last to keep positional callers working.
     supplied: frozenset = frozenset()
+    # Permission for this one load request, not a model setting: kept out of overrides() and _LOAD_OPTION_PARAMS, so it never forces a load, an inferred reload or a resident mismatch on its own.
+    allow_memory_overcommit: bool = False
 
     def overrides(self) -> frozenset:
         """Fields that must reach the load: typed explicitly, or differing from default."""
@@ -693,7 +703,13 @@ def _supplied_load_params(ctx) -> frozenset:
 
 
 def _load_options(
-    ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
+    ctx,
+    gguf_variant,
+    max_seq_length,
+    load_in_4bit,
+    tensor_parallel,
+    gpu_memory_mode,
+    allow_memory_overcommit = False,
 ) -> LoadOptions:
     """Build LoadOptions for an agent command, recording what was typed."""
     return LoadOptions(
@@ -703,6 +719,7 @@ def _load_options(
         tensor_parallel,
         gpu_memory_mode,
         _supplied_load_params(ctx),
+        allow_memory_overcommit,
     )
 
 
@@ -881,7 +898,9 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
 def _fail_request(exc: Exception, error: str) -> NoReturn:
     """Fail with `error` plus whatever the server or the transport gave as a reason."""
     if isinstance(exc, urllib.error.HTTPError):
-        _fail(f"{error}: {_http_error_detail(exc)}")
+        detail = _http_error_detail(exc)
+        # The load guardrail's refusal reads as advice, not as its raw detail dict.
+        _fail(memory_overcommit_refusal(detail) or f"{error}: {detail}")
     _fail(f"{error}: {getattr(exc, 'reason', None) or exc}")
 
 
@@ -1385,6 +1404,8 @@ def _start_studio_server(
         command += ["--tensor-parallel"]
     if load.gpu_memory_mode is not None:
         command += ["--gpu-memory-mode", load.gpu_memory_mode]
+    if load.allow_memory_overcommit:
+        command += ["--allow-memory-overcommit"]
 
     log_path = Path(tempfile.gettempdir()) / f"unsloth-start-server-{os.getpid()}.log"
     typer.echo("Starting Unsloth server")
@@ -2298,6 +2319,8 @@ def _resolve_model(
             )
             if load.gpu_memory_mode == "manual" and not already_manual:
                 payload["gpu_layers"] = -1
+        if load.allow_memory_overcommit:
+            payload["allow_memory_overcommit"] = True
         if (
             attach_public_id is not None
             and inferred_differs
@@ -6086,6 +6109,7 @@ def claude(
     load_in_4bit: bool = _LOAD_4BIT_OPTION,
     tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
     gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
+    allow_memory_overcommit: bool = _ALLOW_MEMORY_OVERCOMMIT_OPTION,
     enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
     tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
     tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
@@ -6131,7 +6155,13 @@ def claude(
         api_key,
         model,
         _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
+            ctx,
+            gguf_variant,
+            max_seq_length,
+            load_in_4bit,
+            tensor_parallel,
+            gpu_memory_mode,
+            allow_memory_overcommit,
         ),
         serve = serve,
         launch = launch,
@@ -6216,6 +6246,7 @@ def codex(
     load_in_4bit: bool = _LOAD_4BIT_OPTION,
     tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
     gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
+    allow_memory_overcommit: bool = _ALLOW_MEMORY_OVERCOMMIT_OPTION,
     enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
     tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
     tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
@@ -6269,7 +6300,13 @@ def codex(
         api_key,
         model,
         _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
+            ctx,
+            gguf_variant,
+            max_seq_length,
+            load_in_4bit,
+            tensor_parallel,
+            gpu_memory_mode,
+            allow_memory_overcommit,
         ),
         serve = serve,
         launch = launch,
@@ -6350,6 +6387,7 @@ def openclaw(
     load_in_4bit: bool = _LOAD_4BIT_OPTION,
     tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
     gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
+    allow_memory_overcommit: bool = _ALLOW_MEMORY_OVERCOMMIT_OPTION,
     enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
     tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
     tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
@@ -6395,7 +6433,13 @@ def openclaw(
         api_key,
         model,
         _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
+            ctx,
+            gguf_variant,
+            max_seq_length,
+            load_in_4bit,
+            tensor_parallel,
+            gpu_memory_mode,
+            allow_memory_overcommit,
         ),
         serve = serve,
         launch = launch,
@@ -6452,6 +6496,7 @@ def opencode(
     load_in_4bit: bool = _LOAD_4BIT_OPTION,
     tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
     gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
+    allow_memory_overcommit: bool = _ALLOW_MEMORY_OVERCOMMIT_OPTION,
     enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
     tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
     tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
@@ -6495,7 +6540,13 @@ def opencode(
         api_key,
         model,
         _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
+            ctx,
+            gguf_variant,
+            max_seq_length,
+            load_in_4bit,
+            tensor_parallel,
+            gpu_memory_mode,
+            allow_memory_overcommit,
         ),
         serve = serve,
         launch = launch,
@@ -6631,6 +6682,7 @@ def hermes(
     load_in_4bit: bool = _LOAD_4BIT_OPTION,
     tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
     gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
+    allow_memory_overcommit: bool = _ALLOW_MEMORY_OVERCOMMIT_OPTION,
     enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
     tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
     tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
@@ -6674,7 +6726,13 @@ def hermes(
         api_key,
         model,
         _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
+            ctx,
+            gguf_variant,
+            max_seq_length,
+            load_in_4bit,
+            tensor_parallel,
+            gpu_memory_mode,
+            allow_memory_overcommit,
         ),
         serve = serve,
         launch = launch,
@@ -6712,6 +6770,7 @@ def pi(
     load_in_4bit: bool = _LOAD_4BIT_OPTION,
     tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
     gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
+    allow_memory_overcommit: bool = _ALLOW_MEMORY_OVERCOMMIT_OPTION,
     enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
     tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
     tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
@@ -6760,7 +6819,13 @@ def pi(
         api_key,
         model,
         _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
+            ctx,
+            gguf_variant,
+            max_seq_length,
+            load_in_4bit,
+            tensor_parallel,
+            gpu_memory_mode,
+            allow_memory_overcommit,
         ),
         serve = serve,
         launch = launch,
@@ -6855,6 +6920,7 @@ def dsh(
     load_in_4bit: bool = _LOAD_4BIT_OPTION,
     tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
     gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
+    allow_memory_overcommit: bool = _ALLOW_MEMORY_OVERCOMMIT_OPTION,
     enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
     tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
     tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
@@ -6893,7 +6959,13 @@ def dsh(
         api_key,
         model,
         _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
+            ctx,
+            gguf_variant,
+            max_seq_length,
+            load_in_4bit,
+            tensor_parallel,
+            gpu_memory_mode,
+            allow_memory_overcommit,
         ),
         serve = serve,
         launch = launch,
@@ -6927,6 +6999,7 @@ def vibe(
     load_in_4bit: bool = _LOAD_4BIT_OPTION,
     tensor_parallel: bool = _TENSOR_PARALLEL_OPTION,
     gpu_memory_mode: Optional[Literal["auto", "manual"]] = _GPU_MEMORY_MODE_OPTION,
+    allow_memory_overcommit: bool = _ALLOW_MEMORY_OVERCOMMIT_OPTION,
     enable_tools: Optional[bool] = _ENABLE_TOOLS_OPTION,
     tool_call_healing: Optional[bool] = _TOOL_CALL_HEALING_OPTION,
     tool_call_nudging: Optional[bool] = _TOOL_CALL_NUDGING_OPTION,
@@ -6965,7 +7038,13 @@ def vibe(
         api_key,
         model,
         _load_options(
-            ctx, gguf_variant, max_seq_length, load_in_4bit, tensor_parallel, gpu_memory_mode
+            ctx,
+            gguf_variant,
+            max_seq_length,
+            load_in_4bit,
+            tensor_parallel,
+            gpu_memory_mode,
+            allow_memory_overcommit,
         ),
         serve = serve,
         launch = launch,

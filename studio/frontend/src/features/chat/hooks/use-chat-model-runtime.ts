@@ -152,6 +152,7 @@ import {
   replayMaxTokensCap,
 } from "../presets/preset-policy";
 import { recordLastLocalModelLoad } from "../utils/last-local-model-load";
+import { confirmFitBeforeUnload } from "../utils/load-fit-preflight";
 import {
   nextServerModelPollDelay,
   SERVER_MODEL_POLL_MIN_MS,
@@ -181,6 +182,7 @@ import {
   savedContextPin,
   type PerModelConfig,
   loadedContextFields,
+  fetchMemoryEstimate,
 } from "@/features/model-picker";
 import {
   invalidateLlamaFlagCatalog,
@@ -936,6 +938,8 @@ export function useChatModelRuntime() {
   const loadAbortRef = useRef<AbortController | null>(null);
   const loadingModelRef = useRef<typeof loadingModel>(null);
   const loadToastIdRef = useRef<string | number | null>(null);
+  // Rewrites the load toast while the memory guardrail's question is open; null outside a load.
+  const loadToastAskingRef = useRef<((asking: boolean) => void) | null>(null);
   const loadToastDismissedRef = useRef(false);
   const cancelUnloadPendingRef = useRef(false);
   const loadLifecycleLeaseRef = useRef<ModelLifecycleLease | null>(null);
@@ -955,6 +959,7 @@ export function useChatModelRuntime() {
     loadingModelRef.current = null;
     loadAbortRef.current = null;
     loadToastIdRef.current = null;
+    loadToastAskingRef.current = null;
     setLoadToastDismissedState(false);
     if (inFlight) {
       useChatRuntimeStore.getState().clearLoadingModelPick(pickOf(inFlight));
@@ -2492,61 +2497,16 @@ export function useChatModelRuntime() {
               ? (await consumeNativePathToken(nativePathToken, "load-model")).nativePathLease
               : undefined;
 
-            stopQueuedRuns(stopDecision, keepsOthers || touchesOnlySelected);
-            // A settings reload is in place, so a failed one must roll back even with others kept.
-            if (currentCheckpoint && !keepsOthers) {
-              // With chats generating, skip this preliminary unload: it cancels them ahead of /load's
-              // preflight, so a rejected target truncates replies for a model that never loads. Idle,
-              // unload first and free VRAM early.
-              // A reload of one of several stays in its own slot: /load replaces it there.
-              if (!forceCancelActive && !touchesOnlySelected) {
-                await unloadModel({ model_path: currentCheckpoint });
-                // Only a real /unload removes the resident model. The forced path leaves
-                // it to /load, so cancellation must not treat it as gone.
-                loadRun.residentModelUnloaded = true;
-              }
-              // Set either way: /load can still leave no model resident, and an unneeded rollback hits
-              // already_loaded before the gate.
-              previousWasUnloaded = true;
-            }
-            if (abortCtrl.signal.aborted) throw new Error("Cancelled");
-
             // On a model switch, fall back to the persisted standing preference rather than null so a
             // per-session forced MTP mode cannot follow the user onto a model without an MTP head.
             // spec_draft_n_max is MTP-only and always resets, and the loaded shadow is seeded to prevent a
             // transient dirty Apply. keepSpeculative skips this for a staged Load.
+            // Read before anything is unloaded: these only shape the request, and the store reset
+            // they belong with waits below until the guardrail has had its say.
+            const persistedSpeculativeType = resetsPerModelSettings
+              ? readPersistedSpeculativeType()
+              : null;
             if (resetsPerModelSettings) {
-              const persistedSpeculativeType = readPersistedSpeculativeType();
-              useChatRuntimeStore.setState({
-                speculativeType: persistedSpeculativeType,
-                loadedSpeculativeType: persistedSpeculativeType,
-                specDraftNMax: null,
-                loadedSpecDraftNMax: null,
-                // Per-model too: a different model follows the server default unless its staged config overrides it.
-                nParallel: null,
-                loadedNParallel: null,
-                reasoningBudget: -1,
-                loadedReasoningBudget: null,
-                loadedReasoningBudgetRequested: null,
-                reasoningBudgetMessage: "",
-                loadedReasoningBudgetMessage: null,
-                loadedReasoningBudgetMessageRequested: null,
-                nBatch: null,
-                loadedNBatch: null,
-                nUbatch: null,
-                loadedNUbatch: null,
-                // Per-model too, and cleared in both halves: a baseline left from the model that just went would
-                // be re-sent by a later rollback.
-                ...clearedServerTuningState(),
-                // Per-model GPU knobs must not follow onto a different model (gpuMemoryMode is standing and is kept).
-                selectedGpuIds: null,
-                selectedGpuIndexKind: null,
-                gpuLayers: GPU_LAYERS_AUTO,
-                nCpuMoe: 0,
-                splitRatio: null,
-                // A Manual+Auto context pin is per-model; clear it so a different model loads at Auto/native.
-                customContextLength: null,
-              });
               loadSpeculativeType =
                 pendingLoadConfig?.speculativeType != null
                   ? normalizeSpeculativeType(pendingLoadConfig.speculativeType)
@@ -2638,6 +2598,104 @@ export function useChatModelRuntime() {
             );
             const effectiveChatTemplateOverride =
               loadChatTemplateOverride?.trim() ? loadChatTemplateOverride : null;
+            // A switch unloads the outgoing model before /load, so /load's own refusal would come with
+            // nothing left to protect and Cancel would mean reloading it. Ask the guardrail first. A
+            // native-path pick skips it: its lease is spent by the load, not by an estimate.
+            const unloadsResidentFirst = Boolean(
+              currentCheckpoint && !keepsOthers && !forceCancelActive && !touchesOnlySelected,
+            );
+            const allowMemoryOvercommit =
+              isGguf && !targetIsDiffusion && unloadsResidentFirst && !nativePathToken
+                ? await confirmFitBeforeUnload(
+                    () =>
+                      fetchMemoryEstimate(
+                        {
+                          modelPath: loadPath,
+                          ggufVariant: ggufVariant ?? null,
+                          hfToken,
+                          // /load prices max_seq_length and pins it unless replayed; the estimate
+                          // pins whatever n_ctx it is sent, so a replayed context goes as Auto.
+                          nCtx: isReplayedLoadContext(isGguf, loadCustomContextLength, loadMaxSeqLength)
+                            ? null
+                            : loadMaxSeqLength,
+                          cacheTypeKv: loadKvCacheDtype,
+                          nParallel: loadNParallel,
+                          nBatch: loadNBatch,
+                          nUbatch: loadNUbatch,
+                          ctxCheckpoints: loadServerTuning.ctxCheckpoints ?? null,
+                          speculativeType: loadSpeculativeType,
+                          specDraftNMax: loadSpecDraftNMax,
+                          specDraftCacheType: loadServerTuning.specDraftCacheDtype ?? null,
+                          tensorParallel: loadTensorParallel,
+                          disableVision: loadDisableVision,
+                          gpuMemoryMode: loadGpuMemoryMode,
+                          gpuLayers: loadGpuLayers,
+                          nCpuMoe: loadNCpuMoe,
+                          selectedGpuIds: loadSelectedGpuIds ?? null,
+                          llamaExtraArgs: loadLlamaExtraArgs ?? null,
+                        },
+                        abortCtrl.signal,
+                      ),
+                    displayName,
+                    {
+                      signal: abortCtrl.signal,
+                      onAsking: (asking) => loadToastAskingRef.current?.(asking),
+                    },
+                  )
+                : false;
+            if (abortCtrl.signal.aborted) throw new Error("Cancelled");
+
+            stopQueuedRuns(stopDecision, keepsOthers || touchesOnlySelected);
+            // A settings reload is in place, so a failed one must roll back even with others kept.
+            if (currentCheckpoint && !keepsOthers) {
+              // With chats generating, skip this preliminary unload: it cancels them ahead of /load's
+              // preflight, so a rejected target truncates replies for a model that never loads. Idle,
+              // unload first and free VRAM early.
+              // A reload of one of several stays in its own slot: /load replaces it there.
+              if (!forceCancelActive && !touchesOnlySelected) {
+                await unloadModel({ model_path: currentCheckpoint });
+                // Only a real /unload removes the resident model. The forced path leaves
+                // it to /load, so cancellation must not treat it as gone.
+                loadRun.residentModelUnloaded = true;
+              }
+              // Set either way: /load can still leave no model resident, and an unneeded rollback hits
+              // already_loaded before the gate.
+              previousWasUnloaded = true;
+            }
+            if (abortCtrl.signal.aborted) throw new Error("Cancelled");
+
+            if (resetsPerModelSettings) {
+              useChatRuntimeStore.setState({
+                speculativeType: persistedSpeculativeType,
+                loadedSpeculativeType: persistedSpeculativeType,
+                specDraftNMax: null,
+                loadedSpecDraftNMax: null,
+                // Per-model too: a different model follows the server default unless its staged config overrides it.
+                nParallel: null,
+                loadedNParallel: null,
+                reasoningBudget: -1,
+                loadedReasoningBudget: null,
+                loadedReasoningBudgetRequested: null,
+                reasoningBudgetMessage: "",
+                loadedReasoningBudgetMessage: null,
+                loadedReasoningBudgetMessageRequested: null,
+                nBatch: null,
+                loadedNBatch: null,
+                nUbatch: null,
+                loadedNUbatch: null,
+                // Per-model too, and cleared in both halves: a baseline left from the model that just went would
+                // be re-sent by a later rollback.
+                ...clearedServerTuningState(),
+                // Per-model GPU knobs must not follow onto a different model (gpuMemoryMode is standing and is kept).
+                selectedGpuIds: null,
+                selectedGpuIndexKind: null,
+                gpuLayers: GPU_LAYERS_AUTO,
+                nCpuMoe: 0,
+                splitRatio: null,
+                // A Manual+Auto context pin is per-model; clear it so a different model loads at Auto/native.
+                customContextLength: null,
+              });
+            }
             // Invalidate factories started before the final loading boundary.
             if (!keepsOthers && !touchesOnlySelected) {
               requestLocalPromptQueueStop();
@@ -2704,6 +2762,10 @@ export function useChatModelRuntime() {
 
               force_reload: forceReload,
               alongside: keepModelsLoaded || touchesOnlySelected,
+              // Answered above, before the unload: /load must not ask the same question twice.
+              ...(allowMemoryOvercommit ? { allow_memory_overcommit: true } : {}),
+            }, {
+              onMemoryOvercommitQuestion: (asking) => loadToastAskingRef.current?.(asking),
             });
             cpuFallbackReason = loadResponse.cpu_fallback_reason ?? null;
             mmprojFallbackReason = loadResponse.mmproj_fallback_reason ?? null;
@@ -3228,6 +3290,27 @@ export function useChatModelRuntime() {
           ),
         );
         loadToastIdRef.current = toastId;
+        // Nothing is loading while "Load anyway?" is open, so the toast says what it is waiting on
+        // rather than "Starting model…" behind the dialog.
+        loadToastAskingRef.current = (asking) => {
+          if (loadToastIdRef.current !== toastId) return;
+          toast(null, {
+            id: toastId,
+            ...modelLoadToastOptions(
+              asking
+                ? renderLoadDescription(
+                    "Waiting for your answer…",
+                    "This model may not fit in free memory. Choose Load anyway or Cancel.",
+                  )
+                : renderLoadDescription(
+                    toastTitle,
+                    loadingDescription,
+                    isCachedLoad ? null : 0,
+                    isCachedLoad ? null : "Preparing download",
+                  ),
+            ),
+          });
+        };
 
         // Poll download progress for non-cached models, then poll the llama-server mmap phase so
         // "Starting model..." does not look frozen on large MoE models.

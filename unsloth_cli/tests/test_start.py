@@ -3082,6 +3082,33 @@ def test_connect_model_flag_forwards_load_options(fake_studio):
     ]
 
 
+@pytest.mark.parametrize(
+    "flags, extra",
+    [([], {}), (["--allow-memory-overcommit"], {"allow_memory_overcommit": True})],
+)
+def test_connect_model_flag_forwards_allow_memory_overcommit(fake_studio, flags, extra):
+    result = CliRunner().invoke(
+        start.start_app,
+        ["claude", "--no-launch", "--model", "unsloth/Qwen3-4B-GGUF", *flags],
+    )
+    assert result.exit_code == 0, result.output
+    loads = [c for c in fake_studio if c[1].endswith("/api/inference/load")]
+    assert loads == [
+        ("POST", f"{BASE}/api/inference/load", {"model_path": "unsloth/Qwen3-4B-GGUF", **extra})
+    ]
+
+
+@pytest.mark.parametrize("model", [[], ["--model", MODEL["id"]]])
+def test_allow_memory_overcommit_alone_does_not_reload_the_resident(fake_studio, model):
+    """A permission for a load this command makes, not a setting that forces one."""
+    result = CliRunner().invoke(
+        start.start_app, ["claude", "--no-launch", *model, "--allow-memory-overcommit"]
+    )
+    assert result.exit_code == 0, result.output
+    assert not any(c[1].endswith("/api/inference/load") for c in fake_studio)
+    _assert_env_set(result.output, "ANTHROPIC_MODEL", MODEL["id"])
+
+
 def test_connect_model_flag_matches_canonical_id(fake_studio, monkeypatch):
     # Unsloth registers a loaded model under a canonical id (resolved identifier
     # / casing) that can differ from the path we passed. The agent must connect
@@ -4427,6 +4454,31 @@ def test_start_studio_server_builds_command_and_waits(monkeypatch, capsys):
     assert "Model: unsloth/Qwen3-1.7B-GGUF:UD-Q4_K_XL\n" in output
     assert "No Unsloth server at" not in output
     assert "server ready" not in output
+    assert "--allow-memory-overcommit" not in cmd
+
+
+def test_start_studio_server_forwards_allow_memory_overcommit(monkeypatch):
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            captured["command"] = command
+            self.pid = 4321
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(start.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(start, "_studio_healthy", lambda base, timeout = 3.0: True)
+    monkeypatch.setattr(start, "_log_tail", lambda path, lines = 20: "API Key: sk-unsloth-abc123")
+    monkeypatch.setattr(start.time, "sleep", lambda _s: None)
+
+    start._start_studio_server(
+        "http://127.0.0.1:8888",
+        "unsloth/Qwen3-1.7B-GGUF",
+        start.LoadOptions(allow_memory_overcommit = True),
+    )
+    assert "--allow-memory-overcommit" in captured["command"]
 
 
 def test_start_studio_server_polls_progress_from_early_key(monkeypatch):
@@ -4769,6 +4821,74 @@ def test_load_model_with_progress_rejects_a_truncated_padded_body(monkeypatch, b
         )
     assert "did not report completion" in str(excinfo.value), what
     assert "/api/inference/load" in str(excinfo.value)
+
+
+# ── The load guardrail's refusal (routes/inference.py _enforce_load_guardrail) ──
+
+_OVERCOMMIT_DETAIL = {
+    "error": "memory_overcommit",
+    "code": "memory_overcommit",
+    "message": "This model probably won't fit: Needs ~38.0 GiB on GPU 0; 23.5 GiB is free. "
+    "Retry with allow_memory_overcommit to load anyway, or change "
+    "Settings > Resources > Load guardrails.",
+    "verdict": {"level": "red", "needs_confirmation": True},
+}
+_OVERCOMMIT_MESSAGE = (
+    "Model load stopped: This model probably won't fit: Needs ~38.0 GiB on GPU 0; "
+    "23.5 GiB is free.\n"
+    "Re-run with --allow-memory-overcommit to load it anyway, or change "
+    "Settings > Resources > Load guardrails in Studio."
+)
+
+
+def _overcommit_conflict(url: str) -> urllib.error.HTTPError:
+    body = json.dumps({"detail": _OVERCOMMIT_DETAIL}).encode()
+    return urllib.error.HTTPError(url, 409, "Conflict", None, io.BytesIO(body))
+
+
+@pytest.mark.parametrize("arrives", ["http_409", "in_band"])
+def test_load_model_with_progress_reports_a_memory_overcommit_refusal(
+    monkeypatch, capsys, arrives
+):
+    """Both shapes read as the two-line advice, not as the raw detail dict or JSON."""
+
+    def urlopen(request, timeout):
+        if request.full_url.endswith("/api/inference/load"):
+            if arrives == "http_409":
+                raise _overcommit_conflict(request.full_url)
+            return _padded({"_deferred_error": {"status_code": 409, "detail": _OVERCOMMIT_DETAIL}})
+        raise urllib.error.HTTPError(request.full_url, 404, "not found", None, None)
+
+    monkeypatch.setattr(start, "urlopen_no_redirect", urlopen)
+    monkeypatch.setattr(start, "_DOWNLOAD_POLL_INTERVAL_S", 0.001)
+    with pytest.raises(typer.Exit) as excinfo:
+        start._load_model_with_progress(
+            BASE,
+            "sk-test",
+            "owner/model-GGUF",
+            start.LoadOptions(),
+            {"model_path": "owner/model-GGUF"},
+        )
+    assert excinfo.value.exit_code == 1
+    err = capsys.readouterr().err
+    assert err == _OVERCOMMIT_MESSAGE + "\n"
+    assert "Retry with allow_memory_overcommit" not in err
+
+
+def test_load_model_with_progress_keeps_other_conflicts_as_they_were(monkeypatch, capsys):
+    def urlopen(request, timeout):
+        if request.full_url.endswith("/api/inference/load"):
+            body = json.dumps({"detail": "A chat is still generating."}).encode()
+            raise urllib.error.HTTPError(request.full_url, 409, "Conflict", None, io.BytesIO(body))
+        raise urllib.error.HTTPError(request.full_url, 404, "not found", None, None)
+
+    monkeypatch.setattr(start, "urlopen_no_redirect", urlopen)
+    monkeypatch.setattr(start, "_DOWNLOAD_POLL_INTERVAL_S", 0.001)
+    with pytest.raises(typer.Exit):
+        start._load_model_with_progress(
+            BASE, "sk-test", "owner/model-GGUF", start.LoadOptions(), {"model_path": "m"}
+        )
+    assert capsys.readouterr().err == "Model load failed: A chat is still generating.\n"
 
 
 def test_download_progress_ignores_fully_cached_bytes(capsys):

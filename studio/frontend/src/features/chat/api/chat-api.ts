@@ -313,6 +313,9 @@ export async function loadModel(
     /** What is taking the slot. Chat ignores its own loads when reconciling, so an Audio load
      *  announced as "chat" left chat naming a model it had evicted. */
     runtime?: ModelRuntime;
+    /** Told when the memory guardrail's question opens and closes, so a load toast can say it is
+     *  waiting on the user instead of claiming a load that has not started. */
+    onMemoryOvercommitQuestion?: (asking: boolean) => void;
   },
 ): Promise<LoadModelResponse> {
   const preparedToken = await prepareHfTokenForUse(payload.hf_token);
@@ -361,10 +364,16 @@ export async function loadModel(
         // the same request (load_request_id included, so a Stop still reaches it).
         const overcommit = memoryOvercommitVerdict(response.status, body);
         if (overcommit && payload.allow_memory_overcommit !== true) {
-          const decision = await requestMemoryOvercommitConsent(
-            { modelLabel: payload.model_path, verdict: overcommit },
-            options?.signal,
-          );
+          options?.onMemoryOvercommitQuestion?.(true);
+          let decision: Awaited<ReturnType<typeof requestMemoryOvercommitConsent>>;
+          try {
+            decision = await requestMemoryOvercommitConsent(
+              { modelLabel: payload.model_path, verdict: overcommit },
+              options?.signal,
+            );
+          } finally {
+            options?.onMemoryOvercommitQuestion?.(false);
+          }
           if (options?.signal?.aborted)
             throw options.signal.reason ?? new DOMException("Aborted", "AbortError");
           if (decision !== "load") {

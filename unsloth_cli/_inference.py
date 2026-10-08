@@ -132,6 +132,56 @@ def read_json_checking_deferred_error(url: str, response):
     return require_completed_padded_body(url, raise_for_deferred_error(url, body))
 
 
+# The load guardrail's 409 (studio/backend/routes/inference.py _enforce_load_guardrail): raised
+# before anything is evicted, and a load sent with allow_memory_overcommit skips it.
+_MEMORY_OVERCOMMIT_CODE = "memory_overcommit"
+# The server's own advice names the API field; the CLI names its flag instead.
+_SERVER_OVERCOMMIT_ADVICE = re.compile(r"\s*Retry with allow_memory_overcommit\b.*\Z", re.DOTALL)
+
+
+def _memory_overcommit_detail(value) -> Optional[dict]:
+    # A body, then its detail, then the JSON text raise_for_deferred_error makes of a dict detail.
+    for _ in range(3):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return None
+        if not isinstance(value, dict):
+            return None
+        if _MEMORY_OVERCOMMIT_CODE in (value.get("code"), value.get("error")):
+            return value
+        value = value.get("detail")
+    return None
+
+
+def memory_overcommit_refusal(error) -> Optional[str]:
+    """The two-line message for a load the memory guardrail refused, else None.
+
+    ``error`` is whatever the caller holds: the ``HTTPError`` (its body is read), the raw
+    or decoded body, or the ``detail``. The refusal can arrive as a plain 409 or in-band
+    after a padded 200 (see ``raise_for_deferred_error``); both shapes are recognised.
+    """
+    import urllib.error
+
+    if isinstance(error, urllib.error.HTTPError):
+        try:
+            error = error.read()
+        except Exception:
+            return None
+    detail = _memory_overcommit_detail(error)
+    if detail is None:
+        return None
+    reason = _SERVER_OVERCOMMIT_ADVICE.sub("", str(detail.get("message") or "")).strip()
+    return (
+        f"Model load stopped: {reason or 'This model probably will not fit in free memory.'}\n"
+        "Re-run with --allow-memory-overcommit to load it anyway, or change "
+        "Settings > Resources > Load guardrails in Studio."
+    )
+
+
 _cache_env_seeded = False
 
 
@@ -913,6 +963,7 @@ class HttpChatBackend:
         speculative_type: Optional[SpeculativeType] = None,
         spec_draft_n_max: Optional[int] = None,
         llama_extra_args: Optional[List[str]] = None,
+        allow_memory_overcommit: bool = False,
     ) -> None:
         typer.echo(f"Loading {model} on the Unsloth server", err = True)
         payload = {
@@ -929,6 +980,8 @@ class HttpChatBackend:
             payload["speculative_type"] = speculative_type
         if spec_draft_n_max is not None:
             payload["spec_draft_n_max"] = spec_draft_n_max
+        if allow_memory_overcommit:
+            payload["allow_memory_overcommit"] = True
         resident_variant = self._resident_gguf_variant(model)
         if resident_variant:
             payload["gguf_variant"] = resident_variant
@@ -941,7 +994,7 @@ class HttpChatBackend:
                 self._request("POST", "/api/inference/load", payload),
             )
         except Exception as exc:
-            typer.echo(f"Model load failed: {exc}", err = True)
+            typer.echo(memory_overcommit_refusal(exc) or f"Model load failed: {exc}", err = True)
             raise typer.Exit(code = 1)
 
     def _resident_gguf_variant(self, model: str) -> Optional[str]:
@@ -1064,11 +1117,16 @@ class HttpChatBackend:
         pass
 
 
-def server_load_opts(ctx, load_opts: dict) -> dict:
-    """Drop an untyped --load-in-4bit so the server can keep a resident model's precision."""
+def server_load_opts(ctx, load_opts: dict, *, allow_memory_overcommit: bool = False) -> dict:
+    """Drop an untyped --load-in-4bit so the server can keep a resident model's precision.
+
+    --allow-memory-overcommit rides only here: the in-process loader has no load guardrail.
+    """
     opts = dict(load_opts)
     if ctx.get_parameter_source("load_in_4bit").name != "COMMANDLINE":
         opts["load_in_4bit"] = None
+    if allow_memory_overcommit:
+        opts["allow_memory_overcommit"] = True
     return opts
 
 
@@ -1082,6 +1140,7 @@ def connect_studio_server(
     speculative_type: Optional[SpeculativeType] = None,
     spec_draft_n_max: Optional[int] = None,
     llama_extra_args: Optional[List[str]] = None,
+    allow_memory_overcommit: bool = False,
 ):
     """Backend on a running Unsloth server, or None (caller loads locally)."""
     base_url = find_studio_server()
@@ -1128,5 +1187,6 @@ def connect_studio_server(
         speculative_type = speculative_type,
         spec_draft_n_max = spec_draft_n_max,
         llama_extra_args = llama_extra_args,
+        allow_memory_overcommit = allow_memory_overcommit,
     )
     return backend
