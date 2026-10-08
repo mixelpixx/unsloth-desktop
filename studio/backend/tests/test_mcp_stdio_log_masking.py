@@ -304,3 +304,23 @@ def test_a_line_with_no_newline_is_written_in_bounded_pieces(studio, monkeypatch
     pieces = [line.rstrip("\r") for line in body.split("\n") if line.strip("\r")]
     assert len(pieces) > 4
     assert all(len(piece) <= 100 for piece in pieces)
+
+
+def test_logs_of_removed_servers_are_pruned_and_the_live_one_kept(studio, monkeypatch):
+    """One file per command, so without pruning every server ever removed leaves its log forever."""
+    monkeypatch.setattr(mcp_client, "_STDIO_LOG_KEEP", 3)
+    folder = studio.home / "logs" / "mcp"
+    folder.mkdir(parents = True)
+    for i in range(5):
+        stale = folder / f"old-{i}.log"
+        stale.write_text("x", encoding = "utf-8")
+        os.utime(stale, (1_000_000 + i, 1_000_000 + i))
+    launch = _launch(studio)
+    writer = launch.open_log()
+    try:
+        names = sorted(path.name for path in folder.glob("*.log"))
+        # The two newest stale files plus this spawn's own, which is protected.
+        assert names == sorted(["old-3.log", "old-4.log", launch.log_path.name])
+    finally:
+        writer.close()
+        launch.close_log()

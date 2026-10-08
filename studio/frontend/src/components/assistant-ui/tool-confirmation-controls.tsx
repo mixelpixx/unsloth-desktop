@@ -63,9 +63,12 @@ export function ToolConfirmationControls({
     (s) => s.clearToolConfirmation,
   );
   const autoAllowKey = confirmation?.autoAllowKey ?? "";
+  // Sharing the user's image is asked every time: no Always allow, no keyboard chord.
+  const disclosure = confirmation?.imageDisclosure;
   const autoAllowed = useChatRuntimeStore(
     (s) =>
-      s.alwaysAllowToolsBySession.get(autoAllowKey)?.has(toolName) ?? false,
+      !disclosure &&
+      (s.alwaysAllowToolsBySession.get(autoAllowKey)?.has(toolName) ?? false),
   );
 
   const [decided, setDecided] = useState(false);
@@ -146,6 +149,7 @@ export function ToolConfirmationControls({
   // one that takes none.
   const selectionActive = useChatNavigationStore((s) => s.selectionActive);
   const keyboardReady =
+    !disclosure &&
     chatActive &&
     soleRequest &&
     !selectionActive &&
@@ -202,28 +206,38 @@ export function ToolConfirmationControls({
       aria-label={`Approve ${displayName}?`}
       className="flex flex-wrap items-center gap-2 pt-1"
     >
-      <span className="text-xs text-muted-foreground">Run this tool?</span>
+      {disclosure ? (
+        <p className="w-full text-xs text-muted-foreground">
+          Send your attached image ({Math.ceil(disclosure.size_bytes / 1024)}{" "}
+          KB) to {disclosure.server} ({disclosure.tool}) at{" "}
+          {disclosure.destination}? The server may keep it.
+        </p>
+      ) : (
+        <span className="text-xs text-muted-foreground">Run this tool?</span>
+      )}
       <Button
         size="xs"
         disabled={pending !== null || failure === "gone"}
         onClick={() => void resolve("allow")}
       >
-        Allow
+        {disclosure ? "Share image once" : "Allow"}
         {showKeyHints && approveKey ? (
           <kbd aria-hidden={true} className={KEY_HINT_CLASS}>
             {approveKey}
           </kbd>
         ) : null}
       </Button>
-      <Button
-        size="xs"
-        variant="outline"
-        disabled={pending !== null || failure === "gone"}
-        onClick={() => void resolve("allow", true)}
-        title="Stop asking about this tool in this chat, until Studio reloads"
-      >
-        Allow for this chat
-      </Button>
+      {disclosure ? null : (
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={pending !== null || failure === "gone"}
+          onClick={() => void resolve("allow", true)}
+          title="Stop asking about this tool in this chat, until Studio reloads"
+        >
+          Allow for this chat
+        </Button>
+      )}
       <Button
         size="xs"
         variant="destructive"

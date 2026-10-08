@@ -17,10 +17,18 @@ import {
   formatMcpToolName,
   mcpServerFromProvenance,
   mcpToolFromProvenance,
+  splitMcpToolName,
 } from "@/features/chat/utils/mcp-tool-name";
 // eslint-disable-next-line no-restricted-imports -- the feature barrel imports this component
 import { useToolAwaitingApproval } from "@/features/chat/tool-approval";
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
+import { McpAppFrame } from "@/features/chat/mcp-apps/mcp-app-frame";
+import {
+  type McpUiToolResult,
+  isMcpUiToolResult,
+} from "@/features/chat/mcp-apps/mcp-ui";
+import { sandboxSessionIdFor } from "@/components/assistant-ui/sandbox-files";
+import { useChatProjectScope } from "@/features/chat/chat-project-scope";
 import { stripAnsi, stringifyToolResult } from "@/lib/strip-ansi";
 import { cn } from "@/lib/utils";
 import {
@@ -412,6 +420,34 @@ function isMcpImageResult(val: unknown): val is McpImageResult {
   );
 }
 
+/** Outside ToolFallbackContent so it stays on screen with the card collapsed. */
+function ToolFallbackMcpApp({
+  toolName,
+  result,
+  argsText,
+}: {
+  toolName: string;
+  result: McpUiToolResult;
+  argsText?: string;
+}) {
+  const threadId = useAuiState(({ threadListItem }) => threadListItem.remoteId);
+  // The provider's project (the store's lags a thread switch): the adapter keys the run's session on it.
+  const projectId = useChatProjectScope();
+  const parts = splitMcpToolName(toolName);
+  if (!parts) return null;
+  return (
+    <McpAppFrame
+      serverId={parts.serverId}
+      toolName={parts.tool}
+      ui={result.ui}
+      argsText={argsText}
+      resultImages={result.images}
+      threadId={threadId}
+      sessionId={sandboxSessionIdFor(threadId, projectId)}
+    />
+  );
+}
+
 function ToolFallbackResult({
   result,
   failed = false,
@@ -530,6 +566,11 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
   // The backend hands MCP failures back as a completed call whose result
   // starts "Error:", so the result is the only place the failure shows.
   const failed = typeof result === "string" && /^\s*Error:/.test(result);
+  // A widget result's pane shows the text (and images) the model saw, never its UI seed.
+  const widget = isMcpUiToolResult(result, toolName) ? result : null;
+  const shown = widget?.images?.length
+    ? { text: widget.text, images: widget.images }
+    : (widget?.text ?? result);
 
   return (
     <ToolFallbackRoot
@@ -545,13 +586,20 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
         awaitingApproval={awaitingApproval}
         failed={failed}
       />
+      {!isCancelled && widget && (
+        <ToolFallbackMcpApp
+          toolName={toolName}
+          result={widget}
+          argsText={argsText}
+        />
+      )}
       <ToolFallbackContent>
         <ToolFallbackError status={status} />
         <ToolFallbackArgs
           argsText={argsText}
           className={cn(isCancelled && "opacity-60")}
         />
-        {!isCancelled && <ToolFallbackResult result={result} failed={failed} />}
+        {!isCancelled && <ToolFallbackResult result={shown} failed={failed} />}
       </ToolFallbackContent>
     </ToolFallbackRoot>
   );

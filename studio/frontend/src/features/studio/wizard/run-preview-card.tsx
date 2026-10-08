@@ -66,12 +66,14 @@ function MetaRow({
   value,
   mono,
   title,
+  wrap,
 }: {
   label: string;
   value: ReactNode;
   mono?: boolean;
   /** The full value, for a row narrow enough to truncate it. */
   title?: string;
+  wrap?: boolean;
 }): ReactElement {
   return (
     <div className="flex items-baseline justify-between gap-3">
@@ -81,7 +83,8 @@ function MetaRow({
       <span
         title={title}
         className={cn(
-          "min-w-0 truncate text-ui-12p5 text-foreground/90",
+          "min-w-0 text-ui-12p5 text-foreground/90",
+          wrap ? "break-words text-right" : "truncate",
           mono && "font-mono text-ui-12",
         )}
       >
@@ -366,6 +369,7 @@ export function RunPreviewCard({
     gradientAccumulation,
     learningRate,
     contextLength,
+    isDecision,
   } = useTrainingConfigStore(
     useShallow((s) => ({
       selectedModel: s.selectedModel,
@@ -385,6 +389,7 @@ export function RunPreviewCard({
       gradientAccumulation: s.gradientAccumulation,
       learningRate: s.learningRate,
       contextLength: s.contextLength,
+      isDecision: s.modelType === "decision",
     })),
   );
 
@@ -396,20 +401,26 @@ export function RunPreviewCard({
   const upgradeNotice = useTrainingTransformersUpgradeNotice();
   const fit = useTrainingFitEstimate(upgradeNotice.fourBitUnavailable);
   const hardwareSummary = trainingHardwareSummary(fit.allDevices, fit.target);
-  // Per card, or the pinned card: memoryTotalGb is the SUM across GPUs, and "RTX 3090 ·
-  // 48 GiB" read as one 48 GiB card that no run on this host can use whole.
+  // Per card, or the pinned card: memoryTotalGb is the SUM across GPUs, and "48 GiB" read as
+  // one 48 GiB card that no run on this host can use whole.
   const hardwareLabel = !gpu.available
     ? t("studio.preview.noGpu")
-    : hardwareSummary
-      ? hardwareSummary.key
-        ? t(hardwareSummary.key, hardwareSummary.params)
-        : hardwareSummary.text
-      : gpu.deviceCount > 1
-        ? t("trainingFit.hardwareCount", {
-            count: String(gpu.deviceCount),
-            memory: `${gpu.memoryTotalGb} GiB`,
-          })
-        : `${gpu.name} · ${gpu.memoryTotalGb} GiB`;
+    : !hardwareSummary
+      ? gpu.name
+      : hardwareSummary.pinnedIndex === null
+        ? hardwareSummary.name
+        : `${t("trainingFit.gpu", { index: String(hardwareSummary.pinnedIndex) })} · ${hardwareSummary.name}`;
+  const vramLabel = hardwareSummary
+    ? hardwareSummary.memory
+    : gpu.deviceCount > 1
+      ? t("trainingFit.hardwareCount", {
+          count: String(gpu.deviceCount),
+          memory: `${Math.round(gpu.memoryTotalGb)} GiB`,
+        })
+      : `${Math.round(gpu.memoryTotalGb)} GiB`;
+  const vramTitle = hardwareSummary
+    ? hardwareSummary.memoryTitle
+    : `${gpu.memoryTotalGb} GiB`;
   const nonDefaultAdvancedSettings = useTrainingConfigStore((state) =>
     countNonDefaultAdvancedSettings(state, state.advancedSettingsBaseline),
   );
@@ -523,11 +534,13 @@ export function RunPreviewCard({
             />
           }
         />
-        <MetaRow
-          label={t("studio.preview.context")}
-          value={numberFormatter.format(contextLength)}
-          mono={true}
-        />
+        {!isDecision && (
+          <MetaRow
+            label={t("studio.preview.context")}
+            value={numberFormatter.format(contextLength)}
+            mono={true}
+          />
+        )}
         <MetaRow
           label={t("studio.preview.lr")}
           value={formatLearningRate(learningRate)}
@@ -550,9 +563,16 @@ export function RunPreviewCard({
       <section className="flex flex-col gap-3">
         <MetaRow
           label={t("studio.preview.hardware")}
+          wrap
           value={hardwareLabel}
-          title={hardwareLabel}
         />
+        {gpu.available && (
+          <MetaRow
+            label={t("studio.preview.vram")}
+            title={vramTitle}
+            value={vramLabel}
+          />
+        )}
         {gpu.available ? (
           <TrainingFitPanel devices={fit.devices} target={fit.target} />
         ) : null}

@@ -2,6 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { usePlatformStore } from "@/config/env";
+import { isAccountOwner } from "@/features/auth";
 import { prepareHfTokenForUse } from "@/features/hf-auth";
 import { getHfToken, useHfTokenStore } from "@/features/hub";
 import { confirmRemoteCodeIfNeeded } from "@/features/security";
@@ -29,6 +30,7 @@ import {
   createDatasetCacheUsabilityIdentity,
   trainingDatasetCacheRejections,
 } from "./dataset-cache-rejection";
+import { checkDecisionDatasetColumns } from "./decision-dataset";
 import { shouldUseVisionDatasetCheck } from "./fresh-dataset-check";
 import { isMissingLocalDatasetCacheError } from "./local-cache-errors";
 import { isRawTextDatasetFormat } from "./training-methods";
@@ -261,6 +263,7 @@ export async function startFreshTrainingRun(): Promise<boolean> {
   const validation = validateTrainingConfig(
     attempt.config,
     usePlatformStore.getState().deviceType,
+    isAccountOwner(),
   );
   if (!validation.ok) {
     return attempt.cancel(translate(validation.errorKey));
@@ -360,6 +363,21 @@ async function prepareSelectedDataset(
   }
 
   const isVlm = shouldUseVisionDatasetCheck(attempt.config);
+  if (attempt.config.modelType === "decision") {
+    const missing = await checkDecisionDatasetColumns(
+      () => checkSelectedDataset(attempt, datasetName, hfToken, isVlm),
+      attempt.config.datasetSource === "upload" ? datasetName : null,
+    );
+    return (
+      missing !== null &&
+      (missing.length === 0 ||
+        attempt.cancel(
+          translate("studio.training.validation.decisionColumnsMissing", {
+            columns: missing.join(", "),
+          }),
+        ))
+    );
+  }
   const check = await checkSelectedDataset(
     attempt,
     datasetName,
@@ -524,6 +542,7 @@ async function submitFreshTrainingRun(
   const validation = validateTrainingConfig(
     attempt.config,
     usePlatformStore.getState().deviceType,
+    isAccountOwner(),
   );
   if (!validation.ok) {
     return attempt.cancel(translate(validation.errorKey));

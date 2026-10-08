@@ -346,8 +346,10 @@ def test_route_resolves_slots_once_before_dedupe_guard_and_load():
     assert resolve < fast_dedupe < active_intent
     assert active_intent < resolved_intent < resolved_dedupe
     assert resolved_dedupe < guard < load_call
-    # Both immutable intents and the guard share the value; resolution runs once.
-    assert load_impl.count("n_parallel = _n_parallel") == 4
+    # Both immutable intents, the training guard and the load guardrail share the value;
+    # resolution runs once.
+    assert load_impl.count("n_parallel = _n_parallel") == 5
+    assert load_impl.index("_enforce_load_guardrail") < load_call
     assert load_impl.count("_resolve_parallel_slots(request, fastapi_request)") == 1
     assert "fastapi_request.app.state" not in load_impl
 

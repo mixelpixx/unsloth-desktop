@@ -51,6 +51,12 @@ export interface MemoryEstimate {
   /** What was actually priced, after overrides and clamps resolve. */
   nCtx: number;
   contextFitted: number | null;
+  /** False when Auto can shrink the priced context to fit. */
+  contextIsPinned: boolean;
+  /** GPU bytes at the loader's context floor; null when pinned. */
+  gpuFloorBytes: number | null;
+  /** Whether a load still over the card at the floor moves layers to the CPU. */
+  floorCanOffload: boolean;
   cacheTypeKv: string | null;
   nParallel: number;
   layerCount: number | null;
@@ -107,6 +113,9 @@ const UNAVAILABLE: MemoryEstimate = {
   kvOnGpu: true,
   nCtx: 0,
   contextFitted: null,
+  contextIsPinned: true,
+  gpuFloorBytes: null,
+  floorCanOffload: false,
   cacheTypeKv: null,
   nParallel: 1,
   layerCount: null,
@@ -132,6 +141,9 @@ interface ApiEstimateResponse {
   kv_on_gpu: boolean;
   n_ctx: number;
   context_fitted?: number | null;
+  context_is_pinned?: boolean;
+  gpu_floor_bytes?: number | null;
+  floor_can_offload?: boolean;
   cache_type_kv: string | null;
   n_parallel: number;
   layer_count: number | null;
@@ -247,6 +259,10 @@ function toMemoryEstimate(body: ApiEstimateResponse): MemoryEstimate {
     kvOnGpu: flag(body.kv_on_gpu, true),
     nCtx: finiteCount(body.n_ctx, 0),
     contextFitted: nullableCount(body.context_fitted),
+    // Preserve older backends' verdicts when these fields are absent.
+    contextIsPinned: flag(body.context_is_pinned, true),
+    gpuFloorBytes: nullableCount(body.gpu_floor_bytes),
+    floorCanOffload: flag(body.floor_can_offload, false),
     cacheTypeKv:
       typeof body.cache_type_kv === "string" ? body.cache_type_kv : null,
     nParallel: finiteCount(body.n_parallel, 1),

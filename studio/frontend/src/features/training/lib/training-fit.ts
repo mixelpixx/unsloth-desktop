@@ -365,22 +365,21 @@ export function trainingStartNeedsFitConfirm(
   return estimate?.verdict === "exceeds";
 }
 
-export type TrainingHardwareSummary =
-  | { key: "trainingFit.hardwareSingle"; params: { name: string; memory: string } }
-  | {
-      key: "trainingFit.hardwarePinned";
-      params: { index: string; name: string; memory: string };
-    }
-  | {
-      key: "trainingFit.hardwareIdentical";
-      params: { count: string; name: string; memory: string };
-    }
-  | { key: null; text: string };
+export type TrainingHardwareSummary = {
+  /** The Hardware row: GPU names only, so a long name never pushes the memory figure out. */
+  name: string;
+  /** The card a pinned target uses, which the row names as "GPU n". */
+  pinnedIndex: number | null;
+  /** The VRAM row: per card ("2 × 24 GiB"), never a sum no single card has. */
+  memory: string;
+  /** The exact figures, for the VRAM row's hover. */
+  memoryTitle: string;
+};
 
 /**
- * The run preview's Hardware row. Several GPUs used to print as one card with their summed
- * memory ("RTX 3090 · 48 GiB"), which reads as a 48 GiB card no model on this host can use
- * whole: layers split across cards, and activations need room on every one of them.
+ * The run preview's Hardware and VRAM rows. Several GPUs used to print as one card with their
+ * summed memory ("RTX 3090 · 48 GiB"), which reads as a 48 GiB card no model on this host can
+ * use whole: layers split across cards, and activations need room on every one of them.
  */
 export function trainingHardwareSummary(
   devices: readonly TrainingGpuDevice[],
@@ -389,28 +388,21 @@ export function trainingHardwareSummary(
   if (devices.length === 0) {
     return null;
   }
+  const one = (device: TrainingGpuDevice, pinnedIndex: number | null) => ({
+    name: device.name,
+    pinnedIndex,
+    memory: formatGiB(device.memoryTotalGb),
+    memoryTitle: `${device.memoryTotalGb} GiB`,
+  });
   if (target.startsWith("gpu:")) {
     const index = Number(target.slice("gpu:".length));
     const device = devices.find((candidate) => candidate.index === index);
     if (device) {
-      return {
-        key: "trainingFit.hardwarePinned",
-        params: {
-          index: String(device.index),
-          name: device.name,
-          memory: formatGiB(device.memoryTotalGb),
-        },
-      };
+      return one(device, device.index);
     }
   }
   if (devices.length === 1) {
-    return {
-      key: "trainingFit.hardwareSingle",
-      params: {
-        name: devices[0].name,
-        memory: formatGiB(devices[0].memoryTotalGb),
-      },
-    };
+    return one(devices[0], null);
   }
   const first = devices[0];
   const identical = devices.every(
@@ -419,20 +411,19 @@ export function trainingHardwareSummary(
       formatGiB(device.memoryTotalGb) === formatGiB(first.memoryTotalGb),
   );
   if (identical) {
+    const count = devices.length;
     return {
-      key: "trainingFit.hardwareIdentical",
-      params: {
-        count: String(devices.length),
-        name: first.name,
-        memory: formatGiB(first.memoryTotalGb),
-      },
+      name: `${count} × ${first.name}`,
+      pinnedIndex: null,
+      memory: `${count} × ${formatGiB(first.memoryTotalGb)}`,
+      memoryTitle: `${count} × ${first.memoryTotalGb} GiB`,
     };
   }
   // Mixed cards: name each one rather than a sum no single card has.
   return {
-    key: null,
-    text: devices
-      .map((device) => `${device.name} · ${formatGiB(device.memoryTotalGb)}`)
-      .join(" + "),
+    name: devices.map((device) => device.name).join(" + "),
+    pinnedIndex: null,
+    memory: devices.map((device) => formatGiB(device.memoryTotalGb)).join(" + "),
+    memoryTitle: devices.map((device) => `${device.memoryTotalGb} GiB`).join(" + "),
   };
 }

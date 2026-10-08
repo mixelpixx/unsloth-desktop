@@ -233,12 +233,9 @@ export function useRecipePersistence({
   const [workflowName, setWorkflowName] = useState("Unnamed");
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [savedSignature, setSavedSignature] = useState("");
+  // Autosave does not retry the exact content that just failed (e.g. a 409 from another window).
+  const [failedSignature, setFailedSignature] = useState<string | null>(null);
   const [saveLoading, setSaveLoading] = useState(false);
-  // The signature a save failed at: autosave waits for the content to change before retrying,
-  // instead of re-toasting every 800ms.
-  const [saveErrorSignature, setSaveErrorSignature] = useState<string | null>(
-    null,
-  );
   // Set when the stored payload would not import. The store then holds an empty recipe, so
   // autosave stays off: it would overwrite the real recipe with that empty one.
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -258,7 +255,7 @@ export function useRecipePersistence({
     savedSignature.length > 0 && currentSignature !== savedSignature;
   const saveTone: SaveTone = loadError
     ? "unloaded"
-    : saveErrorSignature === currentSignature
+    : failedSignature === currentSignature
       ? "failed"
       : !isDirty && Boolean(lastSavedAt)
         ? "success"
@@ -272,7 +269,7 @@ export function useRecipePersistence({
     setWorkflowName(nextName);
     setLastSavedAt(initialSavedAt);
     setCopied(false);
-    setSaveErrorSignature(null);
+    setFailedSignature(null);
 
     const parsed = importRecipePayload(JSON.stringify(initialPayload), {
       preserveUnstructuredUploads: true,
@@ -321,15 +318,18 @@ export function useRecipePersistence({
         payload: currentPayload,
       });
       setLastSavedAt(result.updatedAt);
+      setFailedSignature(null);
       setSavedSignature(buildSignature(nextName, currentPayload));
-      setSaveErrorSignature(null);
       // An explicit save replaced the stored recipe, so there is nothing left to protect.
       setLoadError(null);
       drainQueuedUploadCleanups(currentPayload);
     } catch (error) {
       console.error("Save recipe failed:", error);
-      setSaveErrorSignature(buildSignature(nextName, currentPayload));
-      toastError("Save failed", "Could not save recipe.");
+      setFailedSignature(buildSignature(nextName, currentPayload));
+      toastError(
+        "Save failed",
+        error instanceof Error ? error.message : "Could not save recipe.",
+      );
     } finally {
       setSaveLoading(false);
     }
@@ -340,7 +340,7 @@ export function useRecipePersistence({
       !isDirty ||
       saveLoading ||
       loadError !== null ||
-      saveErrorSignature === currentSignature
+      failedSignature === currentSignature
     ) {
       return;
     }
@@ -350,10 +350,10 @@ export function useRecipePersistence({
     return () => window.clearTimeout(timeoutId);
   }, [
     currentSignature,
+    failedSignature,
     isDirty,
     loadError,
     persistRecipe,
-    saveErrorSignature,
     saveLoading,
   ]);
 

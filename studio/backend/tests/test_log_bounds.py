@@ -57,7 +57,12 @@ def _python_retention_sources() -> str:
     """Every Python file that could plausibly prune a log directory."""
     backend = Path(_BACKEND_DIR)
     parts = []
-    for relative in ("run.py", "utils/log_retention.py", "core/inference/llama_cpp.py"):
+    for relative in (
+        "run.py",
+        "utils/log_retention.py",
+        "core/inference/llama_cpp.py",
+        "core/inference/mcp_client.py",
+    ):
         path = backend / relative
         if path.is_file():
             parts.append(path.read_text(encoding = "utf-8", errors = "replace"))
@@ -118,6 +123,8 @@ class TestFamiliesAreBounded:
             "desktop-update",
             "desktop-repair",
             "desktop-shell",
+            # Keep-newest-64 in _StdioLaunch.open_log, plus a 2 MB cap per file at spawn.
+            "mcp",
         }
         actual = set(debug_log_sources.FAMILIES)
         added = sorted(actual - reviewed)

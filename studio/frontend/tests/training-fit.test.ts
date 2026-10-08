@@ -229,24 +229,32 @@ test("Start asks first only when the estimate positively says exceeds", () => {
 
 test("two GPUs read as two cards, not one with their summed memory", () => {
   assert.deepEqual(trainingHardwareSummary(TWO_3090S, "auto"), {
-    key: "trainingFit.hardwareIdentical",
-    params: { count: "2", name: "NVIDIA GeForce RTX 3090", memory: "24 GiB" },
+    name: "2 × NVIDIA GeForce RTX 3090",
+    pinnedIndex: null,
+    memory: "2 × 24 GiB",
+    memoryTitle: "2 × 24 GiB",
   });
   assert.deepEqual(trainingHardwareSummary(TWO_3090S, "gpu:1"), {
-    key: "trainingFit.hardwarePinned",
-    params: { index: "1", name: "NVIDIA GeForce RTX 3090", memory: "24 GiB" },
+    name: "NVIDIA GeForce RTX 3090",
+    pinnedIndex: 1,
+    memory: "24 GiB",
+    memoryTitle: "24 GiB",
   });
   assert.deepEqual(trainingHardwareSummary(TWO_3090S.slice(0, 1), "auto"), {
-    key: "trainingFit.hardwareSingle",
-    params: { name: "NVIDIA GeForce RTX 3090", memory: "24 GiB" },
+    name: "NVIDIA GeForce RTX 3090",
+    pinnedIndex: null,
+    memory: "24 GiB",
+    memoryTitle: "24 GiB",
   });
   const mixed = trainingHardwareSummary(
     [TWO_3090S[0], { index: 1, name: "RTX 4060", memoryTotalGb: 8 }],
     "all",
   );
   assert.deepEqual(mixed, {
-    key: null,
-    text: "NVIDIA GeForce RTX 3090 · 24 GiB + RTX 4060 · 8.0 GiB",
+    name: "NVIDIA GeForce RTX 3090 + RTX 4060",
+    pinnedIndex: null,
+    memory: "24 GiB + 8.0 GiB",
+    memoryTitle: "24 GiB + 8 GiB",
   });
   assert.equal(trainingHardwareSummary([], "auto"), null);
   assert.equal(formatFitGiB(Number.NaN), "0 GiB");
@@ -321,11 +329,9 @@ test("the start flow reads the visible target, and Start never waits on the esti
 test("the run preview describes cards, not their sum", () => {
   const card = readSrc("features/studio/wizard/run-preview-card.tsx");
   assert.match(card, /trainingHardwareSummary\(fit\.allDevices, fit\.target\)/);
-  assert.doesNotMatch(
-    card,
-    /gpu\.available\s*\?\s*`\$\{gpu\.name\} · \$\{gpu\.memoryTotalGb\} GiB`/,
-    "the multi-GPU sum must not be the Hardware row's first answer",
-  );
+  // Upstream's two rows: names on Hardware, per-card memory on VRAM, the sum only as a labelled fallback.
+  assert.match(card, /const vramLabel = hardwareSummary\s*\?\s*hardwareSummary\.memory/);
+  assert.match(card, /title=\{vramTitle\}\s*value=\{vramLabel\}/);
   // One upgrade-notice fetch shared by the notice and the estimate.
   assert.equal(card.match(/useTrainingTransformersUpgradeNotice\(\)/g)?.length, 1);
 });

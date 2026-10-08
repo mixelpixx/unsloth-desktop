@@ -457,7 +457,7 @@ class TestStudioLocalhostIpv6Warning:
             "print_studio_stop_hint",
             lambda: calls.__setitem__("stop_hint", calls["stop_hint"] + 1),
         )
-        def _reachability(display_host, port, lan_host = ""):
+        def _reachability(display_host, port, lan_host = "", **_):
             calls["reachability"].append((display_host, port))
             calls["reachability_lan_host"].append(lan_host)
 

@@ -19,6 +19,7 @@ import {
 import { initializeLocale } from "./i18n";
 import { isTauri } from "./lib/api-base";
 import { setHubSessionRefresh } from "./lib/hf-endpoint";
+import { watchInputModality } from "./lib/input-modality";
 import { watchOverlayScrollbarGutter } from "./lib/overlay-scrollbar";
 
 setHubSessionRefresh(refreshSession);
@@ -57,6 +58,7 @@ watchMathBlockContainmentOverride();
 
 // Keep right-edge controls clear of overlay scrollbars.
 watchOverlayScrollbarGutter(window);
+watchInputModality(window);
 
 // An update or rebuild replaces the hashed chunks this page was built against, so its next lazy
 // import 404s. Reload once to pick up the new build: route chunks already get that from the

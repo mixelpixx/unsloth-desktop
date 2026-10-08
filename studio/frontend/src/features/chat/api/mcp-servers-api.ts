@@ -11,6 +11,12 @@ import {
   trackMcpServerMutation,
 } from "./mcp-server-mutation-tracker";
 
+export type McpImageInputMapping = {
+  tool: string;
+  field: string;
+  encoding: "base64" | "data_url";
+};
+
 export interface McpServerConfig {
   id: string;
   builtin_id: string | null;
@@ -21,6 +27,10 @@ export interface McpServerConfig {
   use_oauth: boolean;
   // Local programs only: the folder the program starts in; null = the backend's own.
   cwd?: string | null;
+  oauth_client_id?: string | null;
+  has_oauth_client_secret?: boolean;
+  image_input_mappings?: McpImageInputMapping[];
+  image_mappings_active?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -48,7 +58,9 @@ export interface BlenderMcpSettings {
   blender_path: string;
 }
 
-export function listMcpBuiltins(waitForPendingMutations = true): Promise<McpBuiltinConfig[]> {
+export function listMcpBuiltins(
+  waitForPendingMutations = true,
+): Promise<McpBuiltinConfig[]> {
   const read = () => mcpRequest<McpBuiltinConfig[]>("/builtins");
   return waitForPendingMutations
     ? readAfterPendingMcpServerMutations(read)
@@ -63,11 +75,18 @@ export function updateBlenderMcp(
   );
 }
 
-export function testBlenderMcp(payload: BlenderMcpSettings & { consent: boolean }): Promise<McpServerProbeResult & {
-  blender_ready?: boolean;
-  blender_error?: string | null;
-}> {
-  return mcpRequest("/builtins/blender/test", { method: "POST", body: payload });
+export function testBlenderMcp(
+  payload: BlenderMcpSettings & { consent: boolean },
+): Promise<
+  McpServerProbeResult & {
+    blender_ready?: boolean;
+    blender_error?: string | null;
+  }
+> {
+  return mcpRequest("/builtins/blender/test", {
+    method: "POST",
+    body: payload,
+  });
 }
 
 export interface McpServerImportResult {
@@ -183,6 +202,9 @@ export function createMcpServer(payload: {
   isEnabled?: boolean;
   useOauth?: boolean;
   cwd?: string | null;
+  oauthClientId?: string | null;
+  oauthClientSecret?: string;
+  imageInputMappings?: McpImageInputMapping[];
 }): Promise<McpServerConfig> {
   return trackMcpServerMutation(
     mcpRequest("/", {
@@ -194,6 +216,9 @@ export function createMcpServer(payload: {
         is_enabled: payload.isEnabled ?? true,
         use_oauth: payload.useOauth ?? false,
         cwd: payload.cwd ?? null,
+        oauth_client_id: payload.oauthClientId ?? null,
+        oauth_client_secret: payload.oauthClientSecret ?? null,
+        image_input_mappings: payload.imageInputMappings ?? [],
       },
     }),
   );
@@ -210,6 +235,10 @@ export function updateMcpServer(
     useOauth?: boolean;
     /** null = clear the working directory; omit to leave as-is */
     cwd?: string | null;
+    oauthClientId?: string | null;
+    /** omit to keep the stored secret */
+    oauthClientSecret?: string;
+    imageInputMappings?: McpImageInputMapping[];
   },
 ): Promise<McpServerConfig> {
   const body: Record<string, unknown> = {};
@@ -220,6 +249,12 @@ export function updateMcpServer(
   if (payload.isEnabled !== undefined) body.is_enabled = payload.isEnabled;
   if (payload.useOauth !== undefined) body.use_oauth = payload.useOauth;
   if (payload.cwd !== undefined) body.cwd = payload.cwd;
+  if (payload.oauthClientId !== undefined)
+    body.oauth_client_id = payload.oauthClientId;
+  if (payload.oauthClientSecret !== undefined)
+    body.oauth_client_secret = payload.oauthClientSecret;
+  if (payload.imageInputMappings !== undefined)
+    body.image_input_mappings = payload.imageInputMappings;
   return trackMcpServerMutation(
     mcpRequest(`/${serverId}`, { method: "PUT", body }),
   );
@@ -237,11 +272,20 @@ export function refreshMcpServerTools(
   return mcpRequest(`/${serverId}/refresh`, { method: "POST" });
 }
 
+export function listMcpServerTools(
+  serverId: string,
+): Promise<{ name: string; inputSchema?: unknown }[]> {
+  return mcpRequest(`/${serverId}/tools`);
+}
+
 export function testMcpServer(payload: {
   url: string;
   headers?: Record<string, string>;
   useOauth?: boolean;
   cwd?: string | null;
+  oauthClientId?: string | null;
+  oauthClientSecret?: string;
+  serverId?: string;
 }): Promise<McpServerProbeResult> {
   return mcpRequest("/test", {
     method: "POST",
@@ -250,6 +294,9 @@ export function testMcpServer(payload: {
       headers: payload.headers ?? null,
       use_oauth: payload.useOauth ?? false,
       cwd: payload.cwd ?? null,
+      oauth_client_id: payload.oauthClientId ?? null,
+      oauth_client_secret: payload.oauthClientSecret ?? null,
+      server_id: payload.serverId ?? null,
     },
   });
 }
@@ -278,4 +325,50 @@ export function importMcpServers(
   return trackMcpServerMutation(
     mcpRequest("/import", { method: "POST", body: { config } }),
   );
+}
+
+export type McpUiCspField =
+  "connectDomains" | "resourceDomains" | "frameDomains" | "baseUriDomains";
+
+export interface McpUiResource {
+  uri: string;
+  mime_type: string;
+  text: string;
+  blob?: string | null;
+  ui: { csp?: Partial<Record<McpUiCspField, string[]>> };
+  contents?: { uri: string; mimeType?: string; text?: string; blob?: string }[];
+}
+
+export interface McpUiToolCallResult {
+  content: Record<string, unknown>[];
+  structured_content: Record<string, unknown> | null;
+  is_error: boolean;
+  meta: Record<string, unknown> | null;
+}
+
+export function readMcpUiResource(
+  serverId: string,
+  uri: string,
+  scope: { threadId?: string; sessionId?: string },
+): Promise<McpUiResource> {
+  const query = new URLSearchParams({ uri });
+  if (scope.threadId) query.set("thread_id", scope.threadId);
+  if (scope.sessionId) query.set("session_id", scope.sessionId);
+  return mcpRequest(`/${serverId}/ui-resource?${query}`);
+}
+
+/** `serverId` comes from the tool part that drew the frame, never the widget. A 409 rejects with
+ *  Error("approval_required"). */
+export function callMcpUiTool(
+  serverId: string,
+  body: {
+    tool_name: string;
+    arguments: Record<string, unknown>;
+    thread_id: string | null;
+    session_id: string | null;
+    permission_mode: string;
+    approved: boolean;
+  },
+): Promise<McpUiToolCallResult> {
+  return mcpRequest(`/${serverId}/ui-tool-call`, { method: "POST", body });
 }

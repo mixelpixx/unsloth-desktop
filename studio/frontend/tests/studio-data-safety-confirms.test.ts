@@ -31,8 +31,8 @@ test("deleting a recipe asks first and reports a failure", () => {
 
 test("a failed save or load stops recipe autosave from looping or overwriting", () => {
   const source = readSrc("features/recipe-studio/hooks/use-recipe-persistence.ts");
-  assert.match(source, /loadError !== null \|\|\s*saveErrorSignature === currentSignature\s*\) \{\s*return;/);
-  assert.match(source, /setSaveErrorSignature\(buildSignature\(nextName, currentPayload\)\)/);
+  assert.match(source, /loadError !== null \|\|\s*failedSignature === currentSignature\s*\) \{\s*return;/);
+  assert.match(source, /setFailedSignature\(buildSignature\(nextName, currentPayload\)\)/);
 });
 
 test("a GGUF export from a checkpoint names the run, not just the checkpoint", () => {

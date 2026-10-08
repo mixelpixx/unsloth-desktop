@@ -12,6 +12,13 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -40,6 +47,7 @@ import {
   listMcpServers,
   updateMcpServer,
 } from "./api/mcp-servers-api";
+import { BlenderMcpSetup } from "./blender-mcp-setup";
 import { ChatMcpServersDialog } from "./chat-mcp-servers-dialog";
 import { normalizeMcpUrl } from "./mcp-server-url";
 import { useChatActive } from "./runtime-provider";
@@ -96,6 +104,8 @@ export function McpComposerButton({
   const dialogOpen = useMcpServersDialogStore((s) => s.open);
   const setDialogOpen = useMcpServersDialogStore((s) => s.setOpen);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [blenderOpen, setBlenderOpen] = useState(false);
+  const [blenderBusy, setBlenderBusy] = useState(false);
   const [serversLoaded, setServersLoaded] = useState(false);
   // The latest list load failed. Without a loaded snapshot the rows stay disabled, so the menu
   // has to say why and offer another try.
@@ -456,7 +466,7 @@ export function McpComposerButton({
           <DropdownMenuItem
             onSelect={() => {
               setMenuOpen(false);
-              setDialogOpen(true);
+              setBlenderOpen(true);
             }}
             className={blenderEnabled ? "relative text-primary font-medium" : "relative"}
           >
@@ -487,6 +497,32 @@ export function McpComposerButton({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+      <Dialog
+        open={blenderOpen}
+        onOpenChange={(open) => {
+          if (!open && blenderBusy) return;
+          setBlenderOpen(open);
+        }}
+      >
+        <DialogContent
+          className="max-w-lg max-h-[85dvh] overflow-y-auto"
+          showCloseButton={!blenderBusy}
+        >
+          <DialogHeader>
+            <DialogTitle>Blender MCP</DialogTitle>
+            <DialogDescription>
+              Let the model control Blender through MCP.
+            </DialogDescription>
+          </DialogHeader>
+          {blenderOpen && (
+            <BlenderMcpSetup
+              servers={servers}
+              disabled={false}
+              onBusyChange={setBlenderBusy}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

@@ -305,3 +305,88 @@ def test_the_estimate_verdict_never_fails_the_estimate(monkeypatch):
 )
 def test_what_counts_as_a_named_context(n_ctx, extras, pinned):
     assert route._context_is_pinned(n_ctx, extras) is pinned
+
+
+def test_a_new_alongside_slot_is_judged_only_when_it_replaces_the_active_model(monkeypatch):
+    """A slot loaded alongside must fit beside the kept models on its own terms (the
+    loader's partial-fit refusal and the eviction ladder), so the guardrail stays out of
+    it; the ladder's last resort replaces the active model, and that load is judged."""
+    import core.inference.model_slots as model_slots
+    import core.inference.orchestrator as orchestrator
+    from core.inference.llama_cpp import GpuMemoryShortError
+    from utils import multi_model_settings
+
+    class _Llama:
+        holds_no_vram = False
+
+        def __init__(self, identifier = None, variant = None):
+            self.model_identifier = identifier
+            self.hf_variant = variant
+            self.is_loaded = self.is_active = identifier is not None
+            self.is_vision = False
+            self.context_length = 4096
+
+        def unload_model(self):
+            self.is_loaded = self.is_active = False
+
+        def _cleanup(self):
+            pass
+
+    class _Orchestrator:
+        def __init__(self, active = None):
+            self.active_model_name = active
+            self.models = {active: {}} if active else {}
+
+        def unload_model(self, name):
+            self.active_model_name = None
+
+        def _cleanup(self):
+            pass
+
+    monkeypatch.setattr(route, "_llama_cpp_backend", _Llama("org/A-GGUF", "Q4_K_M"))
+    monkeypatch.setattr(orchestrator, "_inference_backend", _Orchestrator())
+    monkeypatch.setattr(model_slots, "slots", [])
+    monkeypatch.setattr(model_slots, "stuck", [])
+    monkeypatch.setattr(route, "LlamaCppBackend", _Llama)
+    monkeypatch.setattr(route, "InferenceOrchestrator", _Orchestrator)
+    monkeypatch.setattr(route, "_raise_if_sidecar_swap_in_progress", lambda: None)
+    monkeypatch.setattr(route, "release_chat_gpu_claim", lambda: None)
+    monkeypatch.setattr(multi_model_settings, "get_multi_model_enabled", lambda: True)
+
+    seen: list[bool] = []
+    short: list[int] = []
+
+    async def _load(request, *_args, enforce_memory_guardrail = False, **_kwargs):
+        seen.append(enforce_memory_guardrail)
+        if short and request.alongside:
+            short.pop()
+            raise GpuMemoryShortError("needs 13 GB, 8 GB free", short_mib = 5000)
+        llama = route.get_llama_cpp_backend()
+        llama.model_identifier, llama.hf_variant = request.model_path, request.gguf_variant
+        llama.is_loaded = llama.is_active = True
+        return "loaded"
+
+    monkeypatch.setattr(route, "_run_tracked_load_model_impl", _load)
+
+    def _gated(**fields):
+        request = LoadRequest(**fields)
+        return asyncio.run(route.load_model_gated(request, None, "s", user_initiated = True))
+
+    # Fits beside the active model: its own fit decided, the guardrail never asked.
+    assert _gated(model_path = "org/C-GGUF", alongside = True) == "loaded"
+    assert seen == [False]
+    # Room made by evicting a kept model: still the slot's own ladder, never judged.
+    seen.clear()
+    short.append(1)
+    assert _gated(model_path = "org/D-GGUF", alongside = True) == "loaded"
+    assert seen == [False, False]
+    # Fits nowhere beside it, nothing left to evict: the replacement load is judged.
+    model_slots.slots.clear()
+    seen.clear()
+    short.append(1)
+    assert _gated(model_path = "org/F-GGUF", alongside = True) == "loaded"
+    assert seen == [False, True]
+    # An ordinary load replaces the active model, so it is judged as before.
+    seen.clear()
+    assert _gated(model_path = "org/E-GGUF") == "loaded"
+    assert seen == [True]

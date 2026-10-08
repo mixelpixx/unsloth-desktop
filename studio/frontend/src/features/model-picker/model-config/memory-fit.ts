@@ -76,6 +76,14 @@ export interface MemoryFitEstimate {
   adaptersUnsized: boolean;
   /** `--n-cpu-moe` is set, so the GPU figure ignores it and reads high. */
   moeOffloadUnmodelled: boolean;
+  /** False when the loader will shrink the priced context to fit. Absent reads as pinned. */
+  contextIsPinned?: boolean;
+  /** `gpuBytes` at the context the loader stops shrinking at, sent with an unpinned context. */
+  gpuFloorBytes?: number | null;
+  /** Whether a load still over the card at the floor moves layers to the CPU. */
+  floorCanOffload?: boolean;
+  /** The context the figures were priced at. */
+  nCtx?: number;
 }
 
 /** What the load may draw on, as resolved by resolveMemoryCapacityGb and the host. */
@@ -228,12 +236,50 @@ export interface MemoryFitResult {
   advisory: MemoryAdvisory | null;
 }
 
+/** Whether Auto has a usable GPU estimate at its context floor. */
+function hasContextFloor(estimate: MemoryFitEstimate): boolean {
+  return estimate.contextIsPinned === false && Number.isFinite(estimate.gpuFloorBytes);
+}
+
+/** Use the GPU floor when Auto's native context exceeds capacity. Keep host terms at
+ *  native as an upper bound: the fitted context is unknown and cache growth can be nonlinear. */
+function autoContextFigures(
+  estimate: MemoryFitEstimate,
+  capacity: MemoryFitCapacity,
+  cpuOnly: boolean,
+): { gpuBytes: number; totalBytes: number; contextShrinks: boolean } {
+  const native = { gpuBytes: estimate.gpuBytes, totalBytes: estimate.totalBytes, contextShrinks: false };
+  // Avoid coercing invalid figures into a fit.
+  if (
+    cpuOnly ||
+    !hasContextFloor(estimate) ||
+    !Number.isFinite(estimate.gpuBytes) ||
+    !Number.isFinite(estimate.totalBytes)
+  ) {
+    return native;
+  }
+  const nativeFit = capacity.singleMemoryPool
+    ? classifyMemoryFit(estimate.totalBytes, capacity.totalCapacityGb)
+    : classifyMemoryFit(estimate.gpuBytes, capacity.gpuCapacityGb);
+  // A context that fits is opened at its native length.
+  if (nativeFit !== "exceeds") {
+    return native;
+  }
+  const shrink = Math.max(0, estimate.gpuBytes - (estimate.gpuFloorBytes as number));
+  return {
+    gpuBytes: estimate.gpuBytes - shrink,
+    totalBytes: estimate.totalBytes - shrink,
+    contextShrinks: true,
+  };
+}
+
 /** Every verdict the row shows, plus the one note it prints. `_host_offload_shortfall_message`
  *  refuses a load whose offloaded weights exceed psutil's AVAILABLE memory less a reserve,
  *  not the physical total, so a 70 GB host share read as fitting a 128 GB box with 32 GB
  *  free. The free-memory verdicts here WARN instead: the bytes a pending load reclaims are
  *  mostly the resident model's own, which Studio unloads first. With nothing to reclaim, free
- *  VRAM that cannot hold the GPU share is an "exceeds", since no unload will change it. */
+ *  VRAM that cannot hold a pinned context's GPU share is an "exceeds", since no unload will
+ *  change it; Auto context fits against what is free, so there it stays pressure. */
 export function resolveMemoryFit(
   estimate: MemoryFitEstimate,
   capacity: MemoryFitCapacity,
@@ -241,10 +287,12 @@ export function resolveMemoryFit(
   const { singleMemoryPool } = capacity;
   const cpuOnly =
     !singleMemoryPool && estimate.gpuBytes === 0 && estimate.totalBytes > 0;
-  const rawGpuFit = classifyMemoryFit(
-    estimate.gpuBytes,
-    capacity.gpuCapacityGb,
+  const { gpuBytes, totalBytes, contextShrinks } = autoContextFigures(
+    estimate,
+    capacity,
+    cpuOnly,
   );
+  const rawGpuFit = classifyMemoryFit(gpuBytes, capacity.gpuCapacityGb);
   // Studio unloads the resident model BEFORE the replacement allocates, so its bytes are about to
   // be free rather than competing. Charging them counted a model against ITSELF: reloading an
   // unchanged config warned it would not fit the memory its own resident copy held. Free-memory
@@ -260,7 +308,7 @@ export function resolveMemoryFit(
   // alone let a partly CPU-offloaded load on a Vulkan iGPU look comfortable.
   const freeGpuCredit = singleMemoryPool ? reclaimableTotal : reclaimableGpu;
   const freeGpuFit = classifyAvailableMemory(
-    singleMemoryPool ? estimate.totalBytes : estimate.gpuBytes,
+    singleMemoryPool ? totalBytes : gpuBytes,
     capacity.freeGpuCapacityGb,
     capacity.freeGpuCapacityKnown,
     freeGpuCredit,
@@ -270,12 +318,12 @@ export function resolveMemoryFit(
   // Guarded, not subtracted blind: a non-finite figure makes the difference NaN, which
   // `Math.max(0, ...)` propagates rather than clamps. 0 classifies the same and is printable.
   const hostShareBytes =
-    Number.isFinite(estimate.totalBytes) && Number.isFinite(estimate.gpuBytes)
-      ? Math.max(0, estimate.totalBytes - estimate.gpuBytes)
+    Number.isFinite(totalBytes) && Number.isFinite(gpuBytes)
+      ? Math.max(0, totalBytes - gpuBytes)
       : 0;
   // Same question for the other pool, with the same credit. See the two notes above.
   const usableHostFit = classifyAvailableMemory(
-    singleMemoryPool ? estimate.totalBytes : hostShareBytes,
+    singleMemoryPool ? totalBytes : hostShareBytes,
     capacity.usableSystemRamGb,
     capacity.usableSystemRamKnown,
     singleMemoryPool ? reclaimableTotal : reclaimableTotal - reclaimableGpu,
@@ -287,8 +335,10 @@ export function resolveMemoryFit(
   // bytes come back first, and that credit is an estimate. With nothing to reclaim it is what the
   // load will actually meet, so a share it cannot hold is red, not amber. A card that held the
   // load on paper while other processes held the VRAM read "tight", and the load then failed.
+  // Not for an unpinned context: Auto fits against what is free, shrinking the context first,
+  // so there the shortfall is pressure, not an overage.
   const gpuFit: MemoryFitVerdict =
-    freeGpuFit === "exceeds" && freeGpuCredit === 0
+    freeGpuFit === "exceeds" && freeGpuCredit === 0 && !hasContextFloor(estimate)
       ? "exceeds"
       : rawGpuFit === "fits" && gpuPressured
         ? "tight"
@@ -300,7 +350,7 @@ export function resolveMemoryFit(
     ? "unknown"
     : classifyMemoryFit(hostShareBytes, capacity.systemRamCapacityGb);
   const combinedFit = classifyMemoryFit(
-    estimate.totalBytes,
+    totalBytes,
     capacity.totalCapacityGb,
   );
   const totalFit = worseMemoryFit(combinedFit, hostShareFit);
@@ -334,6 +384,7 @@ export function resolveMemoryFit(
       rawGpuFit,
       gpuPressured,
       hostPressured,
+      contextShrinks,
     }),
   };
 }
@@ -348,6 +399,8 @@ interface AdvisoryVerdicts {
   rawGpuFit: MemoryFitVerdict;
   gpuPressured: boolean;
   hostPressured: boolean;
+  /** The native-context figure exceeds the pool, but Auto context shrinks it to fit. */
+  contextShrinks: boolean;
 }
 
 function classifyAvailableMemory(
@@ -372,6 +425,19 @@ function classifyAvailableMemory(
   if (known && afterUnloadGb === 0 && Number.isFinite(bytes) && bytes > 0)
     return "exceeds";
   return classifyMemoryFit(bytes, afterUnloadGb);
+}
+
+/** Explain why Auto's native estimate can exceed capacity without a warning. */
+function contextShrinksAdvisory(estimate: MemoryFitEstimate): MemoryAdvisory {
+  const nCtx = estimate.nCtx;
+  const priced =
+    nCtx != null && Number.isFinite(nCtx) && nCtx > 0
+      ? `the full ${nCtx.toLocaleString()}-token context`
+      : "the model's full context";
+  return {
+    tone: "muted",
+    text: `Estimated at ${priced}. Auto context will shrink it to fit.`,
+  };
 }
 
 /** At most one note, most actionable first. An unsizable cache outranks any verdict drawn from
@@ -434,8 +500,14 @@ export function resolveMemoryAdvisory(
     if (verdicts.hostPressured || verdicts.gpuPressured) {
       return {
         tone: "muted",
-        text: "Fits this machine, but little memory is free right now. Free memory or try Auto context.",
+        text: hasContextFloor(estimate)
+          ? "Fits this machine, but little memory is free right now, so Auto may pick a shorter context. Free memory first."
+          : "Fits this machine, but little memory is free right now. Free memory or try Auto context.",
       };
+    }
+    // Free-memory pressure takes priority because the loader fits against available memory.
+    if (verdicts.contextShrinks) {
+      return contextShrinksAdvisory(estimate);
     }
     return null;
   }
@@ -465,6 +537,15 @@ export function resolveMemoryAdvisory(
     };
   }
   if (verdicts.gpuFit === "exceeds") {
+    // At Auto's floor, further relief requires CPU offload, if these settings allow it.
+    if (hasContextFloor(estimate)) {
+      return {
+        tone: "warn",
+        text: estimate.floorCanOffload
+          ? "Exceeds GPU memory even at the shortest context the loader tries, so some layers will run on the CPU and generation will be slower."
+          : "Exceeds GPU memory even at the shortest context the loader tries, and these settings keep layers from moving to the CPU, so loading may fail.",
+      };
+    }
     // The card holds it on paper, but not what is free on it right now.
     if (verdicts.rawGpuFit !== "exceeds") {
       return {
@@ -485,11 +566,18 @@ export function resolveMemoryAdvisory(
       text: "Fits system RAM, but little is free right now. Free memory, or try a shorter context or smaller model.",
     };
   }
-  if (verdicts.rawGpuFit === "fits" && verdicts.gpuPressured) {
+  // Tight still fits the card.
+  if ((verdicts.rawGpuFit === "fits" || verdicts.rawGpuFit === "tight") && verdicts.gpuPressured) {
     return {
       tone: "warn",
-      text: "Fits this GPU, but little VRAM is free right now. Free memory or try Auto context.",
+      text: hasContextFloor(estimate)
+        ? `Fits this GPU, but little VRAM is free right now, so Auto may pick a shorter context${estimate.floorCanOffload ? " or run some layers on the CPU" : ""}. Free memory first.`
+        : "Fits this GPU, but little VRAM is free right now. Free memory or try Auto context.",
     };
+  }
+  // As above, show free-memory pressure before the Auto note.
+  if (verdicts.contextShrinks) {
+    return contextShrinksAdvisory(estimate);
   }
   return null;
 }

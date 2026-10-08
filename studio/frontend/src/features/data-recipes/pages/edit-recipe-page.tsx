@@ -60,10 +60,11 @@ export function EditRecipePage({ recipeId }: EditRecipePageProps): ReactElement 
     let active = true;
     const cachedRecipe = getCachedRecipe(recipeId);
     if (cachedRecipe) {
+      // A later server read would replace edits already made in the open editor.
       setLoadState({ status: "ready", record: cachedRecipe });
-    } else {
-      setLoadState({ status: "loading" });
+      return;
     }
+    setLoadState({ status: "loading" });
 
     getRecipe(recipeId)
       .then((record) => {
@@ -78,18 +79,16 @@ export function EditRecipePage({ recipeId }: EditRecipePageProps): ReactElement 
         setLoadState({ status: "ready", record });
       })
       .catch((error: unknown) => {
+        // biome-ignore lint/suspicious/noConsole: the load state below is what the user sees
+        console.error("Load recipe failed:", error);
         if (!active) {
           return;
         }
-        // A cached copy already on screen stays usable; only a blank load becomes an error.
-        setLoadState((current) =>
-          current.status === "ready"
-            ? current
-            : {
-                status: "error",
-                message: error instanceof Error ? error.message : "",
-              },
-        );
+        // A failed read is not a deleted recipe: say so, rather than offering "not found".
+        setLoadState({
+          status: "error",
+          message: error instanceof Error ? error.message : "",
+        });
       });
     return () => {
       active = false;
@@ -104,13 +103,22 @@ export function EditRecipePage({ recipeId }: EditRecipePageProps): ReactElement 
     signalReady();
   }, [loadState.status, signalReady]);
 
+  // The version this editor is built on, so a save over another window's newer copy is refused.
+  const editedVersion = useRef<number | undefined>(undefined);
+  const loadedRecord = loadState.status === "ready" ? loadState.record : null;
+  useEffect(() => {
+    editedVersion.current = loadedRecord?.updatedAt;
+  }, [loadedRecord]);
+
   const handlePersist = useCallback(
     async (input: { id: string | null; name: string; payload: RecipePayload }) => {
       const record = await saveRecipe({
         id: input.id ?? recipeId,
         name: input.name,
         payload: input.payload,
+        baseUpdatedAt: editedVersion.current,
       });
+      editedVersion.current = record.updatedAt;
       primeRecipeCache(record);
       return { id: record.id, updatedAt: record.updatedAt };
     },
