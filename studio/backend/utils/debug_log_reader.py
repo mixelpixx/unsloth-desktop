@@ -19,7 +19,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from utils.log_redaction import redact_log_text
 
@@ -106,11 +106,17 @@ def _split_lines(data: bytes, *, drop_partial_head: bool) -> tuple[list[str], bo
     return lines, truncated_head
 
 
-def _redact(lines: list[str]) -> list[str]:
+# Extra, source-specific masking run before redact_log_text (debug_log_sources.source_mask).
+Mask = Optional[Callable[[str], str]]
+
+
+def _redact(lines: list[str], mask: Mask = None) -> list[str]:
+    if mask is not None:
+        lines = [mask(line) for line in lines]
     return [redact_log_text(line) for line in lines]
 
 
-def read_tail(path: Path, max_lines: int = DEFAULT_TAIL_LINES) -> ReadResult:
+def read_tail(path: Path, max_lines: int = DEFAULT_TAIL_LINES, mask: Mask = None) -> ReadResult:
     max_lines = max(1, min(int(max_lines), MAX_TAIL_LINES))
     stat = path.stat()
     size = stat.st_size
@@ -142,7 +148,7 @@ def read_tail(path: Path, max_lines: int = DEFAULT_TAIL_LINES) -> ReadResult:
     if len(lines) > max_lines:
         lines = lines[-max_lines:]
         result.truncated_head = True
-    result.lines = _redact(lines[-MAX_LINES_PER_RESPONSE:])
+    result.lines = _redact(lines[-MAX_LINES_PER_RESPONSE:], mask)
     return result
 
 
@@ -150,11 +156,12 @@ def read_since(
     path: Path,
     cursor: Optional[str],
     max_lines: int = DEFAULT_TAIL_LINES,
+    mask: Mask = None,
 ) -> ReadResult:
     """Appended lines only, or a fresh tail when the cursor cannot apply."""
     decoded = decode_cursor(cursor)
     if decoded is None:
-        result = read_tail(path, max_lines)
+        result = read_tail(path, max_lines, mask)
         result.reset_reason = "initial" if not cursor else "cursor_stale"
         return result
 
@@ -164,12 +171,12 @@ def read_since(
     size = stat.st_size
 
     if current_key != key:
-        result = read_tail(path, max_lines)
+        result = read_tail(path, max_lines, mask)
         result.reset_reason = "rotated"
         return result
     if offset > size:
         # Reopened in "w" mode, or truncated underneath us.
-        result = read_tail(path, max_lines)
+        result = read_tail(path, max_lines, mask)
         result.reset_reason = "truncated"
         return result
 
@@ -214,6 +221,6 @@ def read_since(
 
     lines, truncated = _split_lines(body, drop_partial_head = result.dropped_bytes > 0)
     result.truncated_head = truncated
-    result.lines = _redact(lines)
+    result.lines = _redact(lines, mask)
     result.cursor = encode_cursor(current_key, start + consumed)
     return result

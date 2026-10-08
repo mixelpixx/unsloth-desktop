@@ -68,6 +68,9 @@ def public_and_lan(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
     monkeypatch.setattr(socket, "socket", lambda *a, **k: _FakeSocket())
     monkeypatch.delenv(run.DISABLE_PUBLIC_CHECK_ENV, raising = False)
+    # The public answer is what is under test, and a desktop OS skips that lookup by default
+    # (test_public_check_optout.py), so this runs as a server would on any host.
+    monkeypatch.setattr(run, "_on_desktop_os", lambda: False)
 
 
 # ── resolution ───────────────────────────────────────────────────────

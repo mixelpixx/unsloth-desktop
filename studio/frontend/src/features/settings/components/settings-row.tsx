@@ -9,7 +9,7 @@ import {
 import { cn } from "@/lib/utils";
 import { InformationCircleIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import type { ReactNode } from "react";
+import { type ReactNode, useId } from "react";
 
 export function SettingsRow({
   label,
@@ -35,6 +35,10 @@ export function SettingsRow({
   /** Right-aligned line under the control, kept out of its box so the control stays centred. */
   below?: ReactNode;
 }) {
+  // The label is a plain span, not a <label>, so the control's box is a group named after it:
+  // screen readers announce that name on entering the box, where a bare switch had none.
+  const labelId = useId();
+  const descriptionId = useId();
   return (
     <div
       data-settings-label={label}
@@ -64,7 +68,7 @@ export function SettingsRow({
               hint && "flex items-center gap-1.5",
             )}
           >
-            {label}
+            <span id={labelId}>{label}</span>
             {hint ? (
               <Tooltip>
                 <TooltipTrigger asChild={true}>
@@ -92,14 +96,24 @@ export function SettingsRow({
             ) : null}
           </span>
           {description ? (
-            <span className="text-xs text-muted-foreground leading-snug">
+            <span
+              id={descriptionId}
+              className="text-xs text-muted-foreground leading-snug"
+            >
               {description}
             </span>
           ) : null}
         </div>
       </div>
       {children ? (
-        <div className="flex max-w-full shrink-0 items-center">{children}</div>
+        <div
+          role="group"
+          aria-labelledby={labelId}
+          aria-describedby={description ? descriptionId : undefined}
+          className="flex max-w-full shrink-0 items-center"
+        >
+          {children}
+        </div>
       ) : null}
       {/* A line of its own, so it wraps under the control without moving it. */}
       {below ? <div className="flex basis-full justify-end">{below}</div> : null}

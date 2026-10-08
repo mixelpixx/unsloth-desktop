@@ -1,10 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-import { Link, createRouter, useRouterState } from "@tanstack/react-router";
+import {
+  type ErrorComponentProps,
+  Link,
+  createRouter,
+  useRouter,
+  useRouterState,
+} from "@tanstack/react-router";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { MascotImg } from "@/components/mascot-img";
 import { useT } from "@/i18n";
+import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { Route as rootRoute } from "./routes/__root";
 import { Route as apiMonitorRoute } from "./routes/api";
 import { Route as dataRecipesRoute } from "./routes/data-recipes";
@@ -64,9 +72,89 @@ function DefaultNotFound() {
   );
 }
 
+// How Chromium/Firefox and Safari word a lazy chunk the server no longer has: the
+// page outlived an update or rebuild, so only a reload fixes it.
+const STALE_CHUNK_ERROR =
+  /dynamically imported module|Importing a module script failed/i;
+
+function appErrorDetails(error: unknown, componentStack?: string): string {
+  const lines = [
+    error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+    `URL: ${window.location.href}`,
+    `Time: ${new Date().toISOString()}`,
+    `User agent: ${navigator.userAgent}`,
+  ];
+  if (error instanceof Error && error.stack) lines.push("", error.stack);
+  if (componentStack) lines.push("", "Component stack:", componentStack.trim());
+  return lines.join("\n");
+}
+
+// Plain English, not useT: this has to render when anything else, the locale
+// layer included, is what failed.
+function AppError({ error, info, reset }: ErrorComponentProps) {
+  const router = useRouter();
+  const [copied, setCopied] = useState<boolean | null>(null);
+  const message = error instanceof Error ? error.message : String(error);
+  const staleChunk = STALE_CHUNK_ERROR.test(message);
+
+  useEffect(() => {
+    if (copied === null) return;
+    const timer = window.setTimeout(() => setCopied(null), 2000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  return (
+    <div className="flex h-full min-h-0 flex-1 flex-col items-center justify-center gap-4 p-8 text-center">
+      <div role="alert" className="flex max-w-md flex-col items-center gap-1">
+        <h1 className="font-heading font-semibold text-2xl tracking-tight">
+          {staleChunk ? "Unsloth was updated" : "Something went wrong"}
+        </h1>
+        <p className="text-muted-foreground text-sm [overflow-wrap:anywhere]">
+          {staleChunk
+            ? "Reload to continue with the new version."
+            : message || "An unexpected error stopped this page."}
+        </p>
+      </div>
+      <div className="flex flex-wrap items-center justify-center gap-2">
+        <Button type="button" onClick={() => window.location.reload()}>
+          Reload
+        </Button>
+        {/* Retrying would fetch the same missing chunk. */}
+        {staleChunk ? null : (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              // reset clears a render error; invalidate re-runs a failed loader.
+              reset();
+              void router.invalidate();
+            }}
+          >
+            Try again
+          </Button>
+        )}
+        <Button
+          type="button"
+          variant="ghost"
+          onClick={async () => {
+            setCopied(
+              await copyToClipboard(
+                appErrorDetails(error, info?.componentStack),
+              ),
+            );
+          }}
+        >
+          {copied === null ? "Copy details" : copied ? "Copied" : "Copy failed"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export const router = createRouter({
   routeTree,
   defaultNotFoundComponent: DefaultNotFound,
+  defaultErrorComponent: AppError,
 });
 
 declare module "@tanstack/react-router" {

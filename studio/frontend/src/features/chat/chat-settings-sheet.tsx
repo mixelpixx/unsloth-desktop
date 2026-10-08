@@ -201,6 +201,7 @@ export function ParamSlider({
           onValueChange={([v]) => onChange(snapToStep(v, step, min, max))}
           className="panel-slider min-w-0 flex-1"
           disabled={disabled}
+          aria-label={label}
         />
         <NumericValueInput
           value={value}
@@ -247,6 +248,7 @@ export function ParamSlider({
         onValueChange={([v]) => onChange(snapToStep(v, step, min, max))}
         className="panel-slider"
         disabled={disabled}
+        aria-label={label}
       />
     </div>
   );

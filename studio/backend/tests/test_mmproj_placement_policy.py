@@ -1833,3 +1833,73 @@ def test_only_the_owner_may_name_a_custom_projector(monkeypatch, flag, managed):
     with pytest.raises(HTTPException) as err:
         routes._refuse_managed_custom_projector([flag, "/models/p.gguf"])
     assert err.value.status_code == 403
+
+
+def _record_log(monkeypatch) -> list[tuple[str, str]]:
+    """(level, message) from the llama_cpp module logger; structlog does not reach caplog."""
+    import core.inference.llama_cpp as lc
+
+    seen: list[tuple[str, str]] = []
+    real = lc.logger
+
+    class _Recorder:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def _record(self, level, msg, *args, **_kw):
+            seen.append((level, str(msg) % args if args else str(msg)))
+
+        def warning(self, msg, *args, **kw):
+            self._record("warning", msg, *args, **kw)
+
+        def info(self, msg, *args, **kw):
+            self._record("info", msg, *args, **kw)
+
+    monkeypatch.setattr(lc, "logger", _Recorder())
+    return seen
+
+
+def test_vision_switched_off_is_not_reported_as_a_missing_projector(tmp_path, monkeypatch):
+    """The per-model switch dropped a projector that resolved fine, so nothing is wrong.
+
+    The field log warned "Vision-capable GGUF loaded without a usable mmproj" on every
+    load of a model the user had deliberately set text-only.
+    """
+    log = _record_log(monkeypatch)
+    backend, gguf = _backend(tmp_path, memory = [(0, 12_000, 24_000)])
+
+    _launch(backend, gguf, disable_vision = True)
+
+    assert not any("without a usable mmproj" in m for _lvl, m in log)
+    assert ("info", "Vision off (per-model setting); image input is disabled for this session") in log
+
+
+def test_a_projector_that_does_not_resolve_still_warns(tmp_path, monkeypatch):
+    log = _record_log(monkeypatch)
+    backend, gguf = _backend(tmp_path, memory = [(0, 12_000, 24_000)])
+    backend._resolve_launch_mmproj_path = lambda **_kw: None
+
+    _launch(backend, gguf)
+
+    assert any(
+        lvl == "warning" and "Vision-capable GGUF loaded without a usable mmproj" in m
+        for lvl, m in log
+    )
+    assert not any("Vision off (per-model setting)" in m for _lvl, m in log)
+
+
+def test_the_drafter_drop_names_the_gpus_it_priced(tmp_path, monkeypatch):
+    """The probe stops at the smallest GPU set the model fits on and quotes that set's
+    budget, so "on any GPU subset" overstated what it checked."""
+    log = _record_log(monkeypatch)
+    backend, gguf = _drafter_backend(tmp_path, [(0, 8_692, 16_384)])
+    # Room for the projector and the model, not the drafter: the drop probe fires.
+    backend._mmproj_vram_bytes = lambda _path: 0
+
+    cmd = _launch_with_drafter(backend, gguf, tmp_path)
+
+    assert "--model-draft" not in cmd
+    (line,) = [m for _lvl, m in log if m.startswith("Speculative decoding disabled for this load")]
+    assert "on any GPU subset" not in line
+    assert "does not fit in the GPU memory budget (needs " in line
+    assert "on the 1 GPU tried)" in line

@@ -82,6 +82,11 @@ function harness(response: ReturnType<typeof jsonResponse>) {
       // writes to the cache inside that request, passing no download-manager funnel.
       "@/features/settings/low-disk-check": { checkDiskSpace: () => Promise.resolve() },
       "@/lib/model-lifecycle-events": {},
+      // loadModel's memory guardrail question: never asked here, so no refusal is recognised.
+      "@/lib/load-verdict": { memoryOvercommitVerdict: () => null },
+      "../memory-overcommit-consent": {
+        requestMemoryOvercommitConsent: async () => "cancel",
+      },
     },
   );
   return { module, requests };

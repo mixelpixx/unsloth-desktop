@@ -134,10 +134,11 @@ const FIT_BADGE: Record<GgufFitClass, FitBadgeMeta> = {
   },
   oom: {
     label: "Does not fit",
-    // Not "won't fit": llama-server never refuses a GGUF on size, it hands it to --fit. Same words
-    // the chat picker uses, where this class and `partial` share one mark.
+    // Not "won't fit": llama-server never refuses a GGUF on size, it hands it to --fit. But past
+    // VRAM plus the RAM it may offload into, that offload has nowhere to go: the weights page from
+    // disk or the allocation fails. Sharing `partial`'s "still works" copy promised otherwise.
     tooltip:
-      "Model may not fit but still works with offloading. Expect slower inference.",
+      "Exceeds VRAM + usable RAM — will page from disk or fail to load.",
     iconClassName: "text-rose-600 dark:text-rose-400",
   },
 };
@@ -148,6 +149,20 @@ const CHIP_BASE =
 const CHIP_DEFAULT =
   "border-[color-mix(in_oklab,var(--foreground)_calc(15%*var(--contrast-edge-gain,1)),transparent)] bg-muted text-foreground/85 dark:border-border/60 dark:bg-[rgb(255_255_255_/_calc(0.04*var(--contrast-wash-gain,1)))] dark:text-foreground/85";
 
+/** The fit mark: coloured icon, named for screen readers. The visible label beside it is
+ *  aria-hidden so the name is announced once. */
+function FitMark({ meta }: { meta: FitBadgeMeta }) {
+  return (
+    <span role="img" aria-label={meta.label} className="inline-flex shrink-0">
+      <HugeiconsIcon
+        icon={InformationCircleIcon}
+        strokeWidth={2.25}
+        className={cn("size-3.5 shrink-0", meta.iconClassName)}
+      />
+    </span>
+  );
+}
+
 function QuantBadge({
   quant,
   fit,
@@ -156,12 +171,13 @@ function QuantBadge({
   tooltipMode = "eager",
 }: {
   quant: string;
-  fit: GgufFitClass;
+  /** Null when there is nothing to score: no badge rather than a guessed one. */
+  fit: GgufFitClass | null;
   showFit?: boolean;
   variant?: "trigger" | "menu";
   tooltipMode?: "eager" | "lazy" | "none";
 }) {
-  const meta = FIT_BADGE[fit];
+  const meta = showFit && fit ? FIT_BADGE[fit] : null;
   const [tooltipArmed, setTooltipArmed] = useState(false);
   const [tooltipOpen, setTooltipOpen] = useState(false);
   const armTooltip = useCallback(() => {
@@ -180,14 +196,16 @@ function QuantBadge({
           CHIP_DEFAULT,
         )}
       >
-        {showFit && (
-          <HugeiconsIcon
-            icon={InformationCircleIcon}
-            strokeWidth={2.25}
-            className={cn("size-3.5 shrink-0", meta.iconClassName)}
-          />
-        )}
+        {meta && <FitMark meta={meta} />}
         <span className="min-w-0 truncate">{quant}</span>
+        {meta && (
+          <span
+            aria-hidden="true"
+            className={cn("shrink-0 font-normal", meta.iconClassName)}
+          >
+            {meta.label}
+          </span>
+        )}
       </span>
     ) : (
       // Trigger quant label is the row's primary identity and is short
@@ -195,17 +213,20 @@ function QuantBadge({
       // collapses to "q…" when trailing actions crowd the row. The info
       // group's `overflow-hidden` sacrifices the trailing status tags instead.
       <span className="inline-flex shrink-0 cursor-help items-center gap-1.5 whitespace-nowrap text-ui-12p5 font-medium tracking-tight tabular-nums text-foreground">
-        {showFit && (
-          <HugeiconsIcon
-            icon={InformationCircleIcon}
-            strokeWidth={2.25}
-            className={cn("size-3.5 shrink-0", meta.iconClassName)}
-          />
-        )}
+        {meta && <FitMark meta={meta} />}
         <span>{quant}</span>
+        {/* Phones keep the mark and its accessible name; the words would crowd out the quant. */}
+        {meta && (
+          <span
+            aria-hidden="true"
+            className={cn("text-ui-12 font-normal max-sm:hidden", meta.iconClassName)}
+          >
+            {meta.label}
+          </span>
+        )}
       </span>
     );
-  if (!showFit || tooltipMode === "none") return inner;
+  if (!meta || tooltipMode === "none") return inner;
   if (!tooltipActive) {
     return (
       <span
@@ -1051,7 +1072,7 @@ export function GgufDownloadCard({
                 {selected ? (
                   <QuantBadge
                     quant={selectedLabel ?? selected.quant}
-                    fit={selectedFit ?? "oom"}
+                    fit={selectedFit}
                     showFit={showFitInfo}
                   />
                 ) : (

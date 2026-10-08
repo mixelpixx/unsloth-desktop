@@ -145,6 +145,8 @@ const ADVISORY_TEXTS = {
     "Exceeds combined GPU and system memory. Try a shorter context or smaller model.",
   gpuExceeds:
     "Exceeds GPU memory. Try Auto context or fewer GPU layers; loading may still fail.",
+  gpuFreeExceeds:
+    "Exceeds the GPU memory free right now. Free VRAM, or try Auto context or fewer GPU layers; loading may fail.",
   hostPressure:
     "Fits system RAM, but little is free right now. Free memory, or try a shorter context or smaller model.",
   gpuPressure:
@@ -342,12 +344,63 @@ test("pressure advice does not shift layers into another pressured pool", () => 
 test("a discrete host under VRAM pressure alone gets the card wording", () => {
   const result = fit(
     { gpuBytes: 20 * GB, totalBytes: 20 * GB },
-    { freeGpuCapacityGb: 8 },
+    { freeGpuCapacityGb: 22 },
   );
   assert.equal(result.advisory?.text, ADVISORY_TEXTS.gpuPressure);
+  // Amber, not body text: little free is how the load fails at allocation.
+  assert.equal(result.advisory?.tone, "warn");
   // And the GPU figure is coloured amber rather than left green.
   assert.equal(result.rawGpuFit, "fits");
   assert.equal(result.gpuFit, "tight");
+});
+
+test("free VRAM that cannot hold the share, with nothing to unload, is red", () => {
+  // The card holds it on paper; what is free on it does not, and no resident model is about
+  // to hand anything back. That load fails at allocation, so it is not a "tight" fit.
+  const result = fit(
+    { gpuBytes: 20 * GB, totalBytes: 20 * GB },
+    { freeGpuCapacityGb: 8 },
+  );
+  assert.equal(result.rawGpuFit, "fits");
+  assert.equal(result.freeGpuFit, "exceeds");
+  assert.equal(result.gpuFit, "exceeds");
+  assert.deepEqual(result.advisory, {
+    tone: "warn",
+    text: ADVISORY_TEXTS.gpuFreeExceeds,
+  });
+  // A card too small outright keeps its own wording.
+  assert.equal(
+    fit({ gpuBytes: 30 * GB, totalBytes: 30 * GB }, { freeGpuCapacityGb: 8 }).advisory?.text,
+    ADVISORY_TEXTS.gpuExceeds,
+  );
+});
+
+test("a reclaimable resident model keeps the free-VRAM shortfall a warning", () => {
+  // The credit is an estimate of what the unload hands back, so the verdict stays amber.
+  const result = fit(
+    { gpuBytes: 20 * GB, totalBytes: 20 * GB },
+    {
+      freeGpuCapacityGb: 4,
+      reclaimableTotalBytes: 2 * GB,
+      reclaimableGpuBytes: 2 * GB,
+    },
+  );
+  assert.equal(result.freeGpuFit, "exceeds");
+  assert.equal(result.gpuFit, "tight");
+  assert.equal(result.advisory?.text, ADVISORY_TEXTS.gpuPressure);
+});
+
+test("little free system RAM behind a GPU load is amber, not body text", () => {
+  // Shaped like the field report (24 GB cards nearly empty, 7 GB of the load in system RAM,
+  // ~1 GB of it free): the GPU share is fine, the system-RAM share is not.
+  const result = fit(
+    { gpuBytes: 10 * GB, totalBytes: 50 * GB },
+    { usableSystemRamGb: 38 },
+  );
+  assert.deepEqual(result.advisory, {
+    tone: "warn",
+    text: ADVISORY_TEXTS.hostPressure,
+  });
 });
 
 test("a comfortable load says nothing at all", () => {
@@ -590,7 +643,8 @@ test("a confirmed zero free reading warns, while an unknown reading stays unknow
       { freeGpuCapacityGb: 0, freeGpuCapacityKnown: known },
     );
     assert.equal(gpu.freeGpuFit, known ? "exceeds" : "unknown");
-    assert.equal(gpu.gpuFit, known ? "tight" : "fits");
+    // Nothing to reclaim, so a known zero is what the load will meet: red, not amber.
+    assert.equal(gpu.gpuFit, known ? "exceeds" : "fits");
     assert.equal(gpu.cpuOnly, false);
     const ram = fit(
       { gpuBytes: 0, totalBytes: 25 * GB },

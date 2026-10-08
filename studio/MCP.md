@@ -1,5 +1,54 @@
 # MCP in Unsloth Studio
 
+## Add a local program (.exe, npx, uvx)
+
+Open **Manage MCP servers → Add server** and enter the program in **URL or executable**,
+for example `C:\tools\my-mcp\server.exe`, `npx` or `uvx`. Put each argument in its own
+**Arguments** row, or paste a whole command line such as
+`npx -y @modelcontextprotocol/server-filesystem C:\notes` and it is split for you. A path
+copied with Explorer's **Copy as path** (with quotes) works as-is. Environment variables go
+in the rows below. **Test connection** starts the program once and lists its tools.
+
+Local programs run with your account's access, so they are only allowed when Unsloth is
+on this computer alone. The default `unsloth studio` (which binds `127.0.0.1`) and the
+desktop app allow them. A network bind such as `unsloth studio -H 0.0.0.0` turns them off,
+and the dialog says so before you fill anything in. To use them anyway on a network bind,
+set `UNSLOTH_STUDIO_ALLOW_STDIO_MCP=1` before starting Unsloth.
+
+You can also import an existing `mcpServers` JSON config (Claude Desktop, Cursor, VS Code)
+with **Import config**. An entry's `cwd` is imported too.
+
+**Working directory** (optional) is the folder the program starts in, for servers that read
+a config or data file next to themselves. It must be the full path to an existing folder.
+Left empty, the program starts in Unsloth's own working directory, as before.
+
+The program gets the environment variables you set, plus the system ones programs commonly
+need: `ProgramFiles`, `ProgramData`, `ComSpec`, `windir`, `TMP` and similar on Windows, and
+the proxy and certificate variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`,
+`REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, ...) everywhere. A variable you set wins over the
+inherited one. Unsloth's own settings and keys are never passed on.
+
+### When a local program won't start
+
+**Test connection** says why: the program was not found, it exited during startup (with the
+last lines it printed), or it never answered the MCP handshake (it may be waiting for input,
+downloading on first run, or not be an MCP stdio server). Values of your environment
+variables are masked as `***` in that output.
+
+Each program's error output (stderr) is kept in `logs/mcp/<program>-<id>.log` in the Unsloth
+Studio folder (for example `~/.unsloth/studio`). A log is cleared when it grows past 2 MB.
+It is masked as it is written: your environment variable values (4+ characters), credentials in
+the command (after `--token`-style flags, in URLs) and recognisable tokens (`hf_...`, `sk-...`,
+`Bearer ...`) are replaced before a line reaches the file. Settings › Logs lists these logs under
+the server's name.
+
+A stdio server must print only MCP messages on stdout. Other text there (a banner, progress)
+is skipped and logged once per process.
+
+When you enter a command line through the API or a config file, wrap a program path that
+contains spaces in double quotes: `"C:\My Tools\server.exe" --stdio`. Without them, Windows
+would guess which part is the program, so Unsloth refuses it and shows the quoted form.
+
 ## Connect Blender MCP
 
 Blender MCP is **disabled by default**. Unsloth Studio downloads a pinned, checksum-verified

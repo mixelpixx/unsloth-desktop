@@ -11,6 +11,7 @@ import {
   loadModelMemorySettings,
   updateModelMemorySettings,
 } from "../api/model-memory";
+import { LoadGuardrailsRow } from "./load-guardrails-row";
 import { SettingsRow } from "./settings-row";
 import { SettingsSection } from "./settings-section";
 
@@ -146,6 +147,7 @@ export function ModelMemorySection() {
           onCheckedChange={(noRamReserve) => void persist({ noRamReserve })}
         />
       </SettingsRow>
+      <LoadGuardrailsRow />
       {error ? (
         <p className="pb-3 text-xs text-destructive">{error}</p>
       ) : (

@@ -191,11 +191,13 @@ Creates a free Cloudflare link that serves Unsloth - you can access the link glo
 ```bash
 unsloth studio --secure
 ```
-`-H 0.0.0.0` and different ports also work:
+**LAN Access (home network)**: `Settings > API keys > LAN access`. Use this to reach Unsloth from another device at home; plain `unsloth studio` stays on `127.0.0.1` (this computer only).
+
+**Raw network bind (servers and VMs)**: `-H 0.0.0.0` and different ports also work:
 ```bash
 unsloth studio -H 0.0.0.0 -p 8888
 ```
-**LAN Access (home network)**: `Settings > API keys > LAN access`
+On a network bind like this, local-program MCP servers (an `.exe`, `npx`, `uvx`...) are turned off, since they run with your account's access. If you only use Unsloth on this computer, start it with plain `unsloth studio` and they work; to allow them on the network anyway, set `UNSLOTH_STUDIO_ALLOW_STDIO_MCP=1` before starting.
 
 #### Password management & headless starts
 Exposing Unsloth (`--secure`, `--cloudflare`, or a non-loopback `-H`) asks once at the terminal for a new admin password. Ctrl+C there aborts the launch rather than exposing the auto-generated one; set a password non-interactively instead, or use `-H 127.0.0.1` to stay off the network.
@@ -388,6 +390,9 @@ curl -fsSL https://unsloth.ai/install.sh | UNSLOTH_STUDIO_HOME=/abs/path sh
 ```powershell
 $env:UNSLOTH_STUDIO_HOME='C:\path'; irm https://unsloth.ai/install.ps1 | iex
 ```
+On Windows, a custom location gets Start menu and Desktop shortcuts when `UNSLOTH_STUDIO_HOME` is saved as a user or machine environment variable (so new terminals see it), or when you set `UNSLOTH_CREATE_SHORTCUTS=1` for the install. A one-off `$env:` value for a throwaway sandbox gets no shortcuts. The Desktop app always uses the default location.
+
+On Windows and macOS, a network bind (`-H 0.0.0.0`) no longer asks an outside service whether your public IP is reachable; set `UNSLOTH_STUDIO_FORCE_PUBLIC_CHECK=1` to run that check anyway (for example on a cloud VM), or `UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK=1` to turn it off everywhere.
 
 Point the frontend build at a corporate npm mirror/proxy with `UNSLOTH_NPM_REGISTRY`:
 ```bash

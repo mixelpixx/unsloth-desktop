@@ -464,15 +464,21 @@ test("each fit verdict is an info mark that explains itself", () => {
   assert.ok(!HUB_CARD.includes('label: "Might fit"'));
   assert.ok(!PICKERS.includes("Loading can fail while other apps"));
   assert.ok(!HUB_CARD.includes("Within the last GB of VRAM headroom"));
-  // The Hub's oom row says it too, so the two surfaces read alike on a host where every
-  // over-budget quant lands in that class.
+  // Still no "won't fit": llama-server never refuses a GGUF on size.
   assert.ok(!HUB_CARD.includes('label: "Won\'t fit"'));
+  // But the Hub's oom tier is past VRAM plus the RAM it may offload into, so it no longer shares
+  // partial's "still works" promise: that offload has nowhere to go.
   assert.equal(
     HUB_CARD.split(
       '"Model may not fit but still works with offloading. Expect slower inference."',
     ).length - 1,
-    2,
-    "partial and oom both",
+    1,
+    "partial only",
+  );
+  assert.ok(
+    HUB_CARD.includes(
+      '"Exceeds VRAM + usable RAM — will page from disk or fail to load."',
+    ),
   );
 
   // Marks are reachable by screen readers without the tooltip.
@@ -488,6 +494,11 @@ test("each fit verdict is an info mark that explains itself", () => {
     ),
   );
   assert.ok(PICKERS.includes("aria-label={verdict.label}"));
+  // The Hub's mark names itself too, and its label is printed rather than defined and dropped.
+  assert.ok(HUB_CARD.includes("aria-label={meta.label}"));
+  assert.match(HUB_CARD, />\s*\{meta\.label\}\s*</);
+  // No verdict for nothing selected, rather than a red "Does not fit" by default.
+  assert.ok(!HUB_CARD.includes('selectedFit ?? "oom"'));
   // An over-budget figure is a TOTAL: `partial` splits across VRAM and RAM, and the number is
   // weights plus activations plus KV, so "Needs ~47GB VRAM" argued with the offload verdict.
   assert.ok(PICKERS.includes("`Needs ~${vramEst}GB memory (GPU: ${gpuGb}GB)`"));

@@ -2,6 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { authFetch } from "@/features/auth";
+import { stopConnectionMonitor } from "@/lib/connection-monitor";
 import { toastError } from "@/shared/toast";
 import { useState } from "react";
 import {
@@ -50,6 +51,9 @@ export function ShutdownDialog({
     }
 
     onAfterShutdown?.();
+    // The React tree outlives the body it is about to lose, so the monitor would go on probing a
+    // backend the user just stopped, to put a banner on a page nobody can see.
+    stopConnectionMonitor();
     document.body.innerHTML = `
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;gap:12px">
         <p style="font-size:calc(1.1rem * var(--ui-font-scale, 1));font-weight:600;margin:0">Unsloth has stopped.</p>
@@ -64,8 +68,8 @@ export function ShutdownDialog({
           <AlertDialogTitle>Stop Unsloth?</AlertDialogTitle>
           <AlertDialogDescription>
             This will shut down the server. Any active training or inference
-            jobs will be terminated. You can restart it any time from the
-            desktop shortcut.
+            jobs will be terminated. Start it again from the Unsloth Studio
+            shortcut, or run <code>unsloth studio</code> in a terminal.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>

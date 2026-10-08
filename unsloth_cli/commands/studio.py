@@ -2051,6 +2051,7 @@ def studio_default(
         with _studio_deps.studio_backend_imports("unsloth studio"):
             run_mod = _load_run_module()
         run_server = run_mod.run_server
+        _install_console_close_cleanup(run_mod)
 
         if not silent:
             launch_host = _openable_host_for_bind(run_mod, host)
@@ -2697,6 +2698,7 @@ def run(
     with _studio_deps.studio_backend_imports("unsloth studio"):
         run_mod = _load_run_module()
     run_server = run_mod.run_server
+    _install_console_close_cleanup(run_mod)
 
     # Match the route handlers' import path and set it before uvicorn binds; run_server() applies the same pair, idempotently.
     from state.tool_policy import set_tool_policy, set_tool_policy_default
@@ -2723,6 +2725,10 @@ def run(
 
     from studio.backend.run import _graceful_shutdown, _server
 
+    # Before the health wait and the model load, not at the wait loop: a load can take minutes, and the except
+    # below shuts the server down for the KeyboardInterrupt these signals become, where their default action
+    # would end the process with nothing cleaned up.
+    _graceful_shutdown_on_sigterm()
     try:
         request_host = getattr(app.state, "server_request_host", None)
         if not isinstance(request_host, str) or not request_host:
@@ -2850,7 +2856,6 @@ def run(
         typer.echo(f"API Key: {api_key}")
         typer.secho(_tool_notice, fg = _tool_notice_fg, bold = True)
 
-    _graceful_shutdown_on_sigterm()
     try:
         if run_mod._shutdown_event is not None:
             while not run_mod._shutdown_event.is_set():
@@ -2867,6 +2872,9 @@ def run(
 
 _PID_FILE = STUDIO_HOME / "studio.pid"
 PID_FILE_GLOB = "studio-*.pid"
+# run.py's record of a backend that is up or still binding, kept until it stops serving. Same layout as a
+# per-port record, and deliberately not a .pid, so PID_FILE_GLOB never mistakes it for a bound server.
+STARTUP_MARKER_GLOB = "studio-starting-*.marker"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -2996,16 +3004,31 @@ def _pid_is_studio_server(pid: int, created_times: "Sequence[float | None]" = ()
 
 
 def _graceful_shutdown_on_sigterm() -> None:
-    """Route SIGTERM (docker stop, `unsloth studio stop`) into the wait loop's Ctrl+C path,
-    which stops and saves a running training job before anything is killed."""
+    """Route SIGTERM (docker stop, `unsloth studio stop`) and, on Windows, SIGBREAK (Ctrl+Break) into
+    the wait loop's Ctrl+C path, which stops and saves a running training job before anything is killed.
+    Python installs no SIGBREAK handler of its own, so Ctrl+Break otherwise ends the process on the spot
+    with the pid records left behind; run.py's console handler passes it on expecting one."""
     import signal as _signal
 
     def _handler(signum, frame):
         # Restore the default so a second signal force-quits if the shutdown stalls.
-        _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+        _signal.signal(signum, _signal.SIG_DFL)
         raise KeyboardInterrupt
 
     _signal.signal(_signal.SIGTERM, _handler)
+    if hasattr(_signal, "SIGBREAK"):
+        _signal.signal(_signal.SIGBREAK, _handler)
+
+
+def _install_console_close_cleanup(run_mod) -> None:
+    """Make closing this console window (or logging off) shut the in-process server down the way
+    `python run.py` does. Windows raises no signal for that, so neither the handlers above nor atexit
+    run, and studio.pid, the per-port record and the startup marker outlived every such close. Called
+    before run_server() so a close during the minute of imports is covered too. run.py does the work
+    and is a no-op off Windows; an older run.py without it leaves things as they were."""
+    install = getattr(run_mod, "install_console_close_cleanup", None)
+    if install is not None:
+        install()
 
 
 def _signal_stop(pid: int) -> "str | None":
@@ -3026,12 +3049,44 @@ def _signal_stop(pid: int) -> "str | None":
     return None
 
 
+def _prune_stale_startup_markers() -> None:
+    """Drop the startup markers of backends that are gone. run.py takes its own back when it stops serving,
+    but taskkill /F, which is how Windows stops one, runs no exit hook, so every stop there leaked one. A
+    marker is kept while its process is alive and its recorded start time does not prove the PID reused: a
+    sibling reads it to know a backend is still binding and must not clear the compiled cache under it.
+    Unreadable or malformed ones are kept too, since a marker caught mid-write looks like either."""
+    try:
+        paths = sorted(STUDIO_HOME.glob(STARTUP_MARKER_GLOB))
+    except OSError:
+        return
+    for path in paths:
+        record = _read_pid_record(path)
+        if record is None:
+            continue
+        pid, created, _address = record
+        if _pid_alive(pid) and _pid_is_studio_server(pid, [created]):
+            continue
+        try:
+            path.unlink(missing_ok = True)
+        except OSError:
+            # A dead PID's marker is inert to run.py's sibling check; the next stop tries again.
+            pass
+
+
 @studio_app.command()
 def stop():
     """Stop every running Unsloth Studio server for this STUDIO_HOME.
 
     The port fallback can leave more than one running, so stop them all.
     """
+    try:
+        _stop_recorded_servers()
+    finally:
+        # Every way out, "nothing running" included, so a marker an earlier stop leaked goes too.
+        _prune_stale_startup_markers()
+
+
+def _stop_recorded_servers() -> None:
     unreadable: "list[Path]" = []
     entries = _pid_file_entries(unreadable)
     if not entries:

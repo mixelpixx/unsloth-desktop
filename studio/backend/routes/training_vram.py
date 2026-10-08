@@ -2,9 +2,11 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 """Memory coordination between inference and training. Uses live free VRAM to keep resident chat and STT
-models when they fit. STT is evicted before chat when training needs memory.
+models when they fit. STT is evicted before chat when training needs memory. Also prices a training config
+against its target GPUs before Start (estimate_training_fit), with the same estimator Start sizes with.
 """
 
+import math
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from hub.utils.hf_tokens import HfTokenArg, normalize_token
@@ -604,3 +606,263 @@ def coordinate_models_for_training(
         reason = "insufficient VRAM to run training alongside chat",
     )
     return freed
+
+
+# A fit above this share of the usable memory reads as tight rather than clean. The same 0.85 the frontend's
+# MEMORY_FIT_TIGHT_RATIO (src/lib/memory/thresholds.ts) draws the Load Model panel's line at, so the two
+# surfaces cannot call one footprint differently.
+FIT_TIGHT_RATIO = 0.85
+
+# VramBreakdown.to_gb_dict()'s parts. Anything else in vram_breakdown (min_per_gpu_N) is not a part.
+_BREAKDOWN_KEYS = (
+    "model_weights_gb",
+    "lora_adapters_gb",
+    "optimizer_states_gb",
+    "gradients_gb",
+    "activations_gb",
+    "cuda_overhead_gb",
+    "total_gb",
+)
+
+
+def _usable_training_gb(free_vals: List[float]) -> float:
+    """Usable memory across a GPU set, with auto_select_gpu_ids' arithmetic: the roomiest card counts in full and
+    each extra one at _MULTI_GPU_OVERHEAD. Studio splits layers across cards in one process, so a second GPU
+    adds room, not speed."""
+    ranked = sorted(free_vals, reverse = True)
+    return ranked[0] + sum(f * _MULTI_GPU_OVERHEAD for f in ranked[1:]) if ranked else 0.0
+
+
+def classify_training_fit(
+    required_gb: Optional[float],
+    usable_gb: Optional[float],
+    *,
+    min_per_gpu_gb: Optional[float] = None,
+    min_free_gb: Optional[float] = None,
+) -> Tuple[str, Optional[str]]:
+    """(verdict, reason) for a priced config against usable memory. The two checks auto-selection runs: the
+    aggregate, then the per-GPU floor (activations do not shard, so every card in a split needs its own)."""
+    if required_gb is None or usable_gb is None:
+        return "unknown", "estimate_unavailable"
+    # NaN and inf fail every comparison below and would fall through to a confident "fits".
+    if not (math.isfinite(required_gb) and math.isfinite(usable_gb)) or required_gb <= 0:
+        return "unknown", "estimate_unavailable"
+    if usable_gb <= 0 or required_gb > usable_gb:
+        return "exceeds", "insufficient_memory"
+    if min_per_gpu_gb is not None and min_free_gb is not None and min_free_gb < min_per_gpu_gb:
+        return "exceeds", "per_gpu_minimum"
+    if required_gb / usable_gb > FIT_TIGHT_RATIO:
+        return "tight", None
+    return "fits", None
+
+
+def _training_fit_on_gpus(
+    required_gb: Optional[float],
+    estimate_meta: Dict[str, Any],
+    gpu_ids: List[int],
+    free_by_index: Dict[int, float],
+) -> Dict[str, Any]:
+    """Verdict for a priced config on a concrete GPU set."""
+    if not gpu_ids or any(gpu_id not in free_by_index for gpu_id in gpu_ids):
+        # A card nvidia-smi could not read has no free figure, and 0 would read as "full".
+        return {
+            "verdict": "unknown",
+            "reason": "no_gpu_telemetry",
+            "usable_gb": None,
+            "min_per_gpu_gb": None,
+        }
+    free_vals = [free_by_index[gpu_id] for gpu_id in gpu_ids]
+    usable_gb = _usable_training_gb(free_vals)
+    min_per_gpu_gb = None
+    if len(gpu_ids) > 1:
+        min_per_gpu_gb = (estimate_meta.get("vram_breakdown") or {}).get(
+            f"min_per_gpu_{len(gpu_ids)}"
+        )
+    verdict, reason = classify_training_fit(
+        required_gb,
+        usable_gb,
+        min_per_gpu_gb = min_per_gpu_gb,
+        min_free_gb = min(free_vals),
+    )
+    return {
+        "verdict": verdict,
+        "reason": reason,
+        "usable_gb": round(usable_gb, 3),
+        "min_per_gpu_gb": min_per_gpu_gb,
+    }
+
+
+def _training_gpu_rows(devices: List[Dict[str, Any]], selected: List[int]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for device in devices:
+        index = device.get("index")
+        if not isinstance(index, int):
+            continue
+        total_gb = device.get("vram_total_gb")
+        used_gb = device.get("vram_used_gb")
+        rows.append(
+            {
+                "index": index,
+                "name": device.get("name"),
+                "total_gb": total_gb,
+                "free_gb": (
+                    round(max(total_gb - used_gb, 0.0), 3)
+                    if total_gb is not None and used_gb is not None
+                    else None
+                ),
+                "selected": index in selected,
+            }
+        )
+    return rows
+
+
+def estimate_training_fit(
+    *,
+    model_name: str,
+    hf_token: HfTokenArg,
+    training_type: str,
+    load_in_4bit: bool,
+    batch_size: int,
+    max_seq_length: int,
+    lora_rank: int,
+    target_modules: Optional[List[str]],
+    gradient_checkpointing: str,
+    optimizer: str,
+    gpu_ids: Optional[List[int]],
+    four_bit_available: bool = True,
+) -> Dict[str, Any]:
+    """Price a training config against the GPUs it would run on, before Start.
+
+    Sizes and places with the estimator and auto-selector Start itself uses, so the preview names the GPUs Start
+    would pick. Reads only what those read (config.json / Hub metadata, nvidia-smi): nothing is downloaded and
+    nothing is allocated on a GPU. Never raises: anything it cannot price is verdict "unknown" with a reason,
+    because a failed preview must not stand between the user and Start."""
+    explicit = bool(gpu_ids)
+    result: Dict[str, Any] = {
+        "verdict": "unknown",
+        "reason": None,
+        "required_gb": None,
+        "estimation_mode": None,
+        "breakdown": None,
+        "selection_mode": "explicit" if explicit else "auto",
+        "gpu_ids": [],
+        "usable_gb": None,
+        "min_per_gpu_gb": None,
+        "gpus": [],
+        "suggestion": None,
+    }
+    try:
+        from utils.hardware import (
+            DeviceType,
+            auto_select_gpu_ids,
+            estimate_required_model_memory_gb,
+            get_device,
+            get_visible_gpu_utilization,
+            resolve_requested_gpu_ids,
+        )
+        from utils.hardware.hardware import (
+            attention_preview_estimates,
+            reject_gpu_ids_without_torch_kernels,
+        )
+
+        # Auto-selection's own gate: per-card free VRAM exists on CUDA/ROCm and XPU only. MLX trains out of
+        # host memory, which is not a ceiling this verdict can be drawn against.
+        if get_device() not in (DeviceType.CUDA, DeviceType.XPU):
+            result["reason"] = "unsupported_device"
+            return result
+
+        # Full finetuning runs in 16-bit, so a 4-bit flag left over from QLoRA would under-count it.
+        effective_4bit = False if training_type == "Full Finetuning" else load_in_4bit
+        # Normalized the way /start hands them to the selector, so the two price the same config.
+        est_kwargs: Dict[str, Any] = dict(
+            hf_token = normalize_token(hf_token),
+            training_type = training_type,
+            load_in_4bit = effective_4bit,
+            batch_size = batch_size,
+            max_seq_length = max_seq_length,
+            lora_rank = lora_rank,
+            target_modules = target_modules or None,
+            gradient_checkpointing = (gradient_checkpointing or "").strip() or "unsloth",
+            optimizer = optimizer,
+        )
+
+        devices = get_visible_gpu_utilization().get("devices", []) or []
+        free_by_index = _free_vram_by_index(devices)
+
+        explicit_ids: List[int] = []
+        if explicit:
+            try:
+                explicit_ids = resolve_requested_gpu_ids(gpu_ids)
+                reject_gpu_ids_without_torch_kernels(explicit_ids)
+            except ValueError as exc:
+                # /start would 400 these; say so rather than price a target that cannot run.
+                logger.info("Training fit estimate: gpu_ids %s rejected: %s", gpu_ids, exc)
+                result["reason"] = "invalid_gpu_ids"
+                result["gpus"] = _training_gpu_rows(devices, [])
+                return result
+
+        def _price(**overrides: Any) -> Tuple[Optional[float], Dict[str, Any], List[int]]:
+            kwargs = {**est_kwargs, **overrides}
+            # Without unsloth's import: a preview must not pin a CUDA context in the server process.
+            if explicit:
+                with attention_preview_estimates():
+                    required, meta = estimate_required_model_memory_gb(model_name, **kwargs)
+                return required, meta, list(explicit_ids)
+            # One estimator call: the selector runs it and hands back its metadata, breakdown included.
+            with attention_preview_estimates():
+                selected, meta = auto_select_gpu_ids(model_name, **kwargs)
+            # None means training inherits every parent-visible card (non-numeric visibility mask).
+            ids = list(selected) if selected else sorted(free_by_index)
+            return meta.get("required_gb"), meta, ids
+
+        required_gb, meta, selected_ids = _price()
+        result["gpu_ids"] = selected_ids
+        result["gpus"] = _training_gpu_rows(devices, selected_ids)
+        if required_gb is None:
+            result["reason"] = "estimate_unavailable"
+            return result
+
+        result["required_gb"] = round(float(required_gb), 3)
+        estimation_mode = meta.get("estimation_mode")
+        if estimation_mode in ("detailed", "fallback"):
+            result["estimation_mode"] = estimation_mode
+        breakdown = meta.get("vram_breakdown")
+        if isinstance(breakdown, dict) and all(
+            isinstance(breakdown.get(key), (int, float)) for key in _BREAKDOWN_KEYS
+        ):
+            result["breakdown"] = {key: float(breakdown[key]) for key in _BREAKDOWN_KEYS}
+        result.update(_training_fit_on_gpus(required_gb, meta, selected_ids, free_by_index))
+
+        if result["verdict"] != "exceeds":
+            return result
+
+        # Cheaper settings the estimator can price, biggest lever first. QLoRA only for the methods it replaces
+        # (CPT is its own method) and only when the run could actually load 4-bit.
+        candidates: List[Tuple[str, Dict[str, Any]]] = []
+        if (
+            four_bit_available
+            and not effective_4bit
+            and training_type in ("LoRA/QLoRA", "Full Finetuning")
+        ):
+            candidates.append(("qlora", {"training_type": "LoRA/QLoRA", "load_in_4bit": True}))
+        if batch_size > 1:
+            candidates.append(("batch_size", {"batch_size": 1}))
+        for kind, overrides in candidates:
+            alt_required, alt_meta, alt_ids = _price(**overrides)
+            if alt_required is None:
+                continue
+            alt_fit = _training_fit_on_gpus(alt_required, alt_meta, alt_ids, free_by_index)
+            if alt_fit["verdict"] in ("fits", "tight"):
+                result["suggestion"] = {
+                    "kind": kind,
+                    "required_gb": round(float(alt_required), 3),
+                    "verdict": alt_fit["verdict"],
+                    "gpu_ids": alt_ids,
+                    "batch_size": overrides.get("batch_size"),
+                }
+                break
+        return result
+    except Exception as e:
+        logger.warning("Training fit estimate failed: %s", e)
+        result.update(verdict = "unknown", reason = "estimate_failed", suggestion = None)
+        return result

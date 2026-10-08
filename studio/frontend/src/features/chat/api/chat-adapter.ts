@@ -332,8 +332,13 @@ import {
   loadModel,
   streamChatCompletions,
   StreamInterruptedError,
+  unloadModel,
   validateModel,
 } from "./chat-api";
+import {
+  type AutoLoadConsentDecision,
+  requestAutoLoadConsent,
+} from "../auto-load-consent";
 import {
   createOpenAIContainer,
   listOpenAIContainers,
@@ -2283,6 +2288,8 @@ type AutoLoadCandidate = {
   ggufVariant: string | null;
   maxSeqLength: number;
   successLabel: string;
+  /** The quant's file size when known, else the source's; 0 when neither is. Shown when asking. */
+  sizeBytes: number;
 };
 
 // Same case rules as autoLoadSourceKey: folding a POSIX target would conflate /models/Foo and /models/foo.
@@ -2764,7 +2771,10 @@ async function resolveAutoLoadCandidate(
   rememberedVariant: string | null,
   isSkipped: (candidate: AutoLoadCandidate) => boolean,
 ): Promise<AutoLoadCandidate | null> {
-  const build = (ggufVariant: string | null): AutoLoadCandidate => ({
+  const build = (
+    ggufVariant: string | null,
+    sizeBytes = source.sizeBytes,
+  ): AutoLoadCandidate => ({
     id: source.id,
     loadId: source.loadId,
     kind: source.kind,
@@ -2773,6 +2783,7 @@ async function resolveAutoLoadCandidate(
     successLabel: ggufVariant
       ? `Loaded ${source.id} (${ggufVariant})`
       : `Loaded ${source.id}`,
+    sizeBytes,
   });
   if (!source.listVariants) {
     const candidate = build(null);
@@ -2794,7 +2805,7 @@ async function resolveAutoLoadCandidate(
       ]
     : downloaded;
   for (const variant of ordered) {
-    const candidate = build(variant.quant);
+    const candidate = build(variant.quant, variant.size_bytes || source.sizeBytes);
     if (!isSkipped(candidate)) return candidate;
   }
   return null;
@@ -2956,6 +2967,49 @@ async function ensureDefaultModelDownloaded(
   });
 }
 
+/** The starter model's size and whether it is already on disk, for the consent question. Best
+ *  effort: a failed listing asks without a size rather than not asking. */
+async function describeDefaultModel(
+  signal: AbortSignal | undefined,
+): Promise<{ downloaded: boolean; bytes: number }> {
+  try {
+    const listing = await listGgufVariants(DEFAULT_CHAT_MODEL_REPO, undefined, {
+      signal,
+    });
+    const variant = listing.variants.find(
+      (entry) =>
+        entry.quant?.toLowerCase() === DEFAULT_CHAT_MODEL_VARIANT.toLowerCase(),
+    );
+    return {
+      downloaded: Boolean(variant?.downloaded && variant.partial !== true),
+      bytes: variant?.download_size_bytes || variant?.size_bytes || 0,
+    };
+  } catch {
+    return { downloaded: false, bytes: 0 };
+  }
+}
+
+/**
+ * Stop during an auto-load used to mark the reply cancelled while the model kept loading: the
+ * abort cannot interrupt a /load that is already POSTed. Cancel this attempt by its request id,
+ * as the picker's Stop loading does, so a model resident for another chat is never touched.
+ */
+function cancelAutoLoadOnAbort(
+  signal: AbortSignal | undefined,
+  modelPath: string,
+  loadRequestId: string,
+): () => void {
+  if (!signal) return () => {};
+  const onAbort = (): void => {
+    void unloadModel({
+      model_path: modelPath,
+      cancel_load_request_id: loadRequestId,
+    }).catch(() => {});
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  return () => signal.removeEventListener("abort", onAbort);
+}
+
 // The test harness slices helpers from here; keep them below MAX_AUTO_LOAD_ATTEMPTS.
 // Slow downloads and llama-server warm-up need a long cap.
 const CLI_LOAD_ADOPT_MAX_MS = 600_000;
@@ -3092,10 +3146,11 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
   const specSettings = resolveSpeculativeSettingsForLoad();
   const lastLoaded = await readLastLocalModelLoad(options?.abortSignal);
   let autoLoadToastDismissed = false;
-  const toastId = toast.message("Loading a model…", {
+  // Nothing loads before the user agrees (see confirmAutoLoad), so this only says what is happening.
+  const toastId = toast.message("No model is loaded", {
     description: lastLoaded
-      ? "Loading last used model."
-      : "Auto-selecting the smallest downloaded model.",
+      ? "Checking your last used model…"
+      : "Checking which models are on this computer…",
     duration: Number.POSITIVE_INFINITY,
     closeButton: true,
     icon: createLoadingToastIcon(),
@@ -3160,6 +3215,24 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
 
   // Set once the user declines the HF token dialog, so nothing asks again.
   let autoLoadCancelled = false;
+  // The user's answer when they turned down loading a model they did not pick; ends the sweep and
+  // skips the starter download, since "no" to one model is not "yes" to the next. Boxed like
+  // loadFailure: set only in a nested fn.
+  const consent: {
+    declined: Exclude<AutoLoadConsentDecision, "load"> | null;
+  } = { declined: null };
+
+  async function confirmAutoLoad(
+    request: Parameters<typeof requestAutoLoadConsent>[0],
+  ): Promise<boolean> {
+    const decision = await requestAutoLoadConsent(request, options?.abortSignal);
+    // Stop while the question was open: end the send, not just this candidate.
+    options?.abortSignal?.throwIfAborted();
+    if (decision === "load") return true;
+    consent.declined = decision;
+    autoLoadCancelled = true;
+    return false;
+  }
 
   function noteLoadFailure(label: string, error: unknown): void {
     const detail =
@@ -3269,6 +3342,7 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
 
   async function loadAutoLoadCandidate(
     candidate: AutoLoadCandidate,
+    remembered = false,
   ): Promise<boolean> {
     if (
       autoLoadCancelled ||
@@ -3457,6 +3531,23 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
       );
       return false;
     }
+    // Asked only once the guard has passed it, so the user is never offered a model the server
+    // would refuse; and before /load, the first step that costs GPU memory.
+    if (
+      !(await confirmAutoLoad({
+        reason: remembered ? "last-used" : "smallest",
+        modelLabel: candidate.ggufVariant
+          ? `${candidate.id} (${candidate.ggufVariant})`
+          : candidate.id,
+        sizeBytes: candidate.sizeBytes,
+      }))
+    ) {
+      return false;
+    }
+    updateAutoLoadToast(
+      remembered ? "Loading last used model…" : "Loading a model…",
+      `${failureLabel}. Stop cancels the load.`,
+    );
     const autoLoadPin = retainedContextPin({
       isMlx: isServedByMlx(
         candidate.kind === "gguf",
@@ -3468,8 +3559,15 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
     });
     loadAttempts += 1;
     options?.abortSignal?.throwIfAborted();
+    const loadRequestId = crypto.randomUUID();
+    const releaseLoadCancel = cancelAutoLoadOnAbort(
+      options?.abortSignal,
+      modelPath,
+      loadRequestId,
+    );
     const loadResp = await loadModel({
       model_path: modelPath,
+      load_request_id: loadRequestId,
       hf_token: hfToken,
       max_seq_length: fitMaxSeqLength,
       load_in_4bit: true,
@@ -3509,11 +3607,13 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
               : {}),
           }
         : {}),
-    }).catch((error: unknown) => {
-      // The sweep's parameterless catches discard this error, so record it before rethrowing.
-      noteLoadFailure(failureLabel, error);
-      throw error;
-    });
+    })
+      .catch((error: unknown) => {
+        // The sweep's parameterless catches discard this error, so record it before rethrowing.
+        noteLoadFailure(failureLabel, error);
+        throw error;
+      })
+      .finally(releaseLoadCancel);
     // Do not apply this load to the visible runtime once its queue was cancelled; still await
     // /load so the lifecycle stays serialized.
     options?.abortSignal?.throwIfAborted();
@@ -3818,13 +3918,13 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
           if (!candidate) break;
           candidateResolvedFor.add(sourceKey);
           updateAutoLoadToast(
-            isRemembered ? "Loading last used model…" : "Loading a model…",
+            isRemembered ? "Checking last used model…" : "Checking a model…",
             candidate.ggufVariant
               ? `${candidate.id} (${candidate.ggufVariant})`
               : candidate.id,
           );
           try {
-            if (await loadAutoLoadCandidate(candidate)) {
+            if (await loadAutoLoadCandidate(candidate, isRemembered)) {
               return { loaded: true, blockedByTrustRemoteCode: false };
             }
           } catch {
@@ -3846,6 +3946,18 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
         hadNonTrustFailure = true;
         continue;
       }
+    }
+
+    // A "no" is the user's call, not a failure: no error toast, and no starter download behind it.
+    // "Choose a model" opened the picker, so it reports as handled; Cancel gets the caller's
+    // ordinary "No model loaded" hint.
+    if (consent.declined) {
+      toast.dismiss(toastId);
+      return {
+        loaded: false,
+        blockedByTrustRemoteCode: false,
+        loadFailureReported: consent.declined === "choose",
+      };
     }
 
     // The cap gates the default download too, so the whole /load budget is MAX_AUTO_LOAD_ATTEMPTS.
@@ -3910,6 +4022,23 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
         toast.dismiss(toastId);
         return { loaded: false, blockedByTrustRemoteCode };
       }
+      // After the preflight (never offer what the guard refuses), before any byte is fetched.
+      const starter = await describeDefaultModel(options?.abortSignal);
+      options?.abortSignal?.throwIfAborted();
+      if (
+        !(await confirmAutoLoad({
+          reason: starter.downloaded ? "smallest" : "default-download",
+          modelLabel: DEFAULT_CHAT_MODEL_LABEL,
+          sizeBytes: starter.bytes,
+        }))
+      ) {
+        toast.dismiss(toastId);
+        return {
+          loaded: false,
+          blockedByTrustRemoteCode: false,
+          loadFailureReported: consent.declined === "choose",
+        };
+      }
       const download = await ensureDefaultModelDownloaded(
         hfToken,
         options?.abortSignal,
@@ -3938,8 +4067,15 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
       );
       loadAttempts += 1;
       options?.abortSignal?.throwIfAborted();
+      const defaultLoadRequestId = crypto.randomUUID();
+      const releaseDefaultLoadCancel = cancelAutoLoadOnAbort(
+        options?.abortSignal,
+        DEFAULT_CHAT_MODEL_REPO,
+        defaultLoadRequestId,
+      );
       const loadResp = await loadModel({
         model_path: DEFAULT_CHAT_MODEL_REPO,
+        load_request_id: defaultLoadRequestId,
         hf_token: hfToken,
         // Model default under both modes: Auto layers + no pin means resolveFitMaxSeqLength returns 0.
         max_seq_length: 0,
@@ -3959,7 +4095,7 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
         gpu_layers: GPU_LAYERS_AUTO,
         n_cpu_moe: 0,
         gpu_ids: defaultGpuIds ?? undefined,
-      });
+      }).finally(releaseDefaultLoadCancel);
       options?.abortSignal?.throwIfAborted();
       applyAutoLoadRuntimeState(options, () => {
         saveSpeculativeType(specSettings.speculativeType);

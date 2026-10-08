@@ -46,7 +46,7 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { type ReactElement, type ReactNode, useState } from "react";
+import { type ReactElement, type ReactNode, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { ChartSettingsSheet } from "./charts/chart-settings-sheet";
 import {
@@ -321,7 +321,10 @@ export function ProgressSection({
           )}
 
           {data.error && (
-            <p className="rounded-2xl border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-red-500 leading-relaxed">
+            <p
+              role="alert"
+              className="whitespace-pre-line break-words rounded-2xl border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive leading-relaxed"
+            >
               {data.error}
             </p>
           )}
@@ -600,6 +603,7 @@ function TrainingHeaderActions({
   stopRequested: boolean;
 }): ReactElement {
   const t = useT();
+  const stopAndSaveRef = useRef<HTMLButtonElement>(null);
   return (
     <div className="flex items-center gap-2">
       <ConfigPopoverButton configItems={configItems} />
@@ -622,6 +626,11 @@ function TrainingHeaderActions({
         <AlertDialogContent
           className="w-max max-w-[95vw]"
           overlayClassName="bg-background/40 supports-backdrop-filter:backdrop-blur-[1px]"
+          // Radix focuses Cancel by default; land on the run-preserving action instead.
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            stopAndSaveRef.current?.focus({ preventScroll: true });
+          }}
         >
           <AlertDialogHeader>
             <AlertDialogTitle>{t("studio.training.stopTitle")}</AlertDialogTitle>
@@ -630,14 +639,19 @@ function TrainingHeaderActions({
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>{t("studio.training.continueAction")}</AlertDialogCancel>
+            {/* Set apart on the left so it is never mistaken for "close this dialog". */}
             <AlertDialogAction
               variant="destructive"
+              className="sm:mr-auto"
               onClick={() => onRequestStop(false)}
             >
-              {t("studio.training.cancelAction")}
+              {t("studio.training.stopWithoutSaving")}
             </AlertDialogAction>
-            <AlertDialogAction onClick={() => onRequestStop(true)}>
+            <AlertDialogCancel>{t("studio.training.continueAction")}</AlertDialogCancel>
+            <AlertDialogAction
+              ref={stopAndSaveRef}
+              onClick={() => onRequestStop(true)}
+            >
               {t("studio.training.stopAndSave")}
             </AlertDialogAction>
           </AlertDialogFooter>

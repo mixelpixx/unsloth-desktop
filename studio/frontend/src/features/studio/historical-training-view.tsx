@@ -186,7 +186,10 @@ export function HistoricalTrainingView({
 
   if (error || !detail) {
     return (
-      <div className="rounded-xl border border-destructive/30 bg-destructive/5 p-8 text-sm text-red-500">
+      <div
+        role="alert"
+        className="whitespace-pre-line break-words rounded-xl border border-destructive/30 bg-destructive/5 p-8 text-sm text-destructive"
+      >
         {error ?? t("studio.history.runNotFound")}
       </div>
     );

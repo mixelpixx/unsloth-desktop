@@ -4,6 +4,7 @@
 import { useAppShellReadySignal } from "@/components/app-readiness";
 import { AppSidebar } from "@/components/app-sidebar";
 import { CommandPalette } from "@/components/command-palette";
+import { ConnectionBanner } from "@/components/connection-banner";
 import { Navbar } from "@/components/navbar";
 import { SidebarEdgeTrigger } from "@/components/sidebar-edge-trigger";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
@@ -22,6 +23,7 @@ import {
   type ChatSearch,
   clearNewChatDraft,
   hydrateModelDisclaimerPreference,
+  MemoryOvercommitDialog,
   openFolderAsProject,
   startLlamaCppAutoReload,
   StopRunningChatsDialog,
@@ -331,7 +333,7 @@ export const Route = createRootRoute({
 const HIDDEN_NAVBAR_ROUTES = ["/login", "/change-password"];
 
 // Fallback when no matched route declares a `staticData.title`.
-const DEFAULT_DOCUMENT_TITLE = "Unsloth";
+const DEFAULT_DOCUMENT_TITLE = "Unsloth Studio";
 
 function RootLayout() {
   const t = useT();
@@ -678,6 +680,8 @@ function RootLayout() {
       <TransformersUpgradeDialog />
       {/* At the root, not under /chat: a swap can start from the Hub too. */}
       <StopRunningChatsDialog />
+      {/* loadModel asks "Load anyway?" from every surface, so the one answer lives here. */}
+      <MemoryOvercommitDialog />
       {!hideNavbar && <CommandPalette />}
       {hideNavbar ? (
         <main className="flex-1 pt-[var(--studio-hidden-route-top-inset,0px)] [--studio-titlebar-height:var(--studio-hidden-route-top-inset,0px)]">
@@ -813,6 +817,8 @@ function RootLayout() {
       )}
       {/* This side-effect-only mount stays last so it cannot shift existing React useId paths. */}
       {!isAuthFlowRoute && <HubSourceNoticeMount />}
+      {/* After it, for the same reason. Every route, sign-in included: signing in fails the same way. */}
+      <ConnectionBanner authFlow={isAuthFlowRoute} />
     </>
   );
 

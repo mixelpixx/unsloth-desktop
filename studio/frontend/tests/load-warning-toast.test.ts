@@ -69,6 +69,11 @@ function chatApi(body: Record<string, unknown>) {
           run: () => Promise<unknown>,
         ) => run(),
       },
+      // Every reply here is a success, so the memory guardrail's question never comes up.
+      "@/lib/load-verdict": { memoryOvercommitVerdict: () => null },
+      "../memory-overcommit-consent": {
+        requestMemoryOvercommitConsent: async () => "cancel",
+      },
     },
   );
   return { module, shown };

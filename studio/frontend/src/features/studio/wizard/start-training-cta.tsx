@@ -1,11 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   type StartValidationResult,
+  trainingStartNeedsFitConfirm,
   useTrainingActions,
   useTrainingConfigStore,
+  useTrainingFitLineText,
+  useTrainingFitStore,
   useTrainingReadiness,
 } from "@/features/training";
 import { useT } from "@/i18n";
@@ -13,6 +26,7 @@ import { cn } from "@/lib/utils";
 import type { DatasetSource } from "@/types/training";
 import { RefreshIcon, Rocket01Icon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
+import { useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { resolveStartTrainingButtonLabelKey } from "./start-training-cta-state";
 
@@ -96,6 +110,20 @@ export function StartTrainingCta() {
   } = useTrainingReadiness();
   const { startError, startBlocked, stopRequested, startTrainingRun } =
     useTrainingActions();
+  const { fitStatus, fitEstimate } = useTrainingFitStore(
+    useShallow((s) => ({ fitStatus: s.status, fitEstimate: s.estimate })),
+  );
+  const fitLineText = useTrainingFitLineText();
+  const [confirmOverflow, setConfirmOverflow] = useState(false);
+  // Only a settled estimate that positively says "exceeds" asks first. One still loading may
+  // describe the config before the last edit, and a failed one must never stand in the way.
+  const overflowEstimate =
+    fitStatus === "ready" && trainingStartNeedsFitConfirm(fitEstimate)
+      ? fitEstimate
+      : null;
+  const start = () => {
+    startTrainingRun().catch(() => undefined);
+  };
 
   const disabled = startBlocked || !isReady;
   const buttonLabel = t(
@@ -144,7 +172,11 @@ export function StartTrainingCta() {
           "transition-colors duration-200",
         )}
         onClick={() => {
-          startTrainingRun().catch(() => undefined);
+          if (overflowEstimate) {
+            setConfirmOverflow(true);
+            return;
+          }
+          start();
         }}
         disabled={disabled}
       >
@@ -155,6 +187,32 @@ export function StartTrainingCta() {
         />
         {buttonLabel}
       </Button>
+      <AlertDialog open={confirmOverflow} onOpenChange={setConfirmOverflow}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("trainingFit.startAnywayTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {overflowEstimate
+                ? t("trainingFit.startAnywayDescription", {
+                    verdict: fitLineText(overflowEstimate),
+                  })
+                : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                setConfirmOverflow(false);
+                start();
+              }}
+            >
+              {t("trainingFit.startAnyway")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       {errorMessage && (
         <div
           className={cn(

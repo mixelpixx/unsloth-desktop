@@ -19,6 +19,8 @@ export interface McpServerConfig {
   headers: Record<string, string>;
   is_enabled: boolean;
   use_oauth: boolean;
+  // Local programs only: the folder the program starts in; null = the backend's own.
+  cwd?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -77,6 +79,17 @@ export interface McpServerImportResult {
 export interface McpStdioCommand {
   command: string;
   arguments: string[];
+}
+
+export interface McpCapabilities {
+  stdio_enabled: boolean;
+  stdio_disabled_reason: string | null;
+}
+
+// Whether local programs (.exe, npx, uvx) may be added here, so the dialog can explain a closed gate
+// before the user fills in an executable rather than after Save.
+export function getMcpCapabilities(): Promise<McpCapabilities> {
+  return mcpRequest<McpCapabilities>("/capabilities");
 }
 
 let mcpServerListRequest: Promise<McpServerConfig[]> | null = null;
@@ -169,6 +182,7 @@ export function createMcpServer(payload: {
   headers?: Record<string, string>;
   isEnabled?: boolean;
   useOauth?: boolean;
+  cwd?: string | null;
 }): Promise<McpServerConfig> {
   return trackMcpServerMutation(
     mcpRequest("/", {
@@ -179,6 +193,7 @@ export function createMcpServer(payload: {
         headers: payload.headers ?? null,
         is_enabled: payload.isEnabled ?? true,
         use_oauth: payload.useOauth ?? false,
+        cwd: payload.cwd ?? null,
       },
     }),
   );
@@ -193,6 +208,8 @@ export function updateMcpServer(
     headers?: Record<string, string> | null;
     isEnabled?: boolean;
     useOauth?: boolean;
+    /** null = clear the working directory; omit to leave as-is */
+    cwd?: string | null;
   },
 ): Promise<McpServerConfig> {
   const body: Record<string, unknown> = {};
@@ -202,6 +219,7 @@ export function updateMcpServer(
   if (payload.headers !== undefined) body.headers = payload.headers;
   if (payload.isEnabled !== undefined) body.is_enabled = payload.isEnabled;
   if (payload.useOauth !== undefined) body.use_oauth = payload.useOauth;
+  if (payload.cwd !== undefined) body.cwd = payload.cwd;
   return trackMcpServerMutation(
     mcpRequest(`/${serverId}`, { method: "PUT", body }),
   );
@@ -223,6 +241,7 @@ export function testMcpServer(payload: {
   url: string;
   headers?: Record<string, string>;
   useOauth?: boolean;
+  cwd?: string | null;
 }): Promise<McpServerProbeResult> {
   return mcpRequest("/test", {
     method: "POST",
@@ -230,6 +249,7 @@ export function testMcpServer(payload: {
       url: payload.url,
       headers: payload.headers ?? null,
       use_oauth: payload.useOauth ?? false,
+      cwd: payload.cwd ?? null,
     },
   });
 }

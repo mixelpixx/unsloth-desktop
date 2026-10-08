@@ -41,11 +41,15 @@ def _installs_before_waiting(fn: ast.FunctionDef) -> bool:
     )
 
 
+_HANDLED = [signal.SIGTERM] + ([signal.SIGBREAK] if hasattr(signal, "SIGBREAK") else [])
+
+
 @pytest.fixture
 def restore_sigterm():
-    previous = signal.getsignal(signal.SIGTERM)
+    previous = {signum: signal.getsignal(signum) for signum in _HANDLED}
     yield
-    signal.signal(signal.SIGTERM, previous)
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
 
 
 def test_sigterm_becomes_a_keyboard_interrupt_once(restore_sigterm):
@@ -55,6 +59,20 @@ def test_sigterm_becomes_a_keyboard_interrupt_once(restore_sigterm):
     with pytest.raises(KeyboardInterrupt):
         handler(signal.SIGTERM, None)
     assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGBREAK"), reason = "SIGBREAK is Windows-only")
+def test_ctrl_break_takes_the_same_path(restore_sigterm):
+    """Python installs no SIGBREAK handler, so Ctrl+Break ended `unsloth studio` on the spot with no
+    cleanup, and run.py's console handler passes it on expecting one."""
+    studio_mod._graceful_shutdown_on_sigterm()
+    handler = signal.getsignal(signal.SIGBREAK)
+    assert callable(handler) and handler is not signal.SIG_DFL
+    with pytest.raises(KeyboardInterrupt):
+        handler(signal.SIGBREAK, None)
+    # Only the signal that arrived goes back to the default; SIGTERM still shuts down cleanly.
+    assert signal.getsignal(signal.SIGBREAK) is signal.SIG_DFL
+    assert signal.getsignal(signal.SIGTERM) is handler
 
 
 def test_both_server_wait_loops_install_the_handler():

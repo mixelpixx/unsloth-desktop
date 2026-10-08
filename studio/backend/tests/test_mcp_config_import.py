@@ -230,7 +230,8 @@ def test_parse_accepts_cline_streamable_http_alias():
 @pytest.mark.parametrize(
     "server",
     [
-        {"command": "node", "args": ["server.js"], "cwd": "/tmp/server"},
+        {"command": "node", "args": ["server.js"], "cwd": 42},
+        {"url": "https://example.com/mcp", "cwd": "/tmp/server"},
         {"command": "node", "args": ["server.js"], "envFile": ".env"},
         {"command": "node", "args": ["server.js"], "env": {"API_KEY": "${input:api-key}"}},
         {"command": "node", "args": ["${workspaceFolder}/server.js"]},
@@ -251,6 +252,23 @@ def test_parse_rejects_unrepresentable_imports(server):
     entries, errors = parse_mcp_config({"servers": {"bad": server}})
     assert entries == []
     assert len(errors) == 1
+
+
+def test_parse_carries_a_stdio_working_directory():
+    cfg = {
+        "mcpServers": {
+            "with": {"command": "node", "args": ["server.js"], "cwd": "  /srv/mcp  "},
+            "blank": {"command": "node", "args": ["server.js"], "cwd": "   "},
+            "none": {"command": "node", "args": ["server.js"]},
+        }
+    }
+    entries, errors = parse_mcp_config(cfg)
+    assert errors == []
+    by_name = {entry.display_name: entry for entry in entries}
+    # Checked for existence by the route, not the pure parser.
+    assert by_name["with"].cwd == "/srv/mcp"
+    assert by_name["blank"].cwd is None
+    assert by_name["none"].cwd is None
 
 
 def test_servers_alias_key():
@@ -384,3 +402,34 @@ def test_import_route_gates_stdio_when_disabled(tmp_path, monkeypatch):
     assert {c.display_name for c in res.created} == {"remote"}
     assert any("fs" in err for err in res.errors)
     assert len(mcp_servers_db.list_servers()) == 1
+
+
+def test_import_route_validates_each_working_directory(tmp_path, monkeypatch):
+    import asyncio
+
+    from models.mcp_servers import McpServerImportRequest
+    import routes.mcp_servers as routes_mcp
+
+    _reset_db(tmp_path, monkeypatch)
+    _enable(monkeypatch)
+    folder = tmp_path / "server folder"
+    folder.mkdir()
+    a_file = tmp_path / "not-a-folder.txt"
+    a_file.write_text("x")
+    cfg = {
+        "mcpServers": {
+            "good": {"command": "node", "args": ["a.js"], "cwd": str(folder)},
+            "missing": {"command": "node", "args": ["b.js"], "cwd": str(tmp_path / "nope")},
+            "relative": {"command": "node", "args": ["c.js"], "cwd": "relative/dir"},
+            "file": {"command": "node", "args": ["d.js"], "cwd": str(a_file)},
+        }
+    }
+    res = asyncio.run(
+        routes_mcp.import_mcp_servers(McpServerImportRequest(config = cfg), current_subject = "u")
+    )
+    # One bad folder fails that entry alone, with a message naming why.
+    assert [c.display_name for c in res.created] == ["good"]
+    assert res.created[0].cwd == str(folder)
+    assert mcp_servers_db.list_servers()[0]["cwd"] == str(folder)
+    assert sorted(err.split(":")[0] for err in res.errors) == ["file", "missing", "relative"]
+    assert any("absolute" in err for err in res.errors if err.startswith("relative"))

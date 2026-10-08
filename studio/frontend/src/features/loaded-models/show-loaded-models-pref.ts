@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-// Whether the corner indicator may appear. Off by default; only an explicit "true" (Settings ->
-// General -> Notifications) enables it. An older explicit "false" still reads as off, so anyone who
-// already turned it down stays that way. Tri-state on purpose: see setShowLoadedModels.
+// Whether the corner indicator may appear. On by default: it is where a user sees what is still
+// holding memory before the next load, so hiding it by default hid the one thing that explains a
+// load running out. Only an explicit "false" (Settings -> General -> Notifications) turns it off,
+// so anyone who already turned it down stays that way. Tri-state on purpose: see
+// setShowLoadedModels.
 
 import { useSyncExternalStore } from "react";
 
@@ -29,17 +31,17 @@ function notify(): void {
 
 export function getShowLoadedModels(): boolean {
   try {
-    return localStorage.getItem(STORAGE_KEY) === "true";
+    return localStorage.getItem(STORAGE_KEY) !== "false";
   } catch {
-    return false;
+    return true;
   }
 }
 
 export function setShowLoadedModels(show: boolean): void {
   try {
-    // Both values written, never removed: "false" is the one an older reader also treats as off, so
-    // a pre-update tab does not flip the card back on through the storage event. Absent still means
-    // off here, so the default is unaffected.
+    // Both values written, never removed: "false" is the one every reader treats as off, so a
+    // pre-update tab does not flip the card back on through the storage event. Absent means the
+    // default (on), so removing the key would silently re-enable a card the user turned off.
     localStorage.setItem(STORAGE_KEY, show ? "true" : "false");
   } catch {
     // storage unavailable

@@ -34,6 +34,7 @@ export interface ModelsSearch {
 export const Route = createRoute({
   getParentRoute: () => rootRoute,
   path: "/hub",
+  staticData: { titleKey: "shell.navigation.hub" },
   beforeLoad: () => requireAuth(),
   component: ModelsPage,
   validateSearch: (search: Record<string, unknown>): ModelsSearch => {

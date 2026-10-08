@@ -36,10 +36,11 @@ def _env_int(name: str, default: int) -> int:
 # list fetches; mutations and errors always log.
 _ACCESS_LOG_DEDUP_MS = _env_int("UNSLOTH_STUDIO_ACCESS_LOG_DEDUP_MS", 300)
 # Liveness/UI polls whose line means only "still polling"; collapse to a longer heartbeat. First hit and errors still
-# log. 0 = off.
-_QUIET_POLL_DEDUP_MS = _env_int("UNSLOTH_STUDIO_ACCESS_LOG_POLL_DEDUP_MS", 10000)
-# The desktop watchdog probe rounds are ~19s apart, so a 10s window that stamps only on emit would
-# collapse nothing; it gets its own, wider window.
+# log. 0 = off. 60s, not 10s: the window stamps only on emit, so it collapses nothing for a poll as slow as itself,
+# and the 10s status polls were 41% of a field server log.
+_QUIET_POLL_DEDUP_MS = _env_int("UNSLOTH_STUDIO_ACCESS_LOG_POLL_DEDUP_MS", 60000)
+# The desktop watchdog probe rounds are ~19s apart, so a window that stamps only on emit needs to be
+# wider than a whole round to collapse anything; it gets its own window.
 _WATCHDOG_POLL_DEDUP_MS = _env_int("UNSLOTH_STUDIO_ACCESS_LOG_WATCHDOG_DEDUP_MS", 60000)
 # Both windows off is what --verbose sets, and the drop-the-2xx suppressor below has no window of
 # its own, so it reads the same signal.

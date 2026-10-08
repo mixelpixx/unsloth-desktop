@@ -76,6 +76,23 @@ function isAbsoluteFolderPath(path: string): boolean {
   );
 }
 
+// The backend only rejects a bad repo id after the whole conversion, so catch it here.
+const HUB_OWNER_RE = /^[\w.-]+$/;
+const HUB_REPO_NAME_RE = /^[\w.-]{1,96}$/;
+
+function hubRepoIssue(username: string, repoName: string): string | null {
+  if (!username || !repoName) {
+    return "Enter a username or org and a model name to push to the Hub.";
+  }
+  if (!HUB_OWNER_RE.test(username)) {
+    return "Username / Org can only use letters, numbers, '-', '_' and '.'.";
+  }
+  if (!HUB_REPO_NAME_RE.test(repoName)) {
+    return "Model name can only use letters, numbers, '-', '_' and '.' (up to 96 characters).";
+  }
+  return null;
+}
+
 const PHASE_LABELS: Record<string, string> = {
   idle: "Ready",
   loading: "Loading model",
@@ -214,6 +231,8 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
     (v) => findMergedFormat(v)?.label ?? v,
   );
   const showProgress = isExporting || isTerminal;
+  const startBlockedReason =
+    destination === "hub" ? hubRepoIssue(hfUsername, modelName) : null;
 
   return (
     <div className="flex flex-col gap-4 rounded-2xl border border-border/50 bg-muted/20 p-4">
@@ -342,6 +361,14 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
                       />
                     </div>
                   </div>
+                  {startBlockedReason && (
+                    <p
+                      id="export-hub-repo-hint"
+                      className="-mt-2 text-ui-11 text-amber-700 dark:text-amber-300"
+                    >
+                      {startBlockedReason}
+                    </p>
+                  )}
 
                   <div className="flex flex-col gap-1.5">
                     <div className="flex items-center justify-between">
@@ -607,7 +634,15 @@ export function ExportRunPanel(props: ExportRunPanelProps) {
             <Button variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button onClick={onStart}>Start Export</Button>
+            <Button
+              onClick={onStart}
+              disabled={startBlockedReason !== null}
+              aria-describedby={
+                startBlockedReason ? "export-hub-repo-hint" : undefined
+              }
+            >
+              Start Export
+            </Button>
           </>
         )}
         {isExporting && (

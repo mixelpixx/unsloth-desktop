@@ -11,7 +11,7 @@ import type { RecipeRunSettings } from "../stores/recipe-executions";
 import type { RecipeSnapshot } from "../utils/import";
 import type { RecipePayload, RecipePayloadResult } from "../utils/payload/types";
 
-type SaveTone = "success" | "error";
+type SaveTone = "success" | "error" | "failed" | "unloaded";
 
 type PersistRecipeFn = (input: {
   id: string | null;
@@ -43,6 +43,7 @@ type UseRecipeStudioActionsResult = {
   saveLoading: boolean;
   saveTone: SaveTone;
   savedAtLabel: string;
+  loadError: string | null;
   copied: boolean;
   importOpen: boolean;
   setImportOpen: (open: boolean) => void;
@@ -127,6 +128,7 @@ export function useRecipeStudioActions({
     saveLoading: persistence.saveLoading,
     saveTone: persistence.saveTone,
     savedAtLabel: persistence.savedAtLabel,
+    loadError: persistence.loadError,
     copied: persistence.copied,
     importOpen: persistence.importOpen,
     setImportOpen: persistence.setImportOpen,

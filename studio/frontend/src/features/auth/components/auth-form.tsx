@@ -430,6 +430,7 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
                 size="icon"
                 className="absolute right-0 top-0 h-full px-3 text-muted-foreground hover:bg-transparent"
                 onClick={() => setShowPassword((prev) => !prev)}
+                aria-label={showPassword ? "Hide password" : "Show password"}
               >
                 {showPassword ? (
                   <EyeOff className="h-4 w-4" />
@@ -466,6 +467,7 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
                     size="icon"
                     className="absolute right-0 top-0 h-full px-3 text-muted-foreground hover:bg-transparent"
                     onClick={() => setShowPassword((prev) => !prev)}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
                   >
                     {showPassword ? (
                       <EyeOff className="h-4 w-4" />
@@ -503,6 +505,7 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
                   size="icon"
                   className="absolute right-0 top-0 h-full px-3 text-muted-foreground hover:bg-transparent"
                   onClick={() => setShowNewPassword((prev) => !prev)}
+                  aria-label={showNewPassword ? "Hide password" : "Show password"}
                 >
                   {showNewPassword ? (
                     <EyeOff className="h-4 w-4" />
@@ -545,7 +548,10 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
           <p className="text-center text-sm text-amber-600">{helperText}</p>
         )}
         {error && (
-          <p className="text-center text-sm text-destructive [overflow-wrap:anywhere]">
+          <p
+            role="alert"
+            className="text-center text-sm text-destructive [overflow-wrap:anywhere]"
+          >
             {error}
           </p>
         )}
@@ -563,6 +569,12 @@ export function AuthForm({ mode }: AuthFormProps): ReactElement | null {
         >
           {loading ? "Please wait..." : submitLabel}
         </Button>
+        {/* Why Sign in is still disabled. Change-password mode has its own hint above. */}
+        {isLoginMode && password.length > 0 && password.length < 8 && (
+          <p className="-mt-3 text-center text-xs text-muted-foreground">
+            Password must be at least 8 characters
+          </p>
+        )}
       </form>
 
       {showSwitchLink && (

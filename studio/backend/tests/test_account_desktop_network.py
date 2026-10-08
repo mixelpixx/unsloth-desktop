@@ -285,13 +285,28 @@ def test_bootstrap_html_stays_suppressed_while_a_deactivated_account_exists(monk
     assert main._inject_bootstrap(html, app) == (html, None)
 
 
-def test_secure_banner_bytes_and_shared_url_survive_account_creation(monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "platform, stop_hint",
+    [
+        ("linux", "  To stop Unsloth Studio: press Ctrl+C (Control+C, not Command+C, on macOS)."),
+        (
+            "win32",
+            '  To stop Unsloth Studio: use Shutdown in the app menu, run "unsloth studio stop", '
+            "or press Ctrl+C here.",
+        ),
+    ],
+)
+def test_secure_banner_bytes_and_shared_url_survive_account_creation(
+    monkeypatch, capsys, platform, stop_hint
+):
     import run
     import startup_banner
 
     monkeypatch.setattr(run, "_cloudflare_url", "https://shared.trycloudflare.com")
     monkeypatch.setattr(run, "_public_reachable", None)
     monkeypatch.setattr(startup_banner, "stdout_supports_color", lambda: False)
+    # Windows names the in-app Shutdown and `unsloth studio stop` too; the block keeps its shape.
+    monkeypatch.setattr(run.sys, "platform", platform)
     divider = "─" * 52
     expected = (
         "\n🦥 Unsloth Studio is running (secure)\n"
@@ -300,7 +315,7 @@ def test_secure_banner_bytes_and_shared_url_survive_account_creation(monkeypatch
         "  On this machine only: http://127.0.0.1:8888/\n"
         f"{divider}\n"
         "Server-side tools are DISABLED (--disable-tools).\n"
-        "\n  To stop Unsloth Studio: press Ctrl+C (Control+C, not Command+C, on macOS).\n"
+        f"\n{stop_hint}\n"
         f"{divider}\n\n"
     ).encode()
     run._emit_secure_startup_output(8888, enable_tools = False)

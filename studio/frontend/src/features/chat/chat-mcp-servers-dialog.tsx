@@ -17,6 +17,7 @@ import {
 } from "react";
 import { toast } from "sonner";
 
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -41,11 +42,13 @@ import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { subscribeToMcpServerMutationSettlements } from "./api/mcp-server-mutation-tracker";
 import {
+  type McpCapabilities,
   type McpServerConfig,
   createMcpServer,
   decodeMcpStdioCommand,
   deleteMcpServer,
   encodeMcpStdioCommand,
+  getMcpCapabilities,
   importMcpServers,
   listMcpServers,
   refreshMcpServerTools,
@@ -58,6 +61,7 @@ import {
   resolveMcpStdioUrl,
 } from "./mcp-server-form";
 import { BlenderMcpSetup } from "./blender-mcp-setup";
+import { parseMcpConfigFile } from "./utils/mcp-config-file";
 
 type HeaderRow = { id: string; key: string; value: string };
 type ArgumentRow = { id: string; value: string };
@@ -72,6 +76,8 @@ type FormState = {
   headers: HeaderRow[];
   credentialTransport: Exclude<FormTransport, "unknown"> | null;
   useOauth: boolean;
+  // Local programs only; blank = start in the backend's own working directory.
+  cwd: string;
 };
 
 const EMPTY_FORM: FormState = {
@@ -83,7 +89,13 @@ const EMPTY_FORM: FormState = {
   headers: [],
   credentialTransport: null,
   useOauth: false,
+  cwd: "",
 };
+
+// What to send for the working directory: only a local program has one, and blank clears it.
+function cwdForTransport(form: FormState): string | null {
+  return form.transport === "stdio" ? form.cwd.trim() || null : null;
+}
 
 function newRowId(): string {
   return `r_${Math.random().toString(36).slice(2, 10)}`;
@@ -127,6 +139,7 @@ function isHttpAddress(value: string): boolean {
 function transportFromAddress(
   value: string,
   credentialTransport: FormState["credentialTransport"] = null,
+  typing = false,
 ): FormTransport {
   const trimmed = value.trim().toLowerCase();
   if (!trimmed) {
@@ -135,8 +148,10 @@ function transportFromAddress(
   if (isHttpAddress(value)) {
     return "http";
   }
+  // Mid-keystroke "h", "htt", "https:/" is a URL being typed: flipping to the local-program form (and
+  // its "local programs are off" alert) for a few keystrokes reads as a glitch. Blur still resolves it.
   if (
-    credentialTransport === "http" &&
+    (typing || credentialTransport === "http") &&
     ("http://".startsWith(trimmed) || "https://".startsWith(trimmed))
   ) {
     return "unknown";
@@ -152,6 +167,7 @@ function formWithAddress(
   const transport = transportFromAddress(
     url,
     preservePartialHttp ? form.credentialTransport : null,
+    preservePartialHttp,
   );
   const nextCredentialTransport =
     transport === "unknown" ? form.credentialTransport : transport;
@@ -183,6 +199,32 @@ function isValidAddress(value: string): boolean {
   // The backend owns stdio parsing and validation. In particular, the browser must not split an
   // executable or duplicate platform-specific quoting rules.
   return true;
+}
+
+// A remote URL can carry an API key in its query string or userinfo; the list only needs to say which
+// server a row is, so it shows origin + path and marks a hidden query.
+function displayAddress(url: string): string {
+  if (!isHttpAddress(url)) return url;
+  try {
+    const parsed = new URL(url.trim());
+    return `${parsed.origin}${parsed.pathname}${parsed.search ? "?…" : ""}`;
+  } catch {
+    return url;
+  }
+}
+
+const KNOWN_LAUNCHERS = new Set([
+  "npx", "npm", "pnpm", "bunx", "bun", "node", "deno", "uvx", "uv", "pipx",
+  "python", "python3", "py", "docker", "podman", "dotnet", "java", "go", "cargo",
+]);
+
+// Only gates whether a pasted command line is split into program + arguments (by the backend's own
+// parser). A wrong "no" leaves the line as one executable, exactly as before, so stay conservative: an
+// unquoted "C:\Program Files\..." splits to "C:\Program", which is not a program, and stays whole.
+function looksLikeProgram(token: string): boolean {
+  const name = (token.split(/[\\/]/).pop() ?? token).toLowerCase();
+  if (/\.(exe|cmd|bat|ps1|py|js|mjs|cjs|sh)$/.test(name)) return true;
+  return KNOWN_LAUNCHERS.has(name);
 }
 
 function ArgumentsEditor({
@@ -309,12 +351,13 @@ function HeadersEditor({
         </div>
       ) : (
         <div className="flex flex-col gap-2">
-          {rows.map((row) => (
+          {rows.map((row, index) => (
             <div key={row.id} className="flex items-center gap-2">
               <Input
                 value={row.key}
                 disabled={disabled}
                 placeholder={copy.keyPlaceholder}
+                aria-label={`${copy.keyPlaceholder} ${index + 1}`}
                 onChange={(e) => update(row.id, { key: e.target.value })}
               />
               <Input
@@ -322,6 +365,7 @@ function HeadersEditor({
                 value={row.value}
                 disabled={disabled}
                 placeholder={copy.valuePlaceholder}
+                aria-label={`${copy.valuePlaceholder} ${index + 1}`}
                 onChange={(e) => update(row.id, { value: e.target.value })}
               />
               <Button
@@ -367,6 +411,18 @@ export function ChatMcpServersDialog({
   const [decodingCommand, setDecodingCommand] = useState(false);
   const [codecError, setCodecError] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const [capabilities, setCapabilities] = useState<McpCapabilities | null>(
+    null,
+  );
+  const [testResult, setTestResult] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
+  const [importReport, setImportReport] = useState<{
+    added: string[];
+    skipped: string[];
+    errors: string[];
+  } | null>(null);
   const [refreshingIds, setRefreshingIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -387,7 +443,12 @@ export function ChatMcpServersDialog({
   const togglingIdsRef = useRef(new Set<string>());
   const busyIdsRef = useRef(new Set<string>());
   const importingRef = useRef(false);
+  const latestFormRef = useRef(form);
   openRef.current = open;
+
+  useEffect(() => {
+    latestFormRef.current = form;
+  }, [form]);
 
   useEffect(() => {
     return () => {
@@ -461,6 +522,8 @@ export function ChatMcpServersDialog({
       setCodecPending(false);
       setDecodingCommand(false);
       setCodecError(null);
+      setTestResult(null);
+      setImportReport(null);
       setImporting(importingRef.current);
       setConfirmingDelete(null);
       setRefreshingIds(new Set(refreshingIdsRef.current));
@@ -477,6 +540,23 @@ export function ChatMcpServersDialog({
     };
   }, [open, refresh]);
 
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    getMcpCapabilities().then(
+      (next) => {
+        if (!cancelled) setCapabilities(next);
+      },
+      // An older backend has no /capabilities: keep the form usable and let Save report the gate.
+      () => {
+        if (!cancelled) setCapabilities(null);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
   function startCreate() {
     formGenerationRef.current += 1;
     activeEditIdRef.current = null;
@@ -485,6 +565,8 @@ export function ChatMcpServersDialog({
     setCodecPending(false);
     setDecodingCommand(false);
     setCodecError(null);
+    setTestResult(null);
+    setImportReport(null);
     setView({ kind: "create" });
     setForm(EMPTY_FORM);
   }
@@ -497,6 +579,7 @@ export function ChatMcpServersDialog({
     setSaving(false);
     setTesting(false);
     setCodecError(null);
+    setTestResult(null);
     setView({ kind: "edit", id: server.id });
     const baseForm: FormState = {
       displayName: server.display_name,
@@ -507,6 +590,7 @@ export function ChatMcpServersDialog({
       headers: headersFromObject(server.headers ?? {}),
       credentialTransport: isHttpAddress(server.url) ? "http" : "stdio",
       useOauth: server.use_oauth ?? false,
+      cwd: server.cwd ?? "",
     };
 
     if (isHttpAddress(server.url)) {
@@ -567,6 +651,7 @@ export function ChatMcpServersDialog({
     setCodecPending(false);
     setDecodingCommand(false);
     setCodecError(null);
+    setTestResult(null);
     setView({ kind: "list" });
     setForm(EMPTY_FORM);
   }
@@ -619,6 +704,7 @@ export function ChatMcpServersDialog({
     }
     const generation = formGenerationRef.current;
     setTesting(true);
+    setTestResult(null);
     try {
       const url = stdio
         ? await encodeStdioForGeneration(
@@ -632,21 +718,32 @@ export function ChatMcpServersDialog({
         url,
         headers: headersToObject(form.headers),
         useOauth: stdio ? false : form.useOauth,
+        cwd: cwdForTransport(form),
       });
       if (formGenerationRef.current !== generation) return;
-      if (result.ok) {
-        toast.success(
-          `Connected (${result.tool_count} tool${result.tool_count === 1 ? "" : "s"})`,
-        );
+      // Inline rather than a 5 s toast: the result is what the user acts on next (fix the path, add an
+      // argument), and a server listing no tools almost always means it started with the wrong args.
+      if (result.ok && result.tool_count > 0) {
+        setTestResult({
+          ok: true,
+          text: `Connected: ${result.tool_count} tool${result.tool_count === 1 ? "" : "s"} available.`,
+        });
+      } else if (result.ok) {
+        setTestResult({
+          ok: false,
+          text: "Connected, but the server lists no tools. Check its arguments and environment variables.",
+        });
       } else {
-        toast.error("Connection failed", {
-          description: result.error ?? "Unknown error",
+        setTestResult({
+          ok: false,
+          text: `Connection failed: ${result.error ?? "Unknown error"}`,
         });
       }
     } catch (err) {
       if (formGenerationRef.current !== generation) return;
-      toast.error("Connection test failed", {
-        description: err instanceof Error ? err.message : String(err),
+      setTestResult({
+        ok: false,
+        text: `Connection test failed: ${err instanceof Error ? err.message : String(err)}`,
       });
     } finally {
       if (formGenerationRef.current === generation) setTesting(false);
@@ -700,6 +797,8 @@ export function ChatMcpServersDialog({
           url,
           headers: headers ?? null,
           useOauth: stdio ? false : form.useOauth,
+          // Omitted for http: switching a row to a URL clears its working directory on the backend.
+          cwd: stdio ? cwdForTransport(form) : undefined,
         });
         if (formGenerationRef.current !== generation) return;
         toast.success("MCP server updated");
@@ -710,6 +809,7 @@ export function ChatMcpServersDialog({
           url,
           headers: headers,
           useOauth: stdio ? false : form.useOauth,
+          cwd: cwdForTransport(form),
         });
         if (formGenerationRef.current !== generation) return;
         toast.success("MCP server added");
@@ -726,6 +826,49 @@ export function ChatMcpServersDialog({
     }
   }
 
+  // READMEs and Explorer's "Copy as path" hand out whole command lines ("npx -y @scope/server",
+  // "\"C:\\Program Files\\x\\server.exe\" --stdio"), but the executable field is argv[0] alone and the
+  // whole line would be run as one program name. Split with the backend's own parser (the browser must
+  // not duplicate platform quoting rules) and only when the first token is recognizably a program.
+  async function splitPastedCommand() {
+    const value = form.url;
+    if (
+      form.transport !== "stdio" ||
+      form.arguments.length > 0 ||
+      !/\s|^\s*["']/.test(value)
+    ) {
+      return;
+    }
+    const generation = formGenerationRef.current;
+    let decoded;
+    try {
+      decoded = await decodeMcpStdioCommand(value);
+    } catch {
+      return; // Unbalanced quotes etc. are reported by Test/Save with the backend's message.
+    }
+    // The user may have kept typing while the decode was in flight.
+    const latest = latestFormRef.current;
+    if (
+      formGenerationRef.current !== generation ||
+      latest.url !== value ||
+      latest.arguments.length > 0
+    ) {
+      return;
+    }
+    const { command, arguments: rest } = decoded;
+    if (rest.length > 0 && !looksLikeProgram(command)) return;
+    setForm((prev) =>
+      prev.url !== value || prev.arguments.length > 0
+        ? prev
+        : { ...prev, url: command, arguments: argumentsFromStrings(rest) },
+    );
+    if (rest.length > 0) {
+      toast.info(
+        `Split into the program and ${rest.length} argument${rest.length === 1 ? "" : "s"}`,
+      );
+    }
+  }
+
   async function onImportFile(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = ""; // let the user re-pick the same file later
@@ -738,10 +881,12 @@ export function ChatMcpServersDialog({
     try {
       let config: unknown;
       try {
-        config = JSON.parse(await file.text());
-      } catch {
+        config = parseMcpConfigFile(await file.text());
+      } catch (err) {
         if (actionGenerationRef.current === generation && openRef.current)
-          toast.error("Invalid JSON file");
+          toast.error("Couldn't read that file as JSON", {
+            description: err instanceof Error ? err.message : String(err),
+          });
         return;
       }
       if (actionGenerationRef.current !== generation || !openRef.current)
@@ -749,25 +894,14 @@ export function ChatMcpServersDialog({
       const result = await importMcpServers(config);
       if (actionGenerationRef.current !== generation || !openRef.current)
         return;
-      const parts = [`${result.created.length} added`];
-      if (result.skipped.length) parts.push(`${result.skipped.length} skipped`);
-      if (result.errors.length) {
-        parts.push(
-          `${result.errors.length} error${result.errors.length === 1 ? "" : "s"}`,
-        );
-      }
-      const summary = parts.join(", ");
-      if (result.errors.length) {
-        toast.warning(summary, {
-          description: (
-            <div className="whitespace-pre-line">
-              {result.errors.slice(0, 5).join("\n")}
-            </div>
-          ),
-        });
-      } else {
-        toast.success(summary);
-      }
+      // Every name and every error, kept on screen: a 5 s toast showing five of twelve errors left
+      // users guessing which servers made it in.
+      cancelForm();
+      setImportReport({
+        added: result.created.map((server) => server.display_name),
+        skipped: result.skipped,
+        errors: result.errors,
+      });
     } catch (err) {
       if (actionGenerationRef.current !== generation || !openRef.current)
         return;
@@ -880,6 +1014,10 @@ export function ChatMcpServersDialog({
   const formPending = importing || codecPending || testing || saving;
   // A local stdio command uses env vars, not headers or OAuth.
   const addressIsCommand = form.transport === "stdio";
+  // The backend refuses to test or add a local program while its gate is closed (e.g. a -H 0.0.0.0
+  // bind); say why up front rather than after Save. Editing the name/env of a saved one still works.
+  const stdioBlocked = capabilities !== null && !capabilities.stdio_enabled;
+  const stdioBlockedForCommand = stdioBlocked && addressIsCommand;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -891,7 +1029,8 @@ export function ChatMcpServersDialog({
         <DialogHeader>
           <DialogTitle>MCP Servers</DialogTitle>
           <DialogDescription>
-            Register remote (HTTP) or local (stdio command) MCP servers.
+            Connect remote servers by URL, or local programs (an .exe, npx,
+            uvx…) that speak MCP over stdio.
           </DialogDescription>
         </DialogHeader>
         <input
@@ -928,6 +1067,7 @@ export function ChatMcpServersDialog({
               <Label htmlFor="mcp-display-name">Display name</Label>
               <Input
                 id="mcp-display-name"
+                autoFocus
                 value={form.displayName}
                 disabled={formPending}
                 onChange={(e) =>
@@ -951,6 +1091,7 @@ export function ChatMcpServersDialog({
                 onChange={(e) => {
                   const url = e.target.value;
                   setCodecError(null);
+                  setTestResult(null);
                   setForm((prev) => formWithAddress(prev, url, true));
                 }}
                 onBlur={() => {
@@ -959,22 +1100,35 @@ export function ChatMcpServersDialog({
                       ? formWithAddress(prev, prev.url, false)
                       : prev,
                   );
+                  void splitPastedCommand();
                 }}
                 placeholder={
                   addressIsCommand
-                    ? "e.g. npx"
+                    ? "e.g. npx or C:\\path\\to\\server.exe"
                     : form.transport === "http"
                       ? "https://example.com/mcp"
-                      : "https://example.com/mcp or npx"
+                      : "https://example.com/mcp or npx, uvx, C:\\path\\to\\server.exe"
                 }
               />
               <span className="text-xs text-muted-foreground">
                 {addressIsCommand
-                  ? "The executable for a local stdio server. Add each local argument in an Arguments row below."
+                  ? "The program for a local stdio server (an .exe, npx, uvx…). Add each argument in an Arguments row below, or paste a whole command line and it will be split for you."
                   : form.transport === "http"
                     ? "An http(s) URL for a remote server."
-                    : "An http(s) URL for a remote server, or an executable for local stdio. Add local arguments in the Arguments rows."}
+                    : "An http(s) URL for a remote server, or a local program (an .exe, npx, uvx…) for stdio. Add local arguments in the Arguments rows."}
               </span>
+              {stdioBlocked && form.transport !== "http" && (
+                <Alert
+                  variant={addressIsCommand ? "destructive" : "default"}
+                  role={addressIsCommand ? "alert" : "note"}
+                >
+                  <AlertTitle>Local programs are turned off</AlertTitle>
+                  <AlertDescription>
+                    {capabilities?.stdio_disabled_reason ??
+                      "Only http(s) MCP servers can be added on this server."}
+                  </AlertDescription>
+                </Alert>
+              )}
               {decodingCommand && (
                 <span
                   role="status"
@@ -995,6 +1149,29 @@ export function ChatMcpServersDialog({
                   setForm((prev) => ({ ...prev, arguments: arguments_ }))
                 }
               />
+            )}
+
+            {addressIsCommand && (
+              <div className="grid gap-2">
+                <Label htmlFor="mcp-cwd">Working directory</Label>
+                <Input
+                  id="mcp-cwd"
+                  data-reload-snapshot-sensitive={true}
+                  value={form.cwd}
+                  disabled={formPending}
+                  onChange={(e) => {
+                    const cwd = e.target.value;
+                    setTestResult(null);
+                    setForm((prev) => ({ ...prev, cwd }));
+                  }}
+                  placeholder="e.g. C:\path\to\server-folder"
+                />
+                <span className="text-xs text-muted-foreground">
+                  Optional. The folder the program starts in, for servers that
+                  read config or data files next to themselves. Must be the full
+                  path to an existing folder.
+                </span>
+              </div>
             )}
 
             {codecError && (
@@ -1059,6 +1236,20 @@ export function ChatMcpServersDialog({
               />
             )}
 
+            {testResult && (
+              <p
+                role="status"
+                aria-live="polite"
+                className={
+                  testResult.ok
+                    ? "text-xs text-emerald-600 dark:text-emerald-400"
+                    : "whitespace-pre-wrap break-words text-xs text-destructive"
+                }
+              >
+                {testResult.text}
+              </p>
+            )}
+
             <div className="flex items-center justify-between gap-2 pt-2">
               <Button
                 type="button"
@@ -1069,7 +1260,8 @@ export function ChatMcpServersDialog({
                   formPending ||
                   codecError !== null ||
                   form.transport === "unknown" ||
-                  !form.url.trim()
+                  !form.url.trim() ||
+                  stdioBlockedForCommand
                 }
               >
                 {testing ? <Spinner /> : null}
@@ -1088,7 +1280,8 @@ export function ChatMcpServersDialog({
                   disabled={
                     formPending ||
                     codecError !== null ||
-                    form.transport === "unknown"
+                    form.transport === "unknown" ||
+                    (stdioBlockedForCommand && view.kind === "create")
                   }
                 >
                   {saving ? <Spinner /> : null}
@@ -1116,13 +1309,70 @@ export function ChatMcpServersDialog({
                 Add server
               </Button>
             </div>
-            {loading ? (
+            {importReport && (
+              <Alert
+                variant={importReport.errors.length ? "destructive" : "default"}
+                role="status"
+              >
+                <AlertTitle>
+                  Imported {importReport.added.length} server
+                  {importReport.added.length === 1 ? "" : "s"}
+                  {importReport.skipped.length
+                    ? `, ${importReport.skipped.length} already added`
+                    : ""}
+                  {importReport.errors.length
+                    ? `, ${importReport.errors.length} not imported`
+                    : ""}
+                </AlertTitle>
+                <AlertDescription>
+                  {importReport.added.length > 0 && (
+                    <p>Added: {importReport.added.join(", ")}</p>
+                  )}
+                  {importReport.skipped.length > 0 && (
+                    <p>Already added: {importReport.skipped.join(", ")}</p>
+                  )}
+                  {importReport.errors.length > 0 && (
+                    <ul className="list-disc pl-4">
+                      {importReport.errors.map((error, index) => (
+                        <li key={index}>{error}</li>
+                      ))}
+                    </ul>
+                  )}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="mt-1 h-auto px-0"
+                    onClick={() => setImportReport(null)}
+                  >
+                    Dismiss
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            )}
+            {stdioBlocked &&
+              servers.some(
+                (server) => !server.builtin_id && !isHttpAddress(server.url),
+              ) && (
+                <Alert role="note">
+                  <AlertTitle>Local programs are paused</AlertTitle>
+                  <AlertDescription>
+                    {capabilities?.stdio_disabled_reason ??
+                      "Local-program servers aren't available on this server."}
+                  </AlertDescription>
+                </Alert>
+              )}
+            {/* Spinner only for the first load: a background refresh after every toggle or delete used
+                to swap the whole list for a spinner, flashing it and dropping keyboard focus. */}
+            {loading && servers.length === 0 ? (
               <div className="flex justify-center py-6">
                 <Spinner />
               </div>
             ) : servers.filter((server) => !server.builtin_id).length === 0 ? (
-              <div className="rounded-md border border-dashed py-6 text-center text-sm text-muted-foreground">
-                No custom MCP servers configured yet.
+              <div className="rounded-md border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
+                No MCP servers yet. Use <strong>Add server</strong> for a URL or
+                a local program, or <strong>Import config</strong> to bring
+                over servers from Claude Desktop, Cursor or VS Code.
               </div>
             ) : (
               <ul className="flex flex-col divide-y rounded-md border">
@@ -1132,18 +1382,28 @@ export function ChatMcpServersDialog({
                     className="flex items-center justify-between gap-3 px-3 py-2"
                   >
                     <div className="min-w-0 flex-1">
-                      <div className="truncate font-medium">
-                        {server.display_name}
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="truncate font-medium">
+                          {server.display_name}
+                        </span>
+                        {stdioBlocked && !isHttpAddress(server.url) && (
+                          <span
+                            className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                            title={capabilities?.stdio_disabled_reason ?? undefined}
+                          >
+                            Paused
+                          </span>
+                        )}
                       </div>
                       <div className="truncate text-xs text-muted-foreground">
-                        {server.url}
+                        {displayAddress(server.url)}
                       </div>
                     </div>
                     <div className="flex items-center gap-1">
                       <Switch
                         checked={server.is_enabled}
                         onCheckedChange={(next) => toggleEnabled(server, next)}
-                        aria-label="Enable server"
+                        aria-label={`Enable ${server.display_name}`}
                         disabled={importing || busyIds.has(server.id)}
                       />
                       <Button
@@ -1151,9 +1411,17 @@ export function ChatMcpServersDialog({
                         variant="ghost"
                         size="icon"
                         onClick={() => refreshTools(server)}
-                        aria-label="Refresh tools"
-                        title="Refresh tools from this server"
-                        disabled={importing || busyIds.has(server.id)}
+                        aria-label={`Refresh tools for ${server.display_name}`}
+                        title={
+                          stdioBlocked && !isHttpAddress(server.url)
+                            ? (capabilities?.stdio_disabled_reason ?? undefined)
+                            : "Refresh tools from this server"
+                        }
+                        disabled={
+                          importing ||
+                          busyIds.has(server.id) ||
+                          (stdioBlocked && !isHttpAddress(server.url))
+                        }
                       >
                         {refreshingIds.has(server.id) ? (
                           <Spinner />
@@ -1166,7 +1434,7 @@ export function ChatMcpServersDialog({
                         variant="ghost"
                         size="icon"
                         onClick={() => void startEdit(server)}
-                        aria-label="Edit server"
+                        aria-label={`Edit ${server.display_name}`}
                         disabled={importing || blenderBusy || busyIds.has(server.id)}
                       >
                         <HugeiconsIcon icon={Edit03Icon} className="size-3.5" />
@@ -1176,7 +1444,7 @@ export function ChatMcpServersDialog({
                         variant="ghost"
                         size="icon"
                         onClick={() => setConfirmingDelete(server)}
-                        aria-label="Delete server"
+                        aria-label={`Delete ${server.display_name}`}
                         disabled={importing || busyIds.has(server.id)}
                       >
                         <HugeiconsIcon icon={Delete02Icon} className="size-3.5" />

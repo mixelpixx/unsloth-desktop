@@ -29,11 +29,14 @@ import {
   subscribeSystemOneSettings,
   useShortcut,
 } from "@/features/settings";
+import { cn } from "@/lib/utils";
 
 import { subscribeToMcpServerMutationSettlements } from "./api/mcp-server-mutation-tracker";
 import {
+  type McpCapabilities,
   type McpServerConfig,
   createMcpServer,
+  getMcpCapabilities,
   listMcpServers,
   updateMcpServer,
 } from "./api/mcp-servers-api";
@@ -94,6 +97,13 @@ export function McpComposerButton({
   const setDialogOpen = useMcpServersDialogStore((s) => s.setOpen);
   const [menuOpen, setMenuOpen] = useState(false);
   const [serversLoaded, setServersLoaded] = useState(false);
+  // The latest list load failed. Without a loaded snapshot the rows stay disabled, so the menu
+  // has to say why and offer another try.
+  const [loadError, setLoadError] = useState(false);
+  // null while unknown: an older backend has no /capabilities, and local rows stay usable then.
+  const [capabilities, setCapabilities] = useState<McpCapabilities | null>(
+    null,
+  );
   const [pendingUrls, setPendingUrls] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -115,6 +125,7 @@ export function McpComposerButton({
       const decisionsGeneration = decisionsRefreshGenerationRef.current + 1;
       decisionsRefreshGenerationRef.current = decisionsGeneration;
       setServersLoaded(false);
+      setLoadError(false);
       loadSystemOneSettings().then(
         (settings) => {
           if (decisionsRefreshGenerationRef.current !== decisionsGeneration)
@@ -136,6 +147,7 @@ export function McpComposerButton({
         setServers(rows);
         hasLoadedServerSnapshotRef.current = true;
         setServersLoaded(true);
+        setLoadError(false);
       } catch {
         if (
           listRefreshGenerationRef.current === generation &&
@@ -143,10 +155,18 @@ export function McpComposerButton({
         ) {
           setServersLoaded(true);
         }
+        if (listRefreshGenerationRef.current === generation) {
+          setLoadError(true);
+        }
       }
     },
     [],
   );
+
+  // Local programs are skipped by the backend while its gate is closed (e.g. a -H 0.0.0.0 bind).
+  const loadCapabilities = useCallback(() => {
+    getMcpCapabilities().then(setCapabilities, () => setCapabilities(null));
+  }, []);
 
   useEffect(
     () =>
@@ -222,6 +242,11 @@ export function McpComposerButton({
       (decisionsUrl !== null || normalizeMcpUrl(s.url) !== "studio:decisions"),
   ).length;
   const active = usable && mcpEnabledForChat && enabledCount > 0;
+  const pillLabel = enabledCount > 0 ? `MCP · ${enabledCount}` : "MCP";
+  const stdioOff = capabilities !== null && !capabilities.stdio_enabled;
+  const stdioOffReason =
+    capabilities?.stdio_disabled_reason ??
+    "Only http(s) MCP servers can be used on this server.";
 
   async function toggleServer(args: {
     url: string;
@@ -279,49 +304,63 @@ export function McpComposerButton({
     existing?: McpServerConfig;
     hint?: string;
     disablesWebSearch?: boolean;
-  }) => (
-    <DropdownMenuItem
-      key={opts.key}
-      // Server configuration remains available when the loaded model lacks tools.
-      disabled={!serversLoaded || pendingUrls.has(normalizeMcpUrl(opts.url))}
-      onSelect={(e) => {
-        e.preventDefault();
-        void toggleServer({
-          url: opts.url,
-          displayName: opts.displayName,
-          checked: !opts.enabled,
-          existing: opts.existing,
-          disablesWebSearch: opts.disablesWebSearch,
-        });
-      }}
-      onPointerEnter={opts.hint ? () => setHintKey(opts.key) : undefined}
-      onPointerLeave={
-        opts.hint
-          ? () => setHintKey((k) => (k === opts.key ? null : k))
-          : undefined
-      }
-      className={
-        opts.enabled ? "relative text-primary font-medium" : "relative"
-      }
-    >
-      <span className="truncate">{opts.label}</span>
-      {opts.enabled ? (
-        <HugeiconsIcon icon={MenuTickIcon} strokeWidth={2} className="ml-auto" />
-      ) : null}
-      {opts.hint ? (
-        <Tooltip open={hintKey === opts.key}>
-          <TooltipTrigger asChild={true}>
-            <span
-              aria-hidden={true}
-              // pointer-events-none so the anchor cannot swallow row clicks.
-              className="pointer-events-none absolute inset-y-0 right-0 w-0"
-            />
-          </TooltipTrigger>
-          <TooltipContent side="right">{opts.hint}</TooltipContent>
-        </Tooltip>
-      ) : null}
-    </DropdownMenuItem>
-  );
+  }) => {
+    // A local program (not http/https) the backend would skip: say so rather than offer a
+    // toggle that does nothing. Built-in rows manage their own transport.
+    const localOff =
+      stdioOff &&
+      !opts.existing?.builtin_id &&
+      !/^https?:\/\//i.test(opts.url.trim());
+    return (
+      <DropdownMenuItem
+        key={opts.key}
+        // Server configuration remains available when the loaded model lacks tools.
+        disabled={!serversLoaded || pendingUrls.has(normalizeMcpUrl(opts.url)) || localOff}
+        title={localOff ? stdioOffReason : undefined}
+        onSelect={(e) => {
+          e.preventDefault();
+          void toggleServer({
+            url: opts.url,
+            displayName: opts.displayName,
+            checked: !opts.enabled,
+            existing: opts.existing,
+            disablesWebSearch: opts.disablesWebSearch,
+          });
+        }}
+        onPointerEnter={opts.hint ? () => setHintKey(opts.key) : undefined}
+        onPointerLeave={
+          opts.hint
+            ? () => setHintKey((k) => (k === opts.key ? null : k))
+            : undefined
+        }
+        className={cn(
+          opts.enabled ? "relative text-primary font-medium" : "relative",
+          // Disabled rows drop pointer events, which would hide the reason in `title`.
+          localOff && "data-[disabled]:pointer-events-auto",
+        )}
+      >
+        <span className="truncate">
+          {opts.label}
+          {localOff ? " (off)" : null}
+        </span>
+        {opts.enabled ? (
+          <HugeiconsIcon icon={MenuTickIcon} strokeWidth={2} className="ml-auto" />
+        ) : null}
+        {opts.hint ? (
+          <Tooltip open={hintKey === opts.key}>
+            <TooltipTrigger asChild={true}>
+              <span
+                aria-hidden={true}
+                // pointer-events-none so the anchor cannot swallow row clicks.
+                className="pointer-events-none absolute inset-y-0 right-0 w-0"
+              />
+            </TooltipTrigger>
+            <TooltipContent side="right">{opts.hint}</TooltipContent>
+          </Tooltip>
+        ) : null}
+      </DropdownMenuItem>
+    );
+  };
 
   return (
     <>
@@ -329,18 +368,21 @@ export function McpComposerButton({
         open={menuOpen}
         onOpenChange={(open) => {
           setMenuOpen(open);
-          if (open) void refresh();
+          if (open) {
+            void refresh();
+            loadCapabilities();
+          }
         }}
       >
         <DropdownMenuTrigger asChild={true}>
           <button
             type="button"
             className={`composer-pill-btn ${usable ? "" : "opacity-40"}`}
-            data-pill-label="MCP"
+            data-pill-label={pillLabel}
             data-active={active ? "true" : "false"}
             aria-label={
               usable
-                ? "MCP servers"
+                ? `MCP servers, ${enabledCount} on`
                 : "MCP servers, unavailable for the loaded model"
             }
           >
@@ -369,7 +411,7 @@ export function McpComposerButton({
               />
               <XIcon className="composer-pill-x" />
             </span>
-            <span>MCP</span>
+            <span>{pillLabel}</span>
             <ChevronDownIcon strokeWidth={1.5} className="composer-pill-caret size-[calc(15px*var(--ui-space-scale,1))]" />
           </button>
         </DropdownMenuTrigger>
@@ -386,6 +428,18 @@ export function McpComposerButton({
               The loaded model cannot use MCP tools
             </DropdownMenuLabel>
           )}
+          {loadError ? (
+            <DropdownMenuItem
+              variant="destructive"
+              // Stay open: the rows below come back in place once the list loads.
+              onSelect={(e) => {
+                e.preventDefault();
+                void refresh();
+              }}
+            >
+              Couldn't load servers — Retry
+            </DropdownMenuItem>
+          ) : null}
           {presets.map((preset) => {
             const norm = normalizeMcpUrl(preset.url);
             return renderRow({

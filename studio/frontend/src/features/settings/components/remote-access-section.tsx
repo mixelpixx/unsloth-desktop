@@ -44,6 +44,12 @@ import { SettingsRow } from "./settings-row";
 
 type RemoteAccessOperation = "start" | "stop" | "auto";
 
+const ACTION_FAILURE: Record<RemoteAccessOperation, string> = {
+  start: "Could not start remote access.",
+  stop: "Could not stop remote access.",
+  auto: "Could not change Start automatically.",
+};
+
 const STATE_LABEL: Record<RemoteAccessStatus["state"], string> = {
   off: "Off",
   starting: "Starting",
@@ -224,6 +230,8 @@ function RemotePasswordRow({
 export function RemoteAccessSection() {
   const [status, setStatus] = useState<RemoteAccessStatus | null>(null);
   const [busy, setBusy] = useState<RemoteAccessOperation | null>(null);
+  // A request the server refused. Cleared by the next one that succeeds.
+  const [actionError, setActionError] = useState<string | null>(null);
   const [pollRevision, setPollRevision] = useState(0);
   const [pollEnabled, setPollEnabled] = useState(true);
   const mutationEpoch = useRef(0);
@@ -308,10 +316,17 @@ export function RemoteAccessSection() {
     setBusy(operation);
     try {
       applyStatus(await request());
+      setActionError(null);
       if (pausePollingAfterSuccess) {
         selfStopDisconnectExpected.current = true;
       }
-    } catch {
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "";
+      setActionError(
+        detail
+          ? `${ACTION_FAILURE[operation]} ${detail}`
+          : ACTION_FAILURE[operation],
+      );
       // Polling resumes below and reconciles the visible state.
     } finally {
       setBusy(null);
@@ -394,6 +409,7 @@ export function RemoteAccessSection() {
         </Button>
       </div>
 
+      <StatusMessage message={actionError} destructive={true} />
       <StatusMessage
         message={blockMessage ?? status?.error}
         destructive={!blockMessage}

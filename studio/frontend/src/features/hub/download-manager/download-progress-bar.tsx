@@ -34,7 +34,15 @@ export function DownloadProgressBar({
   const etaLabel = etaSeconds > 0 ? formatEta(etaSeconds) : "";
   return (
     <div className="flex flex-col gap-1.5 pb-1">
-      <div className="relative h-[3px] overflow-hidden rounded-full bg-[color-mix(in_oklab,var(--foreground)_calc(6%*var(--contrast-wash-gain,1)),transparent)] dark:bg-[rgb(255_255_255_/_calc(0.06*var(--contrast-wash-gain,1)))]">
+      <div
+        role="progressbar"
+        aria-label="Download progress"
+        // No value while indeterminate: that is how a progressbar says it cannot tell.
+        aria-valuenow={indeterminate ? undefined : Math.round(exactPercent)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        className="relative h-[3px] overflow-hidden rounded-full bg-[color-mix(in_oklab,var(--foreground)_calc(6%*var(--contrast-wash-gain,1)),transparent)] dark:bg-[rgb(255_255_255_/_calc(0.06*var(--contrast-wash-gain,1)))]"
+      >
         {indeterminate ? (
           <div className="loading-bar-slide h-full w-1/3 rounded-full bg-status-warning/80" />
         ) : (

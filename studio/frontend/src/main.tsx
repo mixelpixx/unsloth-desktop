@@ -58,6 +58,28 @@ watchMathBlockContainmentOverride();
 // Keep right-edge controls clear of overlay scrollbars.
 watchOverlayScrollbarGutter(window);
 
+// An update or rebuild replaces the hashed chunks this page was built against, so its next lazy
+// import 404s. Reload once to pick up the new build: route chunks already get that from the
+// router's lazyRouteComponent, this covers every other lazy import and stylesheet. The import
+// still rejects, so nothing renders half-loaded before the reload lands. The timestamp stops a
+// loop when the chunk is missing for some other reason: a second failure right after the reload
+// is left to the router's error screen.
+const PRELOAD_RELOAD_KEY = "unsloth:preload-error-reload-at";
+const PRELOAD_RELOAD_WINDOW_MS = 10_000;
+window.addEventListener("vite:preloadError", () => {
+  try {
+    const lastReload = Number(sessionStorage.getItem(PRELOAD_RELOAD_KEY));
+    if (lastReload && Date.now() - lastReload < PRELOAD_RELOAD_WINDOW_MS) {
+      return;
+    }
+    sessionStorage.setItem(PRELOAD_RELOAD_KEY, String(Date.now()));
+  } catch {
+    // Without storage there is no loop guard, so leave the error to the error screen.
+    return;
+  }
+  window.location.reload();
+});
+
 function renderApp(): void {
   root.render(
     <StrictMode>

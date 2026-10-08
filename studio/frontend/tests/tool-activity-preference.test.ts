@@ -779,6 +779,8 @@ test("a card awaiting approval opens above the preference", async () => {
     "../src/components/assistant-ui/tool-ui-web-search.tsx",
     "../src/components/assistant-ui/tool-ui-knowledge-base.tsx",
     "../src/components/assistant-ui/tool-ui-code-execution.tsx",
+    // Every MCP tool lands here, with its arguments inside the content.
+    "../src/components/assistant-ui/tool-fallback.tsx",
   ]) {
     const card = await sourceOf(file);
     const attribute = jsxAttribute(

@@ -9,7 +9,7 @@ import {
 } from "@/components/ui/tooltip";
 import { InformationCircleIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import type { ReactElement, ReactNode } from "react";
+import { type ReactElement, type ReactNode, useState } from "react";
 
 export function ParamsRow({
   label,
@@ -66,6 +66,33 @@ export function ParamsSliderRow({
   step: number;
   format?: (value: number) => string;
 }): ReactElement {
+  // Typed text lives in a draft keyed to the value it was typed against, so clearing the
+  // field does not send 0 and `format` cannot rewrite "0.0" to "0.00" mid-keystroke. An
+  // outside change (the slider) discards the draft.
+  const [draft, setDraft] = useState<{ value: number; text: string } | null>(
+    null,
+  );
+  const inputValue =
+    draft && draft.value === value
+      ? draft.text
+      : format
+        ? format(value)
+        : String(value);
+  const commitDraft = () => {
+    if (!draft || draft.value !== value) {
+      setDraft(null);
+      return;
+    }
+    const parsed = Number(draft.text);
+    setDraft(null);
+    if (draft.text.trim() === "" || !Number.isFinite(parsed)) {
+      return;
+    }
+    const clamped = Math.min(max, Math.max(min, parsed));
+    if (clamped !== value) {
+      onChange(clamped);
+    }
+  };
   return (
     <ParamsRow label={label} tooltip={tooltip}>
       <div className="flex items-center gap-3">
@@ -79,8 +106,29 @@ export function ParamsSliderRow({
         />
         <input
           type="number"
-          value={format ? format(value) : value}
-          onChange={(event) => onChange(Number(event.target.value))}
+          value={inputValue}
+          onChange={(event) => {
+            const text = event.target.value;
+            const parsed = Number(text);
+            // Live-apply only complete in-range values; anything else waits for blur.
+            if (
+              text.trim() !== "" &&
+              Number.isFinite(parsed) &&
+              parsed >= min &&
+              parsed <= max
+            ) {
+              onChange(parsed);
+              setDraft({ value: parsed, text });
+              return;
+            }
+            setDraft({ value, text });
+          }}
+          onBlur={commitDraft}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              commitDraft();
+            }
+          }}
           min={min}
           max={max}
           step={step}

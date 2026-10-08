@@ -18,7 +18,7 @@ from typing import Optional
 from core.inference.mcp_client import join_stdio_command
 
 _SCALAR = (str, int, float, bool)
-_UNSUPPORTED_STDIO_FIELDS = ("cwd", "envFile")
+_UNSUPPORTED_STDIO_FIELDS = ("envFile",)
 _UNSUPPORTED_TIMEOUT_FIELDS = ("timeout", "timeoutMs", "timeoutSeconds")
 _HTTP_REMOTE_TYPES = ("http", "streamableHttp")
 
@@ -31,6 +31,9 @@ class ParsedMcpEntry:
     is_stdio: bool
     is_enabled: bool = True
     use_oauth: bool = False
+    # A stdio entry's working directory as written; the import route checks it is an existing absolute
+    # folder, like the create route, so a bad one fails that entry alone.
+    cwd: Optional[str] = None
 
 
 def _coerce_str_dict(value: dict) -> dict[str, str]:
@@ -105,14 +108,26 @@ def _parse_entry(name: str, spec: object) -> tuple[Optional[ParsedMcpEntry], Opt
             return None, f"{label}: 'env' must be an object."
         if _has_null_value(env):
             return None, f"{label}: null environment values are not supported by import."
+        cwd = spec.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            return None, f"{label}: 'cwd' must be a string."
         url = join_stdio_command([command, *(str(a) for a in args)])
         headers = _coerce_str_dict(env) if env else None
-        return ParsedMcpEntry(label, url, headers, True, is_enabled = is_enabled), None
+        return ParsedMcpEntry(
+            label,
+            url,
+            headers,
+            True,
+            is_enabled = is_enabled,
+            cwd = (cwd or "").strip() or None,
+        ), None
 
     url = spec["url"]
     if not isinstance(url, str):
         return None, f"{label}: 'url' must be a string."
     url = url.strip()
+    if spec.get("cwd") is not None:
+        return None, f"{label}: 'cwd' is only supported for local (command) servers."
     entry_type = spec.get("type")
     if entry_type is not None and entry_type not in (*_HTTP_REMOTE_TYPES, "sse"):
         return None, f"{label}: remote entry has unsupported type {entry_type!r}."

@@ -16439,6 +16439,7 @@ async def _run_tracked_load_model_impl(
     attempt: Optional[_ScopedLoadAttempt] = None,
     current_request_counted: bool = False,
     on_reload_confirmed = None,
+    enforce_memory_guardrail: bool = False,
 ):
     global _running_load_attempt
 
@@ -16459,6 +16460,8 @@ async def _run_tracked_load_model_impl(
                     current_request_counted = current_request_counted,
                     on_reload_confirmed = on_reload_confirmed,
                     load_cancel_event = attempt.cancel_event,
+                    # Only when set, so every other caller's call is unchanged.
+                    **({"enforce_memory_guardrail": True} if enforce_memory_guardrail else {}),
                 )
         finally:
             _load_warnings_reach_user.reset(warnings_token)
@@ -16643,6 +16646,9 @@ async def load_model_gated(
                     action = "Loading a model",
                     cancel = cancel,
                 ),
+                # The explicit POST /load only: it has a person (or a CLI flag) to answer
+                # "Load anyway". Preview keeps loading as it always has.
+                enforce_memory_guardrail = user_initiated,
             )
         # Record provenance only once the model is resident, and here rather than
         # inside the impl so the already-loaded fast paths are covered too. Preview
@@ -16831,6 +16837,7 @@ async def _load_model_impl(
     cache_environment: Optional[dict[str, str]] = None,
     anonymous_hf_access: bool = False,
     speech_codec_path: Optional[str] = None,
+    enforce_memory_guardrail: bool = False,
 ):
     from core.inference.npu_backend import is_npu_model_path
 
@@ -17481,6 +17488,21 @@ async def _load_model_impl(
             )
             if _host_offload_warning:
                 logger.warning("Loading an oversized GGUF: %s", _host_offload_warning)
+            # The load guardrail: a verdict against memory free NOW, and for a load that
+            # will crash a 409 the UI answers with "Load anyway". Here, ahead of the arbiter
+            # handoff and the teardown below, so a refusal leaves the resident model (and
+            # any Images/Video pipeline) loaded. Only the explicit POST /load enforces it:
+            # auto-switch and preview have no one to ask, and keep loading as before.
+            if enforce_memory_guardrail:
+                await asyncio.to_thread(
+                    _enforce_load_guardrail,
+                    config,
+                    request,
+                    extra_llama_args = extra_llama_args,
+                    n_parallel = _n_parallel,
+                    placement = placement,
+                    model_label = model_log_label,
+                )
 
         expected_native_owner = None
         post_media_handoff_gpu = None
@@ -17674,6 +17696,14 @@ async def _load_model_impl(
                     extra_args = extra_llama_args,
                     label = config.identifier,
                     cancelled = lambda: _gguf_load_cancelled(llama_backend, load_cancel_event),
+                    # What the failed attempt launched, not what it was asked for: a
+                    # tensor request the planner downgraded ran layer split already.
+                    tensor_engaged = lambda: getattr(
+                        llama_backend, "_launched_tensor_parallel", None
+                    ),
+                    is_gpu_memory_failure = lambda exc: (
+                        LlamaCppBackend._is_gpu_memory_start_failure(str(exc))
+                    ),
                 )
             except Exception:
                 # A GGUF load can raise before tearing down the old llama-server (e.g. an
@@ -19289,6 +19319,308 @@ def _cached_estimate_config(
     return config
 
 
+def _placement_priced_breakdown(
+    config: ModelConfig,
+    gguf_path: str,
+    *,
+    hf_token: Optional[str],
+    n_ctx: int,
+    llama_extra_args: Optional[list[str]],
+    speculative_type: Optional[str],
+    n_parallel: int,
+    cache_type_kv: Optional[str],
+    tensor_parallel: bool,
+    n_batch: Optional[int],
+    n_ubatch: Optional[int],
+    ctx_checkpoints: Optional[int],
+    disable_vision: bool,
+    gpu_memory_mode: Optional[str],
+    gpu_layers: Optional[int],
+    spec_draft_n_max: Optional[int],
+    spec_draft_cache_type: Optional[str],
+    selected_gpu_ids: Optional[list[int]],
+) -> Optional[_GgufMemoryBreakdown]:
+    """``_gguf_memory_breakdown`` for one set of panel / load settings, placement included.
+
+    Shared by ``/estimate-memory`` and the ``/load`` guardrail so the verdict a load is
+    refused on is priced exactly like the figure the panel showed for it.
+    """
+    from core.inference.llama_server_args import _effective_tensor_parallel
+
+    return _gguf_memory_breakdown(
+        config,
+        gguf_path,
+        hf_token = hf_token,
+        n_ctx = n_ctx,
+        llama_extra_args = llama_extra_args,
+        speculative_type = speculative_type,
+        n_parallel = n_parallel,
+        cache_type_kv = cache_type_kv,
+        tensor_parallel = bool(tensor_parallel),
+        n_batch = n_batch,
+        n_ubatch = n_ubatch,
+        ctx_checkpoints = ctx_checkpoints,
+        # A layer split across pinned cards replicates the context-linear
+        # compute term and adds per-device pipeline overhead, so the count
+        # matters there too, not just in tensor mode. Automatic placement
+        # stays at one: _guard_device_count makes the same call.
+        n_devices = _guard_device_count(
+            # A pin names cards for a launch that puts something on them. At an
+            # effective layer count of zero the launch is CPU-only and the loader
+            # drops the split flags, so charging the pinned count added per-device
+            # pipeline overhead and replicated the context-linear compute term for
+            # buffers no card allocates: on a two-card pin, 1039 -> 2105 MiB at 4k
+            # and 1417 -> 5129 MiB at 262k. Asked of the same function the panel
+            # prices placement with, so the two cannot disagree.
+            None
+            if _gguf_offloaded_layer_fraction(
+                gpu_memory_mode,
+                gpu_layers,
+                None,
+                llama_extra_args,
+                device_pin_governs = bool(selected_gpu_ids),
+            )
+            == 0.0
+            else selected_gpu_ids or None,
+            # Tensor mode replicates its buffers over the whole pool, and on a
+            # Vulkan build _effective_gpu_count sees none of it. The probed
+            # inventory is the pool; None falls through to the CUDA count as before.
+            _cached_inference_devices(),
+            # Same resolution the breakdown prices with: an extras --split-mode
+            # decides the mode, not the toggle alone, and one card cannot split.
+            tensor_parallel = _effective_tensor_parallel(llama_extra_args, bool(tensor_parallel))
+            and _tensor_split_possible(selected_gpu_ids or None)
+            # And the Manual drops, about the layer count rather than the pool: a
+            # tensor count here sizes per-device buffers for a CPU layer split.
+            and _manual_keeps_tensor_split(
+                gpu_memory_mode,
+                gpu_layers,
+                llama_extra_args,
+            ),
+        ),
+        disable_vision = bool(disable_vision),
+        gpu_memory_mode = gpu_memory_mode,
+        gpu_layers = gpu_layers,
+        spec_draft_n_max = spec_draft_n_max,
+        spec_draft_cache_type = spec_draft_cache_type,
+        tensor_split_possible = _tensor_split_possible(selected_gpu_ids or None),
+        # A pin names the cards, so the launch strips any device flag that says
+        # otherwise and this must read the same way.
+        device_pin_governs = bool(selected_gpu_ids),
+    )
+
+
+def _context_is_pinned(n_ctx: Optional[int], llama_extra_args: Optional[list[str]]) -> bool:
+    """Whether the caller named a context, as opposed to letting the loader size its own.
+
+    An extras ``-c`` names one too (last-wins over the field at launch); ``-c 0`` is
+    llama.cpp's "the model's own", which is not a window anyone chose.
+    """
+    from core.inference.llama_server_args import parse_ctx_override
+
+    try:
+        override = parse_ctx_override(llama_extra_args)
+    except ValueError:
+        override = None
+    if override is not None:
+        return override > 0
+    return bool(n_ctx and n_ctx > 0)
+
+
+def _other_studio_model_resident() -> bool:
+    """A Transformers model or an Images/Video pipeline holds GPU memory a chat load evicts.
+
+    Peeked, never constructed: building the orchestrator imports torch, which this must not
+    do on a route that fires per slider release.
+    """
+    try:
+        from core.inference.gpu_arbiter import DIFFUSION, VIDEO, current_owner
+
+        if current_owner() in (DIFFUSION, VIDEO):
+            return True
+    except Exception:
+        pass
+    try:
+        from core.inference.orchestrator import peek_inference_backend
+
+        backend = peek_inference_backend()
+        return bool(backend is not None and getattr(backend, "active_model_name", None))
+    except Exception:
+        return False
+
+
+def _load_guardrail_verdict(
+    breakdown: Any,
+    *,
+    gpu_ids: Optional[list[int]],
+    gpu_memory_mode: Optional[str],
+    gpu_layers: Optional[int],
+    llama_extra_args: Optional[list[str]],
+    context_pinned: bool,
+    tensor_split: Optional[list[float]] = None,
+    fresh: bool,
+):
+    """The load guardrail's verdict for a priced GGUF load, against memory free now.
+
+    Free memory is the loader's own reading (``LlamaCppBackend._get_gpu_memory``), with
+    the resident llama-server's logged buffers credited back since the load tears it down:
+    see ``core.inference.load_guardrail``.
+    """
+    from core.inference.load_guardrail import (
+        available_ram_bytes,
+        classify_placement,
+        measure_gpu_memory,
+        verdict_from_breakdown,
+    )
+    from core.inference.load_verdict import PLACEMENT_CPU, PLACEMENT_FIXED
+
+    fraction = _gguf_offloaded_layer_fraction(
+        gpu_memory_mode,
+        gpu_layers,
+        getattr(breakdown, "layer_count", None),
+        llama_extra_args,
+        device_pin_governs = bool(gpu_ids),
+    )
+    placement = classify_placement(gpu_memory_mode, gpu_layers, llama_extra_args, fraction)
+    gpus = None
+    if placement != PLACEMENT_CPU:
+        gpus = measure_gpu_memory(
+            llama_backend = get_llama_cpp_backend(),
+            gpu_ids = gpu_ids,
+            gpu_memory_mode = gpu_memory_mode,
+            other_studio_model_resident = _other_studio_model_resident(),
+            fresh = fresh,
+        )
+    return verdict_from_breakdown(
+        breakdown,
+        gpus = gpus,
+        placement = placement,
+        context_pinned = context_pinned,
+        tensor_split = tensor_split if placement == PLACEMENT_FIXED else None,
+        ram_available_bytes = available_ram_bytes(),
+    )
+
+
+def _load_verdict_info(verdict, mode: str) -> dict[str, Any]:
+    """The wire shape (``LoadVerdictInfo``) of a verdict under ``mode``."""
+    from utils.load_guardrail_settings import verdict_needs_confirmation
+
+    return {
+        **verdict.as_dict(),
+        "needs_confirmation": verdict_needs_confirmation(mode, verdict.level, verdict.reason),
+        "mode": mode,
+    }
+
+
+def _enforce_load_guardrail(
+    config: ModelConfig,
+    request: LoadRequest,
+    *,
+    extra_llama_args: Optional[list[str]],
+    n_parallel: int,
+    placement: "_LoadPlacement",
+    model_label: str,
+) -> None:
+    """Refuse a GGUF ``/load`` the guardrail judges too large, unless the caller overrode it.
+
+    Runs BEFORE the arbiter handoff and the teardown, so a refusal leaves the resident
+    model (and any Images/Video pipeline) exactly as it was. Fails open: a load it cannot
+    price (not downloaded, unreadable header, a probe that failed) goes ahead unjudged,
+    because the guardrail exists to stop a crash, not to gate loads on its own blind spots.
+    """
+    from utils.load_guardrail_settings import MODE_OFF, get_load_guardrail_mode
+
+    mode = get_load_guardrail_mode()
+    if mode == MODE_OFF:
+        return
+    if placement.diffusion_kind is True:
+        # The visual runner builds its own command; the chat estimate does not describe it.
+        return
+    try:
+        gguf_path = _local_gguf_main_path(config)
+        if not gguf_path:
+            return
+        breakdown = _placement_priced_breakdown(
+            _localized_estimate_config(config, gguf_path),
+            gguf_path,
+            hf_token = request.hf_token,
+            n_ctx = request.max_seq_length or 0,
+            llama_extra_args = extra_llama_args,
+            speculative_type = request.speculative_type,
+            n_parallel = _effective_parallel_slots(
+                n_parallel, diffusion_kind = placement.diffusion_kind
+            ),
+            cache_type_kv = request.cache_type_kv,
+            tensor_parallel = bool(request.tensor_parallel),
+            n_batch = request.n_batch,
+            n_ubatch = request.n_ubatch,
+            ctx_checkpoints = request.ctx_checkpoints,
+            disable_vision = bool(request.disable_vision),
+            gpu_memory_mode = request.gpu_memory_mode,
+            gpu_layers = request.gpu_layers,
+            spec_draft_n_max = request.spec_draft_n_max,
+            spec_draft_cache_type = request.spec_draft_cache_type,
+            selected_gpu_ids = request.gpu_ids or None,
+        )
+        if breakdown is None:
+            return
+        verdict = _load_guardrail_verdict(
+            breakdown,
+            gpu_ids = placement.resolved_gpu_ids or request.gpu_ids or None,
+            gpu_memory_mode = request.gpu_memory_mode,
+            gpu_layers = request.gpu_layers,
+            llama_extra_args = extra_llama_args,
+            # A replayed fitted context is the previous load's choice, not the user's.
+            context_pinned = _context_is_pinned(
+                0 if request.max_seq_length_auto_derived else request.max_seq_length,
+                extra_llama_args,
+            ),
+            tensor_split = request.tensor_split,
+            fresh = True,
+        )
+    except Exception as exc:  # noqa: BLE001 -- an unpriced load is not a refused one
+        logger.debug("Load guardrail could not judge %s: %s", model_label, exc)
+        return
+    info = _load_verdict_info(verdict, mode)
+    logger.info(
+        "Load guardrail (%s) for %s: %s (%s) -- %s",
+        mode,
+        model_label,
+        verdict.level,
+        verdict.reason,
+        verdict.message,
+    )
+    if not info["needs_confirmation"] or request.allow_memory_overcommit:
+        if info["needs_confirmation"]:
+            logger.warning(
+                "Loading %s past the load guardrail at the user's request: %s",
+                model_label,
+                verdict.message,
+            )
+        return
+    from core.inference.load_guardrail import describe_other_gpu_holders
+
+    # Only on a refusal: naming the programs costs a counter read (about a second on Windows).
+    holders = describe_other_gpu_holders(verdict.gpu_indices)
+    if holders:
+        info["other_apps_note"] = holders
+    raise HTTPException(
+        status_code = 409,
+        detail = {
+            # "error" as the active-generations 409 spells it, "code" for API callers.
+            "error": "memory_overcommit",
+            "code": "memory_overcommit",
+            "message": (
+                f"This model probably won't fit: {verdict.message}"
+                + (f" In use by: {holders}." if holders else "")
+                + " Retry with allow_memory_overcommit to load anyway, or change "
+                "Settings > Resources > Load guardrails."
+            ),
+            "verdict": info,
+        },
+    )
+
+
 @router.post("/estimate-memory", response_model = EstimateMemoryResponse)
 async def estimate_memory(
     request: EstimateMemoryRequest,
@@ -19310,7 +19642,6 @@ async def estimate_memory(
     if account_access.managed_account() and not native_access_deferred:
         await asyncio.to_thread(account_access.require_model_access, request.model_path)
     from core.inference.llama_cpp import _args_place_tensors_on_cpu
-    from core.inference.llama_server_args import _effective_tensor_parallel
 
     if is_ollama_manifest_ref(request.model_path):
         # Resolving one writes a .gguf link to disk; that belongs to the load path.
@@ -19409,7 +19740,7 @@ async def estimate_memory(
         # Price the files on this disk, not the repository they came from.
         config = _localized_estimate_config(config, gguf_path)
 
-        breakdown = _gguf_memory_breakdown(
+        breakdown = _placement_priced_breakdown(
             config,
             gguf_path,
             hf_token = request.hf_token,
@@ -19422,55 +19753,12 @@ async def estimate_memory(
             n_batch = request.n_batch,
             n_ubatch = request.n_ubatch,
             ctx_checkpoints = request.ctx_checkpoints,
-            # A layer split across pinned cards replicates the context-linear
-            # compute term and adds per-device pipeline overhead, so the count
-            # matters there too, not just in tensor mode. Automatic placement
-            # stays at one: _guard_device_count makes the same call.
-            n_devices = _guard_device_count(
-                # A pin names cards for a launch that puts something on them. At an
-                # effective layer count of zero the launch is CPU-only and the loader
-                # drops the split flags, so charging the pinned count added per-device
-                # pipeline overhead and replicated the context-linear compute term for
-                # buffers no card allocates: on a two-card pin, 1039 -> 2105 MiB at 4k
-                # and 1417 -> 5129 MiB at 262k. Asked of the same function the panel
-                # prices placement with, so the two cannot disagree.
-                None
-                if _gguf_offloaded_layer_fraction(
-                    request.gpu_memory_mode,
-                    request.gpu_layers,
-                    None,
-                    request.llama_extra_args,
-                    device_pin_governs = bool(request.selected_gpu_ids),
-                )
-                == 0.0
-                else request.selected_gpu_ids or None,
-                # Tensor mode replicates its buffers over the whole pool, and on a
-                # Vulkan build _effective_gpu_count sees none of it. The probed
-                # inventory is the pool; None falls through to the CUDA count as before.
-                _cached_inference_devices(),
-                # Same resolution the breakdown prices with: an extras --split-mode
-                # decides the mode, not the toggle alone, and one card cannot split.
-                tensor_parallel = _effective_tensor_parallel(
-                    request.llama_extra_args, bool(request.tensor_parallel)
-                )
-                and _tensor_split_possible(request.selected_gpu_ids or None)
-                # And the Manual drops, about the layer count rather than the pool: a
-                # tensor count here sizes per-device buffers for a CPU layer split.
-                and _manual_keeps_tensor_split(
-                    request.gpu_memory_mode,
-                    request.gpu_layers,
-                    request.llama_extra_args,
-                ),
-            ),
             disable_vision = bool(request.disable_vision),
             gpu_memory_mode = request.gpu_memory_mode,
             gpu_layers = request.gpu_layers,
             spec_draft_n_max = request.spec_draft_n_max,
             spec_draft_cache_type = request.spec_draft_cache_type,
-            tensor_split_possible = _tensor_split_possible(request.selected_gpu_ids or None),
-            # A pin names the cards, so the launch strips any device flag that says
-            # otherwise and this must read the same way.
-            device_pin_governs = bool(request.selected_gpu_ids),
+            selected_gpu_ids = request.selected_gpu_ids,
         )
         if breakdown is None:
             return EstimateMemoryResponse(available = False, reason = "unsizable")
@@ -19500,11 +19788,40 @@ async def estimate_memory(
                 )
             ),
         )
-        return EstimateMemoryResponse(**project_estimate_memory_response(estimate))
+        payload = project_estimate_memory_response(estimate)
+        # The same verdict /load acts on, so the panel's headline and a refusal agree.
+        # Into the payload before construction, never assigned afterwards: see
+        # build_memory_estimate on unvalidated assignment.
+        payload["verdict"] = _estimate_route_verdict(breakdown, request)
+        return EstimateMemoryResponse(**payload)
 
     # Header walks and file stats are blocking; keep them off the event loop so a
     # slider drag cannot stall streaming chats.
     return await asyncio.to_thread(_estimate)
+
+
+def _estimate_route_verdict(breakdown, request: EstimateMemoryRequest) -> Optional[dict]:
+    """The guardrail verdict for the panel's settings, or None. Never fails the estimate.
+
+    The probe is memoized for a couple of seconds (``measure_gpu_memory(fresh = False)``):
+    this route fires per slider release, and nvidia-smi costs ~100 ms on Windows.
+    """
+    try:
+        from utils.load_guardrail_settings import get_load_guardrail_mode
+
+        verdict = _load_guardrail_verdict(
+            breakdown,
+            gpu_ids = request.selected_gpu_ids or None,
+            gpu_memory_mode = request.gpu_memory_mode,
+            gpu_layers = request.gpu_layers,
+            llama_extra_args = request.llama_extra_args,
+            context_pinned = _context_is_pinned(request.n_ctx, request.llama_extra_args),
+            fresh = False,
+        )
+        return _load_verdict_info(verdict, get_load_guardrail_mode())
+    except Exception as exc:  # noqa: BLE001 -- the itemization stands without a headline
+        logger.debug("Load guardrail verdict unavailable for the estimate: %s", exc)
+        return None
 
 
 @router.post("/unload", response_model = UnloadResponse)
@@ -36459,7 +36776,16 @@ async def chat_count_tokens(
             status_code = 503,
             detail = "Cannot count tokens while a generation is in progress.",
         )
-    except Exception:
+    except Exception as exc:
+        # The client gets one generic 503 (a background recount has nothing to show), so the
+        # log is the only place the cause survives. Field case: right after a load, a chat
+        # template raising "No user query found" for a prompt with no user turn yet. No
+        # approximate fallback: strict counting refuses one on purpose (it undercounts).
+        logger.info(
+            "chat/count_tokens: could not count with the loaded tokenizer (%s): %s",
+            _tokenizer_model,
+            getattr(exc, "reason", None) or f"{type(exc).__name__}: {str(exc)[:300]}",
+        )
         raise HTTPException(
             status_code = 503,
             detail = "Unable to count tokens with the loaded model tokenizer.",

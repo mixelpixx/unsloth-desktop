@@ -27,6 +27,12 @@ import {
 import { ProjectComposer, Thread } from "@/components/assistant-ui/thread";
 import { usePlatformStore } from "@/config/env";
 import { CopyableErrorChip } from "@/components/ui/copyable-error-chip";
+// eslint-disable-next-line no-restricted-imports -- The settings barrel does not export the load-failure log helpers.
+import {
+  failureLogPath,
+  loadFailureLogFamily,
+  viewLogsAction,
+} from "@/features/settings/lib/view-logs-action";
 import {
   DropdownMenuItem,
   DropdownMenuSeparator,
@@ -140,6 +146,7 @@ import {
   useSelectedChatArtifact,
 } from "./artifacts/store";
 import { isKnownTextOnlySelection } from "./utils/model-vision-capability";
+import { modelLoadErrorHint } from "./utils/model-load-error-hint";
 import type { ChatArtifact, ChatArtifactSurface } from "./artifacts/types";
 import { McpServersDialogMount } from "./mcp-composer-button";
 import { ChatSettingsPanel } from "./chat-settings-sheet";
@@ -223,6 +230,7 @@ import {
   SharedComposer,
 } from "./shared-composer";
 import { BypassPermissionsConfirmDialog } from "./bypass-permissions-menu-item";
+import { AutoLoadConsentDialog } from "./components/auto-load-consent-dialog";
 import {
   CHAT_CODE_TOOLS_ENABLED_KEY,
   CHAT_IMAGE_TOOLS_ENABLED_KEY,
@@ -2421,6 +2429,21 @@ export function ChatPage({
   const modelsFromStore = useChatRuntimeStore((state) => state.models);
   const lorasFromStore = useChatRuntimeStore((state) => state.loras);
   const modelsError = useChatRuntimeStore((state) => state.modelsError);
+  // The header chip outlives the load-failure toast, so it carries the same hint and View logs.
+  const modelsErrorHint = modelsError ? modelLoadErrorHint(modelsError) : null;
+  const modelsErrorLogPath = modelsError ? failureLogPath(modelsError) : null;
+  // Only the GGUF runners append "Full log:", and the Logs panel files a runner log under
+  // diffusion-server by the same diffusion-*.log name test.
+  const modelsErrorLogsAction = modelsErrorLogPath
+    ? viewLogsAction(
+        loadFailureLogFamily(
+          true,
+          /(^|[\\/])diffusion-[^\\/]*$/.test(modelsErrorLogPath),
+          modelsErrorLogPath,
+        ),
+        modelsErrorLogPath,
+      )
+    : undefined;
   const modelLoading = useChatRuntimeStore((state) => state.modelLoading);
   const clearCheckpoint = useChatRuntimeStore((state) => state.clearCheckpoint);
   const resetArtifacts = useChatArtifactsStore((state) => state.resetArtifacts);
@@ -3700,6 +3723,15 @@ export function ChatPage({
     },
     { enabled: headerPickersShown },
   );
+  // "Choose a model" in the auto-load question: the header picker, or in Compare, which drops it,
+  // a pointer to the panes' own pickers. Unpinned, so the user can still dismiss it.
+  const chooseModelInsteadOfAutoLoad = useCallback(() => {
+    if (headerPickersShown) {
+      setModelSelectorOpen(true);
+      return;
+    }
+    toast.info("Pick a model in the pane's model picker, then send again.");
+  }, [headerPickersShown]);
   // The same condition the switcher renders by, so the chord cannot open a control that is not there.
   const projectSwitcherShown = headerPickersShown && Boolean(currentProjectId);
   useShortcut(
@@ -4188,6 +4220,11 @@ export function ChatPage({
           so it must live at one stable root, or Compare mode's composers would each render a copy.
           It also portals to body, so gate it on `active`. */}
       {active && <BypassPermissionsConfirmDialog />}
+      {/* Asks before a send loads a model nobody picked. One mount for the page, like the dialog
+          above; with none mounted, a send declines rather than loading silently. */}
+      {active && (
+        <AutoLoadConsentDialog onChooseModel={chooseModelInsteadOfAutoLoad} />
+      )}
       {/* The MCP servers dialog: its chord has to work before MCP is switched on, and the pill that
           used to own it only renders once it is. Mounted through the route change so it can close
           itself on the way out. */}
@@ -4337,12 +4374,27 @@ export function ChatPage({
               />
             ) : null}
             {!loadingModel && modelsError ? (
-              <div
-                className="relative top-0.5 pl-0.5"
-                role="status"
-                aria-live="polite"
-              >
-                <CopyableErrorChip message={modelsError} />
+              <div className="relative top-0.5 flex min-w-0 items-center gap-1.5 pl-0.5">
+                <div className="min-w-0" role="status" aria-live="polite">
+                  <CopyableErrorChip
+                    message={
+                      modelsErrorHint
+                        ? `${modelsErrorHint}\n\n${modelsError}`
+                        : modelsError
+                    }
+                  />
+                </div>
+                {modelsErrorLogsAction ? (
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="outline"
+                    className="shrink-0 text-ui-11"
+                    onClick={modelsErrorLogsAction.onClick}
+                  >
+                    {modelsErrorLogsAction.label}
+                  </Button>
+                ) : null}
               </div>
             ) : null}
           </div>

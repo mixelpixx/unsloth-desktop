@@ -12,6 +12,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { translate, useT } from "@/i18n";
+import { toast } from "@/lib/toast";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { useCallback, useEffect, useState } from "react";
 import { type ApiKey, fetchApiKeys, revokeApiKey } from "../api/api-keys";
@@ -35,6 +36,8 @@ export function ApiKeysTab() {
   const isOwner = useIsAccountOwner();
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const [loading, setLoading] = useState(true);
+  // The key list's own load failure. Create and revoke failures toast instead: written here they
+  // replaced a list that had loaded fine.
   const [error, setError] = useState<string | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<ApiKey | null>(null);
   const [revoking, setRevoking] = useState(false);
@@ -94,7 +97,8 @@ export function ApiKeysTab() {
       await load();
       setRevokeTarget(null);
     } catch {
-      setError(translate("settings.apiKeys.revokeError"));
+      toast.error(translate("settings.apiKeys.revokeError"));
+      setRevokeTarget(null);
     } finally {
       setRevoking(false);
     }
@@ -144,7 +148,7 @@ export function ApiKeysTab() {
                 setRevealed(raw);
                 void load();
               }}
-              onError={setError}
+              onError={(message) => toast.error(message)}
             />
           </motion.div>
         )}

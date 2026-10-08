@@ -428,16 +428,32 @@ def test_check_prebuilt_freshness_respects_custom_threshold(monkeypatch, tmp_pat
 
 def test_format_stale_warning_contains_actionable_command():
     msg = fr.format_stale_warning({"installed_tag": "b9190", "latest_tag": "b9300", "age_days": 5})
-    assert "b9190" in msg
-    assert "b9300" in msg
-    assert "5 days" in msg
-    assert "unsloth studio update" in msg
+    assert msg == (
+        "A newer llama.cpp prebuilt is available (installed build b9190, installed 5 days "
+        "ago; latest b9300). Run `unsloth studio update` to refresh."
+    )
+
+
+def test_format_stale_warning_does_not_call_install_age_a_release_gap():
+    # age_days counts from installed_at_utc. "N days behind" read as how far the release
+    # trails the latest one, which nothing here measures (field log: "8 days behind").
+    msg = fr.format_stale_warning({"installed_tag": "b9190", "latest_tag": "b9300", "age_days": 8})
+    assert "behind" not in msg
+    assert "installed 8 days ago" in msg
 
 
 def test_format_stale_warning_singular_day():
     msg = fr.format_stale_warning({"installed_tag": "b9190", "latest_tag": "b9300", "age_days": 1})
-    assert "1 day" in msg
+    assert "1 day ago" in msg
     assert "1 days" not in msg
+
+
+def test_format_stale_warning_without_an_install_time():
+    msg = fr.format_stale_warning({"installed_tag": "b9190", "latest_tag": "b9300", "age_days": None})
+    assert msg == (
+        "A newer llama.cpp prebuilt is available (installed build b9190; latest b9300). "
+        "Run `unsloth studio update` to refresh."
+    )
 
 
 # parse_base_build / is_behind.

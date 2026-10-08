@@ -63,7 +63,13 @@ function shouldNotifyTrainingError(
   return getTrainingErrorBody(before) !== getTrainingErrorBody(after);
 }
 
-function maybeNotifyTrainingTerminalTransition(
+/**
+ * Send the native "finished" / "failed" notification for a status transition. Shared with the
+ * app-wide completion watch, so a run that ends while Train is closed still notifies. Both
+ * pollers can see the same transition while Train is open; notifyNative drops a repeat through
+ * its per-key dedupe (`training-completed:<jobId>` / `training-error:<jobId>`).
+ */
+export function maybeNotifyTrainingTerminalTransition(
   before: TrainingRuntimeStore,
   after: TrainingRuntimeStore,
 ): void {

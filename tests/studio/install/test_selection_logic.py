@@ -435,7 +435,13 @@ class TestStudioLocalhostIpv6Warning:
         assert run_module._localhost_ipv6_mismatch_url("127.0.0.1", 8888) is None
 
     def _wire_recorders(self, run_module, monkeypatch):
-        calls = {"banner": [], "warning": [], "stop_hint": 0, "reachability": []}
+        calls = {
+            "banner": [],
+            "warning": [],
+            "stop_hint": 0,
+            "reachability": [],
+            "reachability_lan_host": [],
+        }
         monkeypatch.setattr(
             run_module,
             "print_studio_access_banner",
@@ -451,11 +457,11 @@ class TestStudioLocalhostIpv6Warning:
             "print_studio_stop_hint",
             lambda: calls.__setitem__("stop_hint", calls["stop_hint"] + 1),
         )
-        monkeypatch.setattr(
-            run_module,
-            "_verify_global_reachability",
-            lambda display_host, port: calls["reachability"].append((display_host, port)),
-        )
+        def _reachability(display_host, port, lan_host = ""):
+            calls["reachability"].append((display_host, port))
+            calls["reachability_lan_host"].append(lan_host)
+
+        monkeypatch.setattr(run_module, "_verify_global_reachability", _reachability)
         return calls
 
     def test_emit_startup_output_wires_mismatch_warning(self, monkeypatch):
@@ -498,6 +504,9 @@ class TestStudioLocalhostIpv6Warning:
         assert calls["banner"][0]["include_stop_hint"] is False
         assert calls["warning"] == []
         assert calls["reachability"] == [("203.0.113.5", 8888)]
+        # The LAN address the banner printed, handed on rather than looked up again: a desktop OS
+        # names it in the one line it prints instead of the public probe.
+        assert calls["reachability_lan_host"] == [calls["banner"][0]["network_host"]]
         assert calls["stop_hint"] == 1
 
 

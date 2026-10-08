@@ -20,6 +20,7 @@ import {
   clearDeletedDataset,
   useTrainingConfigStore,
 } from "../stores/training-config-store";
+import { selectedTrainingGpuIds } from "../stores/training-fit-store";
 import { useTrainingRuntimeStore } from "../stores/training-runtime-store";
 import type { TrainingConfigState, TrainingConfigStore } from "../types/config";
 import type { CheckFormatResponse } from "../types/datasets";
@@ -528,7 +529,12 @@ async function submitFreshTrainingRun(
     return attempt.cancel(translate(validation.errorKey));
   }
 
-  const payload = buildTrainingStartPayload(attempt.config, hfToken);
+  // The GPU target the fit panel shows; Auto (or a single-GPU host) sends no gpu_ids.
+  const payload = buildTrainingStartPayload(
+    attempt.config,
+    hfToken,
+    selectedTrainingGpuIds(),
+  );
   if (!attempt.enterTransport()) {
     return false;
   }

@@ -664,7 +664,9 @@ def test_the_lane_never_installs_in_env_override_mode() -> None:
 
     `install.ps1` selects `StudioRedirectMode = 'env'` from that variable, and
     `New-StudioShortcuts` then returns before writing any `.lnk`, because in that mode a shortcut
-    can point at a deleted workspace. Both manifests come back empty, so the comparison that would
+    can point at a deleted workspace. (It writes them only for a root persisted in the User or
+    Machine environment, or with UNSLOTH_CREATE_SHORTCUTS set; a step-level variable is neither.)
+    Both manifests come back empty, so the comparison that would
     see a changed `-WindowStyle` or `-ExecutionPolicy` -- the pair this entire effort is about --
     compares nothing. It does not even fail loudly: empty against empty is equal.
 

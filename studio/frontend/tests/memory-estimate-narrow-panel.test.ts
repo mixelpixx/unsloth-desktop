@@ -11,6 +11,7 @@ import * as jsxRuntime from "react/jsx-runtime";
 import { renderToStaticMarkup } from "react-dom/server";
 import type * as MemoryEstimateModule from "../src/features/model-picker/components/memory-estimate-row.tsx";
 import * as memoryFit from "../src/features/model-picker/model-config/memory-fit.ts";
+import * as loadVerdict from "../src/lib/load-verdict.ts";
 import { loadWithStubs } from "./helpers/module-stubs.ts";
 
 const { glueNoteItems, resolveDraftCacheNote, resolveKvNote } = memoryFit;
@@ -29,6 +30,12 @@ const { MemoryEstimateRow } = loadWithStubs<typeof MemoryEstimateModule>(
       TooltipTrigger: ({ children }: { children: React.ReactNode }) => children,
       TooltipContent: () => null,
     },
+    // The verdict headline's copy, keyed so a test can see which sentence was chosen.
+    "@/i18n": {
+      useT: () => (key: string, values?: Record<string, unknown>) =>
+        values ? `${key}${JSON.stringify(values)}` : key,
+    },
+    "@/lib/load-verdict": loadVerdict,
   },
 );
 
@@ -155,7 +162,8 @@ test("zero free VRAM keeps the GPU figure and its warning", () => {
   const html = render({ freeGpuCapacityGb: 0, freeGpuCapacityKnown: true });
   assert.match(html, />GPU<\/span>/);
   assert.match(html, />Total<\/span>/);
-  assert.match(html, /little VRAM is free right now/);
+  // Nothing resident to unload, so zero free is what the load meets: exceeds, not "little free".
+  assert.match(html, /Exceeds the GPU memory free right now/);
 });
 
 test("memory figures are keyboard targets with the full value as their name", () => {
@@ -223,4 +231,31 @@ test("gluing round-trips the note the row actually builds", () => {
   });
   // Only whitespace changes.
   assert.equal(glueNoteItems(note).replace(new RegExp(NBSP, "g"), " "), note);
+});
+
+test("the backend verdict is the headline, styled by its level, when the backend sends one", () => {
+  const verdict = loadVerdict.parseLoadVerdict({
+    level: "likely_too_large",
+    reason: "forced_gpu_overflow",
+    message: "Needs ~19.6 GiB on GPU 0; 6.1 GiB is free.",
+    gpu_need_bytes: 19.6 * GIB,
+    gpu_free_bytes: 6.1 * GIB,
+    gpu_indices: [0],
+    other_apps_bytes: 17 * GIB,
+    needs_confirmation: true,
+  });
+  assert.ok(verdict);
+  // Free VRAM short enough that the page's own reading would also have warned.
+  const html = render({ estimate: { ...props.estimate!, verdict }, freeGpuCapacityGb: 2 });
+  const headline = html.match(/<p data-load-verdict="likely_too_large" class="([^"]*)">([\s\S]*?)<\/p>/);
+  assert.ok(headline, "the verdict renders as one line");
+  assert.match(headline[1], /text-red-600/);
+  const text = headline[2].replaceAll("&quot;", '"');
+  assert.match(text, /loadVerdict\.level\.likelyTooLarge/);
+  assert.match(text, /loadVerdict\.needsOnGpu\{"need":"19\.6 GiB"/);
+  assert.match(text, /loadVerdict\.otherApps\{"other":"17\.0 GiB"\}/);
+  // The page's own placement advisory gives way to it rather than saying it twice.
+  assert.doesNotMatch(html, /Exceeds the GPU memory free right now/);
+  // Without a verdict the row is exactly what it was.
+  assert.doesNotMatch(render(), /data-load-verdict/);
 });

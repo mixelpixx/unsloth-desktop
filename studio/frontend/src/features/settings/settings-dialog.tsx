@@ -240,7 +240,6 @@ const TABS: TabDef[] = [
     id: "library",
     labelKey: "shell.navigation.library",
     icon: LibrariesIcon,
-    badgeKey: "common.new",
   },
   {
     id: "data",
@@ -526,7 +525,7 @@ export function SettingsDialog() {
                   <button
                     type="button"
                     onClick={() => setQuery("")}
-                    aria-label={t("settings.dialog.closeAriaLabel")}
+                    aria-label={t("skills.clearSearch")}
                     className="absolute top-1/2 right-2 flex size-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground hover:text-foreground"
                   >
                     <HugeiconsIcon icon={Cancel01Icon} className="size-3.5" />
@@ -605,6 +604,7 @@ export function SettingsDialog() {
                         tabButtonRefs.current[tab.id] = node;
                       }}
                       type="button"
+                      aria-current={active ? "page" : undefined}
                       onClick={() => setActiveTab(tab.id)}
                       className={cn(
                         "relative flex h-[calc(32px*var(--ui-space-scale,1))] items-center gap-2.5 rounded-full pl-3 pr-2.5 text-ui-14p5 leading-ui-19 tracking-nav font-medium transition-colors",

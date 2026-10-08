@@ -11,7 +11,12 @@ import {
   type ParsedTrainingProgressEvent,
   consumeTrainingProgressStream,
 } from "../lib/training-sse-stream";
+import {
+  type TrainingFitEstimate,
+  parseTrainingFitEstimate,
+} from "../lib/training-fit";
 import type {
+  TrainingEstimateRequest,
   TrainingResetResponse,
   TrainingStartRequest,
   TrainingStartRequestStatusResponse,
@@ -146,6 +151,36 @@ async function readTrainingStartError(
     return new TrainingStartError(await readFastApiError(fallbackResponse));
   }
   return new TrainingStartError(await readFastApiError(fallbackResponse));
+}
+
+// The first estimate after launch can wait on the backend's hardware detection and the Hub
+// metadata read; past this the fit bar gives up and shows its unknown state.
+const TRAINING_ESTIMATE_TIMEOUT_MS = 30_000;
+
+/** Price a config against its target GPUs. Throws on transport or HTTP failure; the caller
+ *  shows the unknown state, never a blocked Start. */
+export async function estimateTrainingFit(
+  payload: TrainingEstimateRequest,
+  signal?: AbortSignal,
+): Promise<TrainingFitEstimate> {
+  return runRequestWithTimeout(
+    TRAINING_ESTIMATE_TIMEOUT_MS,
+    "Training memory estimate timed out",
+    async (requestSignal) => {
+      const response = await authFetch(
+        "/api/train/estimate",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: requestSignal,
+        },
+        { retryNetworkErrors: false },
+      );
+      return parseTrainingFitEstimate(await parseJson<unknown>(response));
+    },
+    signal,
+  );
 }
 
 export async function startTraining(

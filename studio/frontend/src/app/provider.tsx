@@ -1085,7 +1085,7 @@ export function AppProvider({ children }: AppProviderProps) {
         <SttDownloadPrompt />
         <Toaster
           position="top-right"
-          visibleToasts={2}
+          visibleToasts={3}
           expand={true}
           closeButton={true}
           offset={insetPastChatSettings(toastOffsets.default)}

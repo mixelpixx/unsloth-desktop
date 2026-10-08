@@ -269,6 +269,7 @@ test("authFetch invokes its policy guard after refresh and before retry", async 
       {
         "@/lib/api-base": { apiUrl: (path: string) => path, isTauri: false },
         "@/lib/account-transition": { accountTransitionPending: () => false },
+        "@/lib/connection-monitor": { reportTransportFailure: () => {} },
         "./session": {
           clearAuthTokens: () => {
             accessToken = null;

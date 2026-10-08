@@ -171,7 +171,7 @@ def test_stdio_command_codec_windows_preserves_final_whitespace_argument_end_to_
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(routes_mcp, "stdio_mcp_enabled", lambda: True)
     monkeypatch.setattr(mcp_client, "stdio_mcp_enabled", lambda: True)
-    monkeypatch.setattr(routes_mcp, "close_mcp_sessions", lambda *args: None)
+    monkeypatch.setattr(routes_mcp, "close_mcp_sessions", lambda *args, **kwargs: None)
 
     probed_urls: list[str] = []
 
@@ -385,7 +385,7 @@ def test_stdio_raw_nul_is_rejected_before_route_side_effects(tmp_path, monkeypat
         routes_mcp, "invalidate_tool_cache", lambda *args: side_effects.append("invalidate")
     )
     monkeypatch.setattr(
-        routes_mcp, "close_mcp_sessions", lambda *args: side_effects.append("close")
+        routes_mcp, "close_mcp_sessions", lambda *args, **kwargs: side_effects.append("close")
     )
 
     with pytest.raises(HTTPException):
@@ -1348,6 +1348,7 @@ def test_get_enabled_mcp_tools_caches_discovery(tmp_path, monkeypatch):
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         calls.append(url)
         return _one_tool()
@@ -1407,6 +1408,7 @@ def test_get_enabled_mcp_tools_does_not_cache_failures(tmp_path, monkeypatch):
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         attempts["n"] += 1
         if attempts["n"] == 1:
@@ -1440,6 +1442,7 @@ def test_refresh_warms_tool_cache(tmp_path, monkeypatch):
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         return _one_tool()
 
@@ -1575,7 +1578,7 @@ def test_stdio_arguments_update_preserves_untouched_bytes_then_invalidates_once(
     invalidated: list[str] = []
     closed: list[tuple] = []
     monkeypatch.setattr(routes_mcp, "invalidate_tool_cache", invalidated.append)
-    monkeypatch.setattr(routes_mcp, "close_mcp_sessions", lambda *args: closed.append(args))
+    monkeypatch.setattr(routes_mcp, "close_mcp_sessions", lambda *args, **kwargs: closed.append(args))
     cached = _one_tool()
     monkeypatch.setattr(mcp_client, "_tool_cache", {"s1": cached})
 
@@ -1680,6 +1683,7 @@ def test_get_enabled_mcp_tools_probes_only_uncached(tmp_path, monkeypatch):
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         probed.append(url)
         return _one_tool("fresh")
@@ -1709,6 +1713,7 @@ def test_get_enabled_mcp_tools_partial_failure_caches_healthy(tmp_path, monkeypa
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         if "bad" in url:
             raise RuntimeError("down")
@@ -1740,6 +1745,7 @@ def test_get_enabled_mcp_tools_caches_empty_tool_list(tmp_path, monkeypatch):
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         calls.append(url)
         return []
@@ -1791,6 +1797,7 @@ def test_get_enabled_mcp_tools_skips_cache_when_config_changes_mid_probe(tmp_pat
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         # Simulate a PUT landing while we are awaiting the probe.
         mcp_servers_db.update_server("s1", {"url": "https://new/mcp"})
@@ -1824,6 +1831,7 @@ def test_get_enabled_mcp_tools_no_cooloff_when_config_changes_mid_failed_probe(
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         # The user re-points the server while the old endpoint's probe fails.
         mcp_servers_db.update_server("s1", {"url": "https://new/mcp"})
@@ -1856,6 +1864,7 @@ def test_get_enabled_mcp_tools_no_cooloff_when_server_deleted_mid_failed_probe(
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         mcp_servers_db.delete_server("s1")
         raise RuntimeError("down")
@@ -1886,6 +1895,7 @@ def test_get_enabled_mcp_tools_skips_failed_server_during_cooloff(tmp_path, monk
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         attempts["n"] += 1
         raise RuntimeError("down")
@@ -1952,6 +1962,7 @@ def test_refresh_failure_records_cooloff(tmp_path, monkeypatch):
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         raise RuntimeError("down")
 
@@ -1978,6 +1989,7 @@ def test_refresh_drops_result_when_config_changes_mid_probe(tmp_path, monkeypatc
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         mcp_servers_db.update_server("s1", {"url": "https://new/mcp"})
         return _one_tool("stale")
@@ -2006,6 +2018,7 @@ def test_refresh_failure_no_cooloff_when_config_changes_mid_probe(tmp_path, monk
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         mcp_servers_db.update_server("s1", {"url": "https://new/mcp"})
         raise RuntimeError("old endpoint down")
@@ -2035,6 +2048,7 @@ def test_get_enabled_mcp_tools_drops_result_when_server_deleted_mid_probe(tmp_pa
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         # Simulate a DELETE landing while we await the probe.
         mcp_servers_db.delete_server("s1")
@@ -2074,6 +2088,7 @@ def test_oauth_probe_failure_in_chat_path_uses_long_cooloff(tmp_path, monkeypatc
         headers = None,
         timeout = None,
         use_oauth = False,
+        cwd = None,
     ):
         raise RuntimeError("oauth down")
 

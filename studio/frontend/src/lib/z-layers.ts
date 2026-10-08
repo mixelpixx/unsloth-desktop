@@ -15,6 +15,7 @@
  *   WINDOW_RESIZE_EDGE   the window's own bottom resize grips, under that stack
  *   FLOATING_PANEL       windows the user drags, resizes and closes
  *   FLOATING_PANEL_TOP   the one of those the user touched last
+ *   CONNECTION_BANNER    the backend cannot be reached; above anything the user can move
  *   STARTUP_SCREEN       blocks the app while the backend comes up or quits
  *   TOOLTIP              transient, must be readable above whatever spawned it
  *   DRAG_CURSOR_OVERLAY  owns the cursor and the hit test during a panel drag
@@ -60,6 +61,13 @@ export const Z_LAYER = {
    * so a single step above FLOATING_PANEL is enough; see floating-panel-order.
    */
   FLOATING_PANEL_TOP: 9101,
+  /**
+   * The "can't reach Unsloth Studio" banner across the top. Above the floating panels, since
+   * a panel dragged to the top edge must not hide that nothing behind it is answering. Below
+   * the startup screen, which on desktop takes over once the launcher sees the backend gone
+   * and is the more specific of the two.
+   */
+  CONNECTION_BANNER: 9200,
   /**
    * The startup and closing screens, which stand in for the whole app while
    * the backend comes up or shuts down. Nothing below may show through.

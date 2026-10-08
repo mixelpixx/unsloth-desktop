@@ -5218,6 +5218,35 @@ function Install-UnslothStudio {
         return ($text -like "*unsloth-studio-managed-launcher*" -and $text -like "*from unsloth_cli import app*")
     }
 
+    # Whether $Path is the root a new session resolves to: persisted UNSLOTH_STUDIO_HOME, else legacy
+    # STUDIO_HOME, User before Machine as a fresh process inherits them. A session-only root (a CI
+    # sandbox, a one-off override) is not, and its .lnk could outlive a deleted workspace. Compared
+    # resolved, case-insensitively, without a trailing separator; anything unreadable answers false.
+    function Test-StudioHomeIsPersisted {
+        param([string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+        $persisted = $null
+        foreach ($name in @('UNSLOTH_STUDIO_HOME', 'STUDIO_HOME')) {
+            foreach ($scope in @('User', 'Machine')) {
+                $value = $null
+                try { $value = [Environment]::GetEnvironmentVariable($name, $scope) } catch {}
+                if (-not [string]::IsNullOrWhiteSpace($value)) { $persisted = $value.Trim(); break }
+            }
+            if ($persisted) { break }
+        }
+        if (-not $persisted) { return $false }
+        if ($persisted -eq "~" -or $persisted -like "~/*" -or $persisted -like "~\*") {
+            if (-not $env:USERPROFILE) { return $false }
+            $persisted = Join-Path $env:USERPROFILE $persisted.Substring(1).TrimStart('/', '\')
+        }
+        try {
+            $resolved = (Resolve-Path -LiteralPath $persisted -ErrorAction Stop).Path
+        } catch { return $false }
+        return [string]::Equals(
+            $resolved.TrimEnd('\', '/'), $Path.TrimEnd('\', '/'),
+            [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
     function New-StudioShortcuts {
         param(
             [Parameter(Mandatory = $true)][string]$ManagedPythonPath,
@@ -5355,7 +5384,7 @@ function Install-UnslothStudio {
 $studioHomeExport`$ErrorActionPreference = 'Stop'
 `$basePort = 8888
 `$maxPortOffset = 20
-`$timeoutSec = 60
+`$timeoutSec = 120
 `$pollIntervalMs = 1000
 `$_ExpectedStudioRootId = '$_studioRootId'
 `$_StudioInstallIdFile = '$($_studioIdFile -replace "'", "''")'
@@ -5423,16 +5452,16 @@ function Get-CandidatePorts {
 }
 
 function Find-HealthyStudioPort {
-    if (`$portFile) {
-        if (Test-Path -LiteralPath `$portFile) {
-            `$cached = Get-Content -LiteralPath `$portFile -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (`$cached -match '^\d+`$') {
-                `$cachedPort = [int]`$cached
-                if (Test-StudioHealth -Port `$cachedPort) { return `$cachedPort }
-                Remove-Item -LiteralPath `$portFile -Force -ErrorAction SilentlyContinue
-            }
+    # The port this launcher last started first, then the scan: a server started from a terminal
+    # writes no port file, and missing it starts a second one against the same database.
+    # Test-StudioHealth matches this install's studio_root_id, so the scan adopts no other install.
+    if (`$portFile -and (Test-Path -LiteralPath `$portFile)) {
+        `$cached = Get-Content -LiteralPath `$portFile -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (`$cached -match '^\d+`$') {
+            `$cachedPort = [int]`$cached
+            if (Test-StudioHealth -Port `$cachedPort) { return `$cachedPort }
+            Remove-Item -LiteralPath `$portFile -Force -ErrorAction SilentlyContinue
         }
-        return `$null
     }
     foreach (`$candidate in (Get-CandidatePorts)) {
         if (Test-StudioHealth -Port `$candidate) {
@@ -5697,10 +5726,19 @@ exit 0
                 $iconChanged = $true
             }
 
-            # Env-mode: skip .lnk shortcuts (may point at a deleted workspace); launcher stays.
+            # Env-mode: shortcuts only for a persisted root (the user's real install, otherwise startable
+            # only from a terminal) or with UNSLOTH_CREATE_SHORTCUTS; a session-only root keeps just the
+            # launcher. -in is case-insensitive, so TRUE and On count too.
             if ($StudioRedirectMode -eq 'env') {
-                substep "wrote launcher at $launcherPs1 (persistent shortcuts skipped in env-override mode)"
-                return
+                $wantShortcuts = ("$env:UNSLOTH_CREATE_SHORTCUTS".Trim() -in @('1', 'true', 'yes', 'on'))
+                if (-not $wantShortcuts) {
+                    $wantShortcuts = Test-StudioHomeIsPersisted -Path $StudioHome
+                }
+                if (-not $wantShortcuts) {
+                    substep "wrote launcher at $launcherPs1 (no Desktop/Start menu shortcut: this custom location is set for this session only)"
+                    substep "to add them, save UNSLOTH_STUDIO_HOME for your user or set UNSLOTH_CREATE_SHORTCUTS=1, then run: unsloth studio update"
+                    return
+                }
             }
 
             # Gates the heavy refresh below: on a reinstall that changed nothing, purging

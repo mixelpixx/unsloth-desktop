@@ -30,7 +30,9 @@ import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import {
   Alert02Icon,
+  ArrowDown01Icon,
   ArrowDownDoubleIcon,
+  ArrowUp01Icon,
   Copy01Icon,
   Download01Icon,
   FolderOpenIcon,
@@ -71,6 +73,15 @@ import {
 } from "../lib/debug-log-buffer";
 import { isAbort, isLogSourceGone } from "../lib/debug-log-error";
 import {
+  LEVEL_FILTERS,
+  type LevelFilter,
+  type LogLevel,
+  adjacentAnchor,
+  classifyLogLines,
+  passesLevelFilter,
+  segmentLines,
+} from "../lib/log-levels";
+import {
   NO_PENDING_LOG_REQUEST,
   pendingLogRequestKey,
   useSettingsDialogStore,
@@ -84,6 +95,15 @@ const SOURCE_RESCAN_MS = 10_000;
 
 // how close to the bottom the pane must be scrolled for auto-follow to stay on
 const FOLLOW_THRESHOLD_PX = 40;
+
+// A gutter in the pane's left padding (the negative margin gives back what the
+// border and padding take, so text stays aligned with the plain lines).
+const LEVEL_LINE_CLASS: Record<LogLevel, string> = {
+  error: "-ml-2 border-l-2 border-destructive/70 pl-1.5 text-destructive",
+  warning:
+    "-ml-2 border-l-2 border-amber-500/70 pl-1.5 text-amber-700 dark:text-amber-400",
+  info: "",
+};
 
 function readStoredMode(): RefreshMode {
   if (typeof window === "undefined") return DEFAULT_REFRESH_MODE;
@@ -161,6 +181,13 @@ export function DebuggingTab() {
   const [exporting, setExporting] = useState(false);
   const [revealing, setRevealing] = useState(false);
   const [filter, setFilter] = useState("");
+  const [levelFilter, setLevelFilter] = useState<LevelFilter>("all");
+  // The error Previous / Next last landed on, by buffer index plus its text: the
+  // buffer drops its oldest lines past its caps, which moves every index down.
+  const [activeError, setActiveError] = useState<{
+    index: number;
+    line: string;
+  } | null>(null);
   const [wrap, setWrap] = useState(true);
   // mirrors pinnedRef for the jump-to-latest button; the ref stays the source of
   // truth so the scroll handler does not re-render the pane on every line
@@ -364,6 +391,7 @@ export function DebuggingTab() {
     setMorePending(false);
     setStaleSession(false);
     setNotice(null);
+    setActiveError(null);
   }, [sourceId]);
 
   useEffect(() => {
@@ -397,18 +425,71 @@ export function DebuggingTab() {
 
   // stripped once per line so the filter matches exactly what the pane shows
   const plainLines = useMemo(() => buffer.lines.map(stripAnsi), [buffer.lines]);
+  // Over every line, not the filtered ones: a traceback frame only reads as part of
+  // an error next to the line before it.
+  const classified = useMemo(() => classifyLogLines(plainLines), [plainLines]);
   const trimmedFilter = filter.trim().toLowerCase();
-  const visibleLines = useMemo(
-    () =>
-      trimmedFilter
-        ? plainLines.filter((line) =>
-            line.toLowerCase().includes(trimmedFilter),
-          )
-        : plainLines,
-    [plainLines, trimmedFilter],
-  );
+  const filtering = Boolean(trimmedFilter) || levelFilter !== "all";
+  // Buffer indices of the lines shown, so a line keeps one identity for the
+  // segments, the error anchors and the active highlight.
+  const visibleIndices = useMemo(() => {
+    const shown: number[] = [];
+    for (let index = 0; index < plainLines.length; index += 1) {
+      if (!passesLevelFilter(classified.levels[index], levelFilter)) continue;
+      if (
+        trimmedFilter &&
+        !plainLines[index].toLowerCase().includes(trimmedFilter)
+      )
+        continue;
+      shown.push(index);
+    }
+    return shown;
+  }, [classified, levelFilter, plainLines, trimmedFilter]);
 
-  const text = useMemo(() => visibleLines.join("\n"), [visibleLines]);
+  const text = useMemo(
+    () => visibleIndices.map((index) => plainLines[index]).join("\n"),
+    [plainLines, visibleIndices],
+  );
+  const segments = useMemo(
+    () => segmentLines(plainLines, visibleIndices, classified),
+    [classified, plainLines, visibleIndices],
+  );
+  const visibleAnchors = useMemo(() => {
+    const shown = new Set(visibleIndices);
+    return classified.anchors.filter((anchor) => shown.has(anchor));
+  }, [classified, visibleIndices]);
+  const activeIndex = useMemo(() => {
+    if (!activeError) return null;
+    if (buffer.lines[activeError.index] === activeError.line)
+      return activeError.index;
+    const moved = buffer.lines.lastIndexOf(activeError.line, activeError.index);
+    return moved >= 0 ? moved : null;
+  }, [activeError, buffer.lines]);
+  const previousError = adjacentAnchor(visibleAnchors, activeIndex, -1);
+  const nextError = adjacentAnchor(visibleAnchors, activeIndex, 1);
+  const activePosition =
+    activeIndex === null ? -1 : visibleAnchors.indexOf(activeIndex);
+
+  const goToError = useCallback(
+    (target: number | null) => {
+      const pane = paneRef.current;
+      if (target === null || !pane) return;
+      setActiveError({ index: target, line: buffer.lines[target] });
+      // The anchor's segment is already rendered (only its highlight waits on the
+      // state above), so it can be scrolled to now.
+      const element = pane.querySelector<HTMLElement>(
+        `[data-log-line="${target}"]`,
+      );
+      if (!element) return;
+      // Off the bottom, so Live mode stops pulling the view back down to the newest line.
+      pinnedRef.current = false;
+      setFollowing(false);
+      const offset =
+        element.getBoundingClientRect().top - pane.getBoundingClientRect().top;
+      pane.scrollTop += offset - pane.clientHeight / 3;
+    },
+    [buffer.lines],
+  );
 
   const scrollToBottom = useCallback(() => {
     const pane = paneRef.current;
@@ -505,6 +586,14 @@ export function DebuggingTab() {
           ? "settings.debugging.modeInterval"
           : "settings.debugging.modeManual",
     );
+  const levelLabel = (candidate: LevelFilter) =>
+    t(
+      candidate === "errors"
+        ? "settings.debugging.levelErrors"
+        : candidate === "warnings"
+          ? "settings.debugging.levelWarnings"
+          : "settings.debugging.levelAll",
+    );
 
   return (
     <div className="settings-page">
@@ -539,7 +628,9 @@ export function DebuggingTab() {
                       className="font-mono text-ui-12"
                     >
                       <span className="flex min-w-0 items-center gap-2">
-                        <span className="min-w-0 truncate">{source.label}</span>
+                        <span className="min-w-0 truncate" title={source.label}>
+                          {source.displayName ?? source.label}
+                        </span>
                         {source.isCurrent ? (
                           <span className="shrink-0 rounded-full bg-primary/10 px-1.5 py-px font-sans text-ui-10 font-medium text-primary">
                             {t("settings.debugging.currentSession")}
@@ -626,14 +717,93 @@ export function DebuggingTab() {
               className="text-sm"
             />
           </InputGroup>
+          <div
+            role="radiogroup"
+            aria-label={t("settings.debugging.levelFilter")}
+            data-testid="debug-log-level-filter"
+            className="hub-tab-toggle inline-flex h-8 items-center rounded-full"
+          >
+            {LEVEL_FILTERS.map((candidate) => {
+              const active = candidate === levelFilter;
+              return (
+                <button
+                  key={candidate}
+                  type="button"
+                  role="radio"
+                  data-testid={`debug-log-level-${candidate}`}
+                  aria-checked={active}
+                  onClick={() => setLevelFilter(candidate)}
+                  className={cn(
+                    "relative flex h-8 items-center rounded-full px-3 text-xs font-medium transition-colors",
+                    active
+                      ? "hub-tab-toggle-pill text-foreground"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <span className="relative z-10">{levelLabel(candidate)}</span>
+                </button>
+              );
+            })}
+          </div>
+          <div className="flex items-center gap-0.5">
+            <Tooltip>
+              <TooltipTrigger asChild={true}>
+                <Button
+                  size="icon-sm"
+                  variant="ghost"
+                  data-testid="debug-log-previous-error"
+                  aria-label={t("settings.debugging.previousError")}
+                  disabled={previousError === null}
+                  onClick={() => goToError(previousError)}
+                  className="text-muted-foreground"
+                >
+                  <HugeiconsIcon strokeWidth={1.75} icon={ArrowUp01Icon} />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {t("settings.debugging.previousError")}
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild={true}>
+                <Button
+                  size="icon-sm"
+                  variant="ghost"
+                  data-testid="debug-log-next-error"
+                  aria-label={t("settings.debugging.nextError")}
+                  disabled={nextError === null}
+                  onClick={() => goToError(nextError)}
+                  className="text-muted-foreground"
+                >
+                  <HugeiconsIcon strokeWidth={1.75} icon={ArrowDown01Icon} />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t("settings.debugging.nextError")}</TooltipContent>
+            </Tooltip>
+            {visibleAnchors.length > 0 ? (
+              <span
+                className="text-xs text-muted-foreground tabular-nums"
+                data-testid="debug-log-error-position"
+              >
+                {activePosition >= 0
+                  ? t("settings.debugging.errorPosition", {
+                      current: activePosition + 1,
+                      total: visibleAnchors.length,
+                    })
+                  : t("settings.debugging.errorTotal", {
+                      total: visibleAnchors.length,
+                    })}
+              </span>
+            ) : null}
+          </div>
           <div className="ml-auto flex items-center gap-2">
             <span
               className="text-xs text-muted-foreground tabular-nums"
               data-testid="debug-log-line-count"
             >
-              {trimmedFilter
+              {filtering
                 ? t("settings.debugging.filteredLineCount", {
-                    shown: visibleLines.length,
+                    shown: visibleIndices.length,
                     total: buffer.lines.length,
                   })
                 : t("settings.debugging.lineCount", {
@@ -715,8 +885,9 @@ export function DebuggingTab() {
         ) : null}
 
         <div className="relative">
-          {/* One text surface, not an element per line: this repaints on every
-              poll and 1000 nodes per tick is what makes a log pane feel broken. */}
+          {/* Runs of one level, not an element per line: this repaints on every
+              poll and 1000 nodes per tick is what makes a log pane feel broken.
+              Each error entry is still its own run, to scroll to and highlight. */}
           <pre
             ref={paneRef}
             onScroll={onScroll}
@@ -727,10 +898,27 @@ export function DebuggingTab() {
               !text && "text-muted-foreground",
             )}
           >
-            {text ||
-              (trimmedFilter && buffer.lines.length > 0
+            {segments.length > 0
+              ? segments.map((segment) => (
+                  <span
+                    key={segment.start}
+                    data-log-line={segment.start}
+                    data-log-level={segment.level}
+                    className={cn(
+                      "block",
+                      LEVEL_LINE_CLASS[segment.level],
+                      segment.entry !== null &&
+                        segment.entry === activeIndex &&
+                        "bg-destructive/10",
+                    )}
+                  >
+                    {/* a lone empty line still takes its height */}
+                    {segment.text || " "}
+                  </span>
+                ))
+              : filtering && buffer.lines.length > 0
                 ? t("settings.debugging.noMatches")
-                : t("settings.debugging.empty"))}
+                : t("settings.debugging.empty")}
           </pre>
           {!following && text ? (
             <Button

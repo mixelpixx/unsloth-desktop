@@ -3,9 +3,11 @@
 
 import asyncio
 import json
+import os
+import re
 import sys
 import uuid
-from typing import Annotated
+from typing import Annotated, Optional
 from urllib.parse import urlparse
 
 import structlog
@@ -21,6 +23,7 @@ from auth.authentication import (
 )
 from core.inference.mcp_client import (
     TOOL_CACHE_INVALIDATING_FIELDS,
+    McpStdioServerError,
     cache_tools,
     clear_oauth_tokens_async,
     close_mcp_sessions,
@@ -35,10 +38,12 @@ from core.inference.mcp_client import (
     serialize_mcp_server_mutation,
     stdio_mcp_disabled_reason,
     stdio_mcp_enabled,
+    unquoted_spaced_program,
 )
 from core.inference.mcp_config_import import parse_mcp_config
 from models.mcp_servers import (
     BlenderTest,
+    McpCapabilities,
     McpServerCreate,
     McpServerImportRequest,
     McpServerImportResult,
@@ -64,14 +69,29 @@ ViaApiKey = Annotated[bool, Depends(authenticated_via_api_key)]
 WithoutCredential = Annotated[bool, Depends(request_admitted_without_credential)]
 
 
+_WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+# No ".com": it is far likelier a scheme-less domain than an MS-DOS program.
+_PROGRAM_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1", ".py", ".js", ".mjs", ".cjs", ".sh")
+
+
 def _looks_like_command(value: str) -> bool:
-    """Whitespace is a one-way signal: a URL can't hold an unencoded space, so a value with whitespace is
-    definitely a command. No whitespace proves nothing (a lone token may be a single-arg command or a
-    scheme-less URL)."""
-    return any(ch.isspace() for ch in value)
+    """Only picks which error to show when local commands are off, so a wrong guess costs a message, never
+    access. Whitespace is a one-way signal: a URL can't hold an unencoded space. A lone token is a command
+    when it is a path (urlparse reads ``D:\\mcp\\server.exe`` as scheme ``d``, which used to answer an .exe
+    with "must start with http://"), quoted, or a program name; otherwise it may be a scheme-less URL."""
+    if any(ch.isspace() for ch in value):
+        return True
+    if "://" in value:
+        return False
+    return (
+        _WINDOWS_DRIVE_PATH.match(value) is not None
+        or value.startswith(("\\", "/", "./", "../", "~", '"', "'"))
+        or "\\" in value
+        or value.lower().endswith(_PROGRAM_SUFFIXES)
+    )
 
 
-def _normalize_stdio_command(url: str) -> str:
+def _normalize_stdio_command(url: str, *, reject_unquoted_spaced_program: bool = True) -> str:
     raw = url or ""
     trimmed = raw.strip()
     if not trimmed:
@@ -102,7 +122,59 @@ def _normalize_stdio_command(url: str) -> str:
             detail = "Enter an http(s):// URL, or a local command whose "
             "first token is an executable (not a URL).",
         )
+    # The dialog quotes the program itself (/stdio/encode), but the raw API and config import take a command line
+    # as written, and ``C:\My Tools\server.exe --x`` then runs ``C:\My`` -- or a planted ``C:\My.exe``, since Windows
+    # guesses the extension. Refuse it while the intended path is still visible. POSIX shells taught everyone to
+    # quote; there is no extension guessing there either.
+    if reject_unquoted_spaced_program and sys.platform == "win32":
+        spaced = unquoted_spaced_program(parts)
+        if spaced is not None:
+            raise HTTPException(
+                status_code = 400,
+                detail = f'This program path contains spaces — wrap it in double quotes: "{spaced}"',
+            )
     return normalized
+
+
+def _strip_wrapping_quotes(command: str) -> str:
+    """Explorer's "Copy as path" wraps the path in double quotes. The executable field holds one argv entry,
+    so those quotes would otherwise be escaped into the program name and the spawn fails with "file not
+    found". Windows file names cannot contain '"', so one matching outer pair is never part of the name."""
+    if len(command) >= 2 and command[0] == command[-1] and command[0] in "\"'":
+        return command[1:-1].strip()
+    return command
+
+
+def _validate_cwd(cwd: Optional[str], url: str) -> Optional[str]:
+    """A local program's working directory: None or blank clears it, anything else must be an existing
+    absolute folder. Checked when saved so a typo shows up in the dialog, not as a server that never
+    starts; checked again at spawn because folders get deleted. Callers gate local commands to a UI
+    session first, so an API key cannot use this to probe which folders exist."""
+    if cwd is None:
+        return None
+    value = _strip_wrapping_quotes(cwd.strip())
+    if not value:
+        return None
+    if not is_stdio(url):
+        raise HTTPException(
+            status_code = 400,
+            detail = "A working directory only applies to local programs, not http(s) servers.",
+        )
+    if "\x00" in value:
+        raise HTTPException(
+            status_code = 400, detail = "The working directory must not contain NUL characters."
+        )
+    if not os.path.isabs(value):
+        raise HTTPException(
+            status_code = 400,
+            detail = "The working directory must be an absolute path to an existing folder.",
+        )
+    if not os.path.isdir(value):
+        raise HTTPException(
+            status_code = 400,
+            detail = f"Working directory not found, or not a folder: {value}",
+        )
+    return value
 
 
 def _validate_url(url: str) -> str:
@@ -161,6 +233,7 @@ def _row_to_response(row: dict, *, include_headers: bool = True) -> McpServerRes
         headers = (parse_server_headers(row) or {}) if include_headers else {},
         is_enabled = bool(row["is_enabled"]),
         use_oauth = bool(row.get("use_oauth")),
+        cwd = row.get("cwd"),
         created_at = row["created_at"],
         updated_at = row["updated_at"],
     )
@@ -181,6 +254,22 @@ def _require_managed_access(
     require_ui_session_for_local_commands(via_api_key or no_credential)
     if executes and not stdio_mcp_enabled():
         raise HTTPException(status_code = 400, detail = stdio_mcp_disabled_reason())
+
+
+@router.get("/capabilities", response_model = McpCapabilities)
+def get_mcp_capabilities(
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+    no_credential: WithoutCredential = False,
+):
+    if via_api_key or no_credential:
+        return McpCapabilities(
+            stdio_enabled = False,
+            stdio_disabled_reason = "Local programs can only be added from a signed-in Unsloth Studio window.",
+        )
+    if stdio_mcp_enabled():
+        return McpCapabilities(stdio_enabled = True)
+    return McpCapabilities(stdio_enabled = False, stdio_disabled_reason = stdio_mcp_disabled_reason())
 
 
 @router.get("/builtins", response_model = list[McpBuiltinResponse])
@@ -274,7 +363,9 @@ def decode_stdio_command(
     require_ui_session_for_local_commands(via_api_key)
     if not is_stdio(payload.url.strip()):
         raise HTTPException(status_code = 400, detail = "HTTP(S) MCP servers do not have arguments")
-    url = _normalize_stdio_command(payload.url)
+    # A row saved unquoted before that check existed must still open in the editor, where re-saving encodes it
+    # properly.
+    url = _normalize_stdio_command(payload.url, reject_unquoted_spaced_program = False)
     parts = parse_stdio_command(url)
     return McpStdioCommand(command = parts[0], arguments = parts[1:])
 
@@ -286,7 +377,7 @@ def encode_stdio_command(
     via_api_key: ViaApiKey = False,
 ):
     require_ui_session_for_local_commands(via_api_key)
-    command = payload.command.strip()
+    command = _strip_wrapping_quotes(payload.command.strip())
     if not command:
         raise HTTPException(status_code = 400, detail = "command must not be empty")
     if "://" in command:
@@ -326,6 +417,7 @@ async def create_mcp_server(
     url = _validate_url(payload.url)
     if is_stdio(url):
         require_ui_session_for_local_commands(via_api_key)
+    cwd = _validate_cwd(payload.cwd, url)
     headers = _normalize_headers(payload.headers)
     # OAuth is HTTP-only; force it off for stdio commands so a stale flag can't
     # push the probe onto the 305s OAuth timeout. Backend enforces this.
@@ -339,6 +431,7 @@ async def create_mcp_server(
         headers_json = json.dumps(headers) if headers else None,
         is_enabled = payload.is_enabled,
         use_oauth = use_oauth,
+        cwd = cwd,
     )
     return _row_to_response(mcp_servers_db.get_server(server_id))
 
@@ -391,13 +484,20 @@ async def update_mcp_server(
                 status_code = 400,
                 detail = "Use the managed integration setup to configure or enable this server.",
             )
-    if not changes:
+    cwd_sent = "cwd" in payload.model_fields_set
+    if not changes and not cwd_sent:
         raise HTTPException(status_code = 400, detail = "No fields to update")
     # Both directions, so an API key can neither repoint an http row at a command nor edit a stdio row's
     # env/name/enabled flag. Before every side effect, so a refusal leaves the row, its OAuth tokens, cache and
     # sessions untouched.
     if is_stdio(old["url"]) or is_stdio(changes.get("url", old["url"])):
         require_ui_session_for_local_commands(via_api_key)
+    # Validated against the address the row will have, after the gate (the check touches the filesystem). A switch
+    # to http drops a stored working directory, as it drops env vars below.
+    if cwd_sent:
+        changes["cwd"] = _validate_cwd(payload.cwd, changes.get("url", old["url"]))
+    elif "url" in changes and not is_stdio(changes["url"]) and old.get("cwd"):
+        changes["cwd"] = None
     # headers == HTTP headers (remote) or env vars (stdio). On a transport-type switch with no new headers, drop
     # the old ones so env secrets aren't re-sent as HTTP headers (or vice versa).
     if (
@@ -425,9 +525,11 @@ async def update_mcp_server(
     if invalidates_tools:
         invalidate_tool_cache(server_id)
     if invalidates_tools:
-        # Narrow to this row's env: another server row sharing the command but
-        # with a different env keeps its live sessions.
-        await asyncio.to_thread(close_mcp_sessions, old["url"], parse_server_headers(old))
+        # Narrow to this row's env and working directory: another server row sharing the command but not those
+        # keeps its live sessions.
+        await asyncio.to_thread(
+            lambda: close_mcp_sessions(old["url"], parse_server_headers(old), cwd = old.get("cwd"))
+        )
     return _row_to_response(mcp_servers_db.get_server(server_id), include_headers = not no_credential)
 
 
@@ -445,7 +547,9 @@ async def delete_mcp_server(server_id: str, current_subject: str = Depends(get_c
         await clear_oauth_tokens_async(old["url"])
     mcp_servers_db.delete_server(server_id)
     invalidate_tool_cache(server_id)
-    await asyncio.to_thread(close_mcp_sessions, old["url"], parse_server_headers(old))
+    await asyncio.to_thread(
+        lambda: close_mcp_sessions(old["url"], parse_server_headers(old), cwd = old.get("cwd"))
+    )
 
 
 @router.post("/{server_id}/refresh", response_model = McpServerProbeResult)
@@ -475,14 +579,10 @@ async def refresh_mcp_server_tools(
             headers = parse_server_headers(server),
             timeout = probe_timeout(server["url"], use_oauth),
             use_oauth = use_oauth,
+            cwd = server.get("cwd"),
         )
     except Exception as exc:  # noqa: BLE001 - surface transport+timeout errors to UI
-        logger.error(
-            "mcp_servers.refresh_failed",
-            server_id = server_id,
-            error = str(exc),
-            exc_info = True,
-        )
+        _log_probe_failure("mcp_servers.refresh_failed", exc, server_id = server_id)
         current = mcp_servers_db.get_server(server_id)
         if current is not None and not any(
             current.get(k) != server.get(k) for k in TOOL_CACHE_INVALIDATING_FIELDS
@@ -525,6 +625,7 @@ async def import_mcp_servers(
             # http entries and reports the stdio ones.
             if is_stdio(url):
                 require_ui_session_for_local_commands(via_api_key)
+            cwd = _validate_cwd(entry.cwd, url)
             headers = _normalize_headers(entry.headers)
         except HTTPException as exc:
             errors.append(f"{entry.display_name}: {exc.detail}")
@@ -540,6 +641,7 @@ async def import_mcp_servers(
             headers_json = json.dumps(headers) if headers else None,
             is_enabled = entry.is_enabled,
             use_oauth = entry.use_oauth and not is_stdio(url),
+            cwd = cwd,
         )
         seen_urls.add(url)
         created.append(_row_to_response(mcp_servers_db.get_server(server_id)))
@@ -560,6 +662,7 @@ async def test_mcp_server(
     # list_tools_async -- after it the process has already started.
     if is_stdio(url):
         require_ui_session_for_local_commands(via_api_key)
+    cwd = _validate_cwd(payload.cwd, url)
     headers = _normalize_headers(payload.headers)
     use_oauth = payload.use_oauth and not is_stdio(url)
     try:
@@ -568,13 +671,21 @@ async def test_mcp_server(
             headers = headers,
             timeout = probe_timeout(url, use_oauth),
             use_oauth = use_oauth,
+            cwd = cwd,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "mcp_servers.test_failed",
-            error = str(exc),
-            exc_info = True,
-        )
+        _log_probe_failure("mcp_servers.test_failed", exc)
         return McpServerProbeResult(ok = False, error = safe_curated_detail(exc))
 
     return McpServerProbeResult(ok = True, tool_count = len(tools))
+
+
+def _log_probe_failure(event: str, exc: Exception, **fields) -> None:
+    """An explained local-program failure (missing program, crash, no handshake) is the user's
+    configuration talking, not a backend fault: one warning line with its first line only, since the
+    rest quotes the program's own output, which stays in its log file. Anything else keeps the full
+    traceback."""
+    if isinstance(exc, McpStdioServerError):
+        logger.warning(event, error = exc.summary, **fields)
+    else:
+        logger.error(event, error = str(exc), exc_info = True, **fields)

@@ -4042,6 +4042,18 @@ _LLAMA_FIT_TARGET_DEFAULT_MIB = 1024.0
 _WINDOWS_SYSMEM_FALLBACK_RESERVE_MIB = _LLAMA_FIT_TARGET_DEFAULT_MIB
 _WINDOWS_SYSMEM_FALLBACK_MAX_FRACTION = 0.125
 
+# Windows + CUDA: llama-server's fitter reads free VRAM from cudaMemGetInfo, which under WDDM
+# answers from the child's own budget and cannot see what other processes hold. Field case:
+# 2x RTX 3090 with another LLM app holding ~13.5 GB on each, nvidia-smi said 10571 / 10961 MiB
+# free, llama-server said 23332 MiB free on both (the same figure it gives an empty card), so
+# its fit planned a full load and cudaMalloc failed. What it cannot see is in use minus what it
+# already counts as unavailable on an idle card: 24575 - 23332 = 1243 MiB there, ~5% of the
+# card. Capped at 1 GiB so the estimate errs high, toward leaving memory free.
+_WDDM_IDLE_RESERVE_FRACTION = 0.05
+_WDDM_IDLE_RESERVE_MAX_MIB = 1024.0
+# Below this on every card the correction is noise (a desktop and a browser), not a culprit.
+_WDDM_OUTSIDE_USAGE_MIN_MIB = 1024.0
+
 
 def _vram_reserve_floor_mib(total_mib: float, *, sysmem_fallback: bool = False) -> float:
     """Smallest margin a card keeps: 512 MiB, or the default's own reserve if smaller.
@@ -7298,6 +7310,31 @@ def _count_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
+def _count_failure_detail(resp: "httpx.Response", limit: int = 300) -> str:
+    """llama-server's own error message for a failed count call, one line, bounded.
+
+    The ``{"error": {"message": ...}}`` body when there is one (a chat template's
+    ``raise_exception`` text lands there), else the raw body. For the server log only.
+    """
+    message = ""
+    try:
+        body = resp.json()
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict):
+            message = str(error.get("message") or "")
+        elif isinstance(error, str):
+            message = error
+    except Exception:
+        message = ""
+    if not message:
+        try:
+            message = resp.text or ""
+        except Exception:
+            message = ""
+    message = " ".join(message.split())
+    return (message[:limit] + "...") if len(message) > limit else (message or "no detail")
+
+
 class LlamaCppBackend:
     """Manages a llama-server subprocess for GGUF model inference.
 
@@ -7504,6 +7541,13 @@ class LlamaCppBackend:
         # ``_gpu_ids`` unset, so reclaim accounting must not infer this mapping
         # from status state after a fit/arch gate narrowed the child mask.
         self._child_gpu_physical_ids: Optional[tuple[int, ...]] = None
+        # Whether any llama-server spawn of the current load ran --split-mode tensor: None
+        # before the first spawn. The /load tensor fallback reads it, because a tensor
+        # REQUEST the planner downgraded to layer split would relaunch the same command.
+        self._launched_tensor_parallel: Optional[bool] = None
+        # GPU memory other programs hold that a Windows CUDA child cannot see, for the
+        # current load: {"gpu_mem", "mib", and once looked up "note"}, or None.
+        self._hidden_gpu_usage: Optional[dict] = None
         # RAW requested GPU pin, before the fit narrowed it. self._gpu_ids records the
         # EFFECTIVE (fit-narrowed) pin for /status; dedupe compares this raw value so a
         # [0, 1] narrowed to [0] and re-sent as [0, 1] still matches (#7239).
@@ -20690,6 +20734,8 @@ class LlamaCppBackend:
         log_path: "Optional[Path | str]" = None,
         secrets: Sequence[Optional[str]] = (),
         extra_args: Optional[Sequence[str]] = None,
+        *,
+        gpu_memory_note: "Union[str, Callable[[], Optional[str]], None]" = None,
     ) -> str:
         """Classify, then redact, whatever the classification quoted.
 
@@ -20714,6 +20760,7 @@ class LlamaCppBackend:
                 log_path,
                 secrets,
                 extra_args,
+                gpu_memory_note = gpu_memory_note,
             ),
             secrets,
         )
@@ -20728,8 +20775,13 @@ class LlamaCppBackend:
         log_path: "Optional[Path | str]" = None,
         secrets: Sequence[Optional[str]] = (),
         extra_args: Optional[Sequence[str]] = None,
+        *,
+        gpu_memory_note: "Union[str, Callable[[], Optional[str]], None]" = None,
     ) -> str:
         """Explain *why* llama-server failed to start, from its output.
+
+        ``gpu_memory_note`` names the programs holding GPU memory (a sentence, or a
+        callable producing one, called only when the failure IS a GPU allocation).
 
         Several distinct failures otherwise collapse into the same opaque
         "invalid GGUF or out of memory" message. Worst case: a diffusion GGUF
@@ -21113,7 +21165,38 @@ class LlamaCppBackend:
                 "localhost bypasses it (NO_PROXY=127.0.0.1,localhost)."
             )
 
-        # Fallback: genuinely unknown failure (OOM, missing binary ...).
+        # A GPU buffer allocation failed, and the fallback below then sent the user
+        # to check a GGUF that was fine. Field case (Windows, 2x 24 GB): another
+        # program held ~13.5 GB on each card. Studio's nvidia-smi probe saw it, but
+        # llama-server's own free-memory probe reported ~23 GB free regardless, so
+        # its fit planned a full GPU load and cudaMalloc failed. Lead with that
+        # cause, since nothing inside Studio can free it; keep the evidence, the
+        # allocation line is in the tail.
+        if LlamaCppBackend._is_gpu_memory_start_failure(scan_tail):
+            # Name the programs when the caller can (Windows counters), and only here:
+            # the lookup costs a PowerShell spawn, which no other failure should pay.
+            holders: Optional[str] = None
+            try:
+                holders = gpu_memory_note() if callable(gpu_memory_note) else gpu_memory_note
+            except Exception:
+                holders = None
+            cause = (
+                f"{holders} Close or unload it there, then retry."
+                if holders
+                else "Another program (another LLM app, a game, a training run) may be "
+                "using GPU memory; close or unload it there, then retry."
+            )
+            return LlamaCppBackend._with_startup_diagnostics(
+                "Not enough GPU memory to load this model: llama.cpp could not "
+                f"allocate a GPU buffer. {cause} Otherwise lower the context length, "
+                "pick a smaller quant, or eject other models. On Windows, large GPU "
+                "allocations also need free system RAM.",
+                output,
+                log_path,
+                secrets,
+            )
+
+        # Fallback: genuinely unknown failure (missing binary ...).
         # Nothing above recognised the output, so carry the evidence rather
         # than drop it; without the tail and the log path a report of this
         # message is unactionable and costs a round trip (#8566).
@@ -21128,6 +21211,57 @@ class LlamaCppBackend:
     # Enough of the tail to carry a stack trace or a ggml assert, bounded so a
     # chatty server cannot push an unreadable wall of text into an API error.
     _STARTUP_TAIL_CHARS = 2000
+
+    @staticmethod
+    def _is_unused_tensor_notice(line: str) -> bool:
+        """llama.cpp's per-tensor "model has unused tensor ... -- ignoring" line.
+
+        One per tensor it skips (an MTP / nextn head the build does not run, say),
+        so a model with dozens of them fills the whole tail with lines that explain
+        nothing and push out the one that does ("unable to allocate CUDA0 buffer").
+        Substring tests rather than a regex, so a long line stays linear.
+        """
+        lowered = line.lower()
+        return "model has unused tensor " in lowered and "-- ignoring" in lowered
+
+    @staticmethod
+    def _unused_tensor_note(count: int) -> str:
+        # Must not itself read as a notice, or a second pass would drop it.
+        return f'[{count} harmless "model has unused tensor" lines omitted]'
+
+    @staticmethod
+    def _without_unused_tensor_lines(tail: str) -> tuple[str, int]:
+        """``tail`` minus the per-tensor "unused tensor" notices, and how many."""
+        kept: list[str] = []
+        dropped = 0
+        for line in tail.split("\n"):
+            if LlamaCppBackend._is_unused_tensor_notice(line):
+                dropped += 1
+            else:
+                kept.append(line)
+        return ("\n".join(kept) if dropped else tail), dropped
+
+    def _startup_output_tail(self, max_lines: int = 50) -> str:
+        """The child's last ``max_lines`` lines of output, unused-tensor notices skipped.
+
+        What a failed start is classified from and quoted with. Skipped BEFORE the
+        line cap: taking the last 50 lines first let the notices fill the window and
+        drop the allocation failure from the evidence the classifier reads, so a
+        CUDA out-of-memory was reported as an invalid GGUF.
+        """
+        kept: list[str] = []
+        dropped = 0
+        for line in reversed(list(self._stdout_lines)):
+            if LlamaCppBackend._is_unused_tensor_notice(line):
+                dropped += 1
+                continue
+            kept.append(line)
+            if len(kept) >= max_lines:
+                break
+        kept.reverse()
+        if dropped:
+            kept.insert(0, LlamaCppBackend._unused_tensor_note(dropped))
+        return "\n".join(kept)
 
     # The labels _with_startup_diagnostics writes, so it can recognise its own
     # output and stay idempotent. Kept next to the writer: a label edited on one
@@ -21366,7 +21500,14 @@ class LlamaCppBackend:
         tail = "".join(ch for ch in raw if ch in "\n\t" or ch.isprintable()).strip()
         if tail:
             tail = LlamaCppBackend._scrub_secret_values(tail, extra_secrets)
-            tail = tail[-LlamaCppBackend._STARTUP_TAIL_CHARS :].lstrip()
+            # After the scrub, so dropping a line can never split a multi-line
+            # secret into pieces that no longer match it.
+            tail, _unused = LlamaCppBackend._without_unused_tensor_lines(tail)
+            tail = tail.strip()[-LlamaCppBackend._STARTUP_TAIL_CHARS :].lstrip()
+            if _unused:
+                # Say so rather than drop them silently; the full log keeps them.
+                _note = LlamaCppBackend._unused_tensor_note(_unused)
+                tail = f"{_note}\n{tail}" if tail else _note
             parts.append(f"llama-server output:\n{tail}")
         if log_path:
             parts.append(f"Full log: {log_path}")
@@ -21766,6 +21907,11 @@ class LlamaCppBackend:
         allocation_markers = (
             "out of memory",
             "failed to allocate",
+            # llama_model_load's own summary, "unable to allocate CUDA0 buffer",
+            # which can be the only allocation line left in a short tail. Still
+            # needs a GPU marker on the same line: the bare "unable to allocate
+            # buffer" an older build prints is not tied to any device.
+            "unable to allocate",
             "cudamalloc failed",
             "hiperroroutofmemory",
             "vk_error_out_of_device_memory",
@@ -23022,6 +23168,26 @@ class LlamaCppBackend:
                 out[ki] = "<redacted>"
         return out
 
+    def _note_launched_split_mode(
+        self, cmd: Sequence[str], env: Optional[Mapping[str, str]]
+    ) -> None:
+        """Record whether this spawn runs tensor parallel, sticky across the load's spawns.
+
+        Read off the argv and env the child really gets (last-wins --split-mode, else the
+        inherited LLAMA_ARG_SPLIT_MODE), not the request: the planner downgrades a tensor
+        request to layer split when the pooled budget cannot hold it, and the /load fallback
+        then relaunched an identical layer command blaming tensor parallelism. Sticky, so a
+        load whose first spawn ran tensor and whose internal retries did not still reads as
+        one that tried it.
+        """
+        try:
+            launched = _effective_tensor_parallel(list(cmd), False, env)
+        except Exception:
+            return
+        self._launched_tensor_parallel = (
+            bool(getattr(self, "_launched_tensor_parallel", None)) or launched
+        )
+
     def _start_llama_process(
         self, cmd: list[str], env: dict, *, child_gpu_physical_ids: Optional[tuple[int, ...]]
     ) -> bool:
@@ -23077,6 +23243,7 @@ class LlamaCppBackend:
                 self._close_attempt_log()
                 self._health_wait_cancelled = True
                 return False
+            self._note_launched_split_mode(cmd, env)
             _spawned = subprocess.Popen(
                 cmd,
                 stdout = subprocess.PIPE,
@@ -23218,6 +23385,13 @@ class LlamaCppBackend:
             # so any in-flight load has drained) instead of using a half-swapped one.
             if getattr(self, "_llama_update_in_progress", False):
                 raise RuntimeError("llama.cpp is updating; try again in a moment.")
+
+            # Per-load records read back after this call returns or raises: whether any
+            # spawn of THIS load ran tensor parallel (the /load layer-split fallback keys
+            # on it), and the memory other programs hold. Left from the previous load,
+            # either would describe a child this load never launched.
+            self._launched_tensor_parallel = None
+            self._hidden_gpu_usage = None
 
             intent = self._preserve_cpu_fallback_intent(intent)
             tensor_parallel = intent.tensor_parallel
@@ -24352,10 +24526,19 @@ class LlamaCppBackend:
                 # GGUF into vision mode.
                 effective_is_vision = bool(launch_mmproj_path) and bool(is_vision)
                 if is_vision and not effective_is_vision and not _pv_mmproj_unpinnable:
-                    logger.warning(
-                        "Vision-capable GGUF loaded without a usable mmproj; "
-                        "image input will be disabled for this session"
-                    )
+                    if _dv_dropped_image_projector:
+                        # The per-model Vision switch dropped a projector that resolved
+                        # fine. Nothing is wrong, so no warning: the field log flagged
+                        # every load of a model the user had deliberately set text-only.
+                        logger.info(
+                            "Vision off (per-model setting); image input is disabled "
+                            "for this session"
+                        )
+                    else:
+                        logger.warning(
+                            "Vision-capable GGUF loaded without a usable mmproj; "
+                            "image input will be disabled for this session"
+                        )
                 # Seed before the try: the except (GPU-selection failure ->
                 # --fit on) falls through to the launch which reads this, and the
                 # probe that assigns it may throw first. Captured before manual
@@ -24413,6 +24596,10 @@ class LlamaCppBackend:
                 _ctx_cap_fits = False
                 total_by_idx: dict[int, int] = {}
                 _gpu_mem: list[tuple[int, int, int]] = []
+                # Per-GPU MiB other processes hold that a WDDM child cannot see; raises the
+                # --fit-target margin below. Bound before the try: the --fit on except arm
+                # falls through to the launch, which reads it.
+                _hidden_gpu_mib: dict[int, float] = {}
                 model_size = None  # set in the fit try; used by the APU RAM guard
                 _mtp_will_engage = False
                 _separate_draft_launches = False  # a sidecar displaces an embedded head
@@ -24572,6 +24759,30 @@ class LlamaCppBackend:
                     # GPU-aware speculative defaults; the list feeds the
                     # CPU-fallback check.
                     _detected_gpus = list(gpus)
+                    # Memory other programs hold that llama-server's own probe will not
+                    # see (Windows + CUDA), measured on the cards this load may use. Only
+                    # the fitter needs it, which is decided later; Unsloth's own planner
+                    # already sees it, nvidia-smi's free being system-wide. Advisory input:
+                    # it must never be the reason placement falls back to --fit on.
+                    try:
+                        _hidden_gpu_mib = self._wddm_hidden_gpu_usage_mib(
+                            binary,
+                            _gpu_mem,
+                            (
+                                [idx for idx, _free in _detected_gpus]
+                                if _detected_gpus
+                                else ([int(i) for i in gpu_ids] if gpu_ids else None)
+                            ),
+                            is_vulkan_backend = is_vulkan_backend,
+                        )
+                    except Exception as e:
+                        logger.debug(f"Hidden GPU usage check failed: {e}")
+                        _hidden_gpu_mib = {}
+                    self._hidden_gpu_usage = (
+                        {"gpu_mem": list(_gpu_mem), "mib": dict(_hidden_gpu_mib)}
+                        if _hidden_gpu_mib
+                        else None
+                    )
                     # Vulkan reports total 0 only for integrated GPUs. Their
                     # free "VRAM" is the same host pool the RAM guard prices.
                     _shared_gpu_ids = (
@@ -25534,6 +25745,9 @@ class LlamaCppBackend:
                         _both_fit_somewhere = False
                         _probe_ctx = 0
                         _probe_need = _probe_have = 0.0
+                        # GPUs in the subset those two numbers were priced on: the first,
+                        # smallest one the target fits, where the message's figures come from.
+                        _probe_gpu_count = 0
                         for _probe_ranked in _probe_orders:
                             if _both_fit_somewhere:
                                 break
@@ -25617,6 +25831,7 @@ class LlamaCppBackend:
                                         _foot_w,
                                         _budget_w,
                                     )
+                                    _probe_gpu_count = _n
                                 if _foot_w <= _budget_w:
                                     _both_fit_somewhere = True
                                     break
@@ -25671,15 +25886,21 @@ class LlamaCppBackend:
                             # _flat_mtp_engages swaps the flat fraction in as replacement.
                             mtp_overhead_fn = None
                             _mtp_kv_unsized = False
+                            # The figures are the smallest GPU set the model fits on, the
+                            # one the placement takes; the probe does not price every subset,
+                            # so the message must not claim it did.
                             logger.warning(
                                 "Speculative decoding disabled for this load: the model "
-                                "fits in VRAM at context %d but its drafter does not "
-                                "(needs %.1f GB of a %.1f GB budget, on any GPU subset). "
+                                "fits in VRAM at context %d, but with its drafter it does "
+                                "not fit in the GPU memory budget (needs %.1f GB of %.1f GB "
+                                "on the %d GPU%s tried). "
                                 "Auto keeps the context rather than shrink it for a speed "
                                 "option. Select the drafter in Settings to force it.",
                                 _probe_ctx,
                                 _probe_need / 1024,
                                 _probe_have / 1024,
+                                _probe_gpu_count,
+                                "" if _probe_gpu_count == 1 else "s",
                             )
 
                     # Flat MTP reserve fraction: used only as the fallback when the
@@ -27486,6 +27707,55 @@ class LlamaCppBackend:
                 # the capability and a budget at the default all leave the child
                 # unpriced, and each is decided inside that call.
                 _fit_target_priced = "--fit-target" in _integrity_flags
+                # Memory other programs hold is invisible to a Windows CUDA child's own
+                # probe, so its fitter plans into it and cudaMalloc fails mid-load. Widen
+                # the margin it keeps by exactly that much; Unsloth's own placement already
+                # sees it. After _fit_target_priced on purpose: this is not the budget.
+                _hidden_fit_target = None
+                if (
+                    _hidden_gpu_mib
+                    and use_fit
+                    and server_caps.get("supports_fit_target")
+                    and fit_is_effectively_on([*cmd, *(extra_args or [])], os.environ)
+                ):
+                    if fit_target_margin_in(extra_args, os.environ) is not None:
+                        # Theirs, appended last (or read from the env when argv sets none):
+                        # emitting ours would override an env margin and lose to an argv one.
+                        logger.info(
+                            "Leaving the pass-through --fit-target as set, although other "
+                            "processes hold GPU memory llama.cpp cannot see: %s MiB.",
+                            ", ".join(
+                                f"GPU {i}: {round(v)}" for i, v in sorted(_hidden_gpu_mib.items())
+                            ),
+                        )
+                    else:
+                        _hidden_fit_target = self._outside_usage_fit_target(
+                            _hidden_gpu_mib,
+                            base_margin_mib = self._fit_target_margin_mib(
+                                auto_fit = auto_fit,
+                                fit_target_delta_mib = _fit_target_delta_mib,
+                            ),
+                            device_order = self._fit_target_device_order(
+                                gpu_indices,
+                                gpu_ids = gpu_ids,
+                                visible_ids = [idx for idx, _f, _t in _gpu_mem],
+                                extra_args = extra_args,
+                            ),
+                        )
+                if _hidden_fit_target:
+                    _integrity_flags = self._with_fit_target(_integrity_flags, _hidden_fit_target)
+                    _holders = self._hidden_gpu_usage_note()
+                    logger.warning(
+                        "Other processes hold GPU memory that llama.cpp cannot see on Windows "
+                        "(%s). Passing --fit-target %s so its fit leaves that memory alone; "
+                        "more of the model may run from system RAM.%s",
+                        ", ".join(
+                            f"~{v / 1024:.1f} GB on GPU {i}"
+                            for i, v in sorted(_hidden_gpu_mib.items())
+                        ),
+                        _hidden_fit_target,
+                        f" {_holders}" if _holders else "",
+                    )
                 cmd.extend(_integrity_flags)
                 offload_overridden = _extra_args_set_any_flag(
                     extra_args, _GPU_OFFLOAD_OVERRIDE_FLAGS
@@ -29532,6 +29802,48 @@ class LlamaCppBackend:
                 # Memoed only when the load ends terminally, so a recovering fallback is not blocked.
                 _sched_abort_seen = False
 
+                def _with_hidden_fit_margin(run_cmd: list) -> list:
+                    """``run_cmd`` with the hidden-usage ``--fit-target`` when its fitter runs
+                    with no margin set at all.
+
+                    The first launch already carries it (emitted with the integrity flags,
+                    ahead of the extras); this covers the retries that turn a pinned launch's
+                    fitter back ON, which would otherwise plan into the memory other programs
+                    hold exactly like the launch this exists for. Any margin already on the
+                    argv or in the env is left alone, whoever set it.
+                    """
+                    if not _hidden_gpu_mib or not server_caps.get("supports_fit_target"):
+                        return run_cmd
+                    try:
+                        if not fit_is_effectively_on(run_cmd, env):
+                            return run_cmd
+                        if fit_target_margin_in(run_cmd, env) is not None:
+                            return run_cmd
+                        value = self._outside_usage_fit_target(
+                            _hidden_gpu_mib,
+                            base_margin_mib = self._fit_target_margin_mib(
+                                auto_fit = auto_fit,
+                                fit_target_delta_mib = _fit_target_delta_mib,
+                            ),
+                            device_order = self._fit_target_device_order(
+                                gpu_indices,
+                                gpu_ids = gpu_ids,
+                                visible_ids = [idx for idx, _f, _t in _gpu_mem],
+                                extra_args = extra_args,
+                            ),
+                        )
+                    except Exception as e:
+                        logger.debug(f"Hidden GPU usage margin skipped: {e}")
+                        return run_cmd
+                    if not value:
+                        return run_cmd
+                    logger.info(
+                        "Passing --fit-target %s to this launch: other processes hold GPU "
+                        "memory llama.cpp cannot see.",
+                        value,
+                    )
+                    return [*run_cmd, "--fit-target", value]
+
                 def _spawn_and_wait(run_cmd, *, label = ""):
                     """Start llama-server with run_cmd and wait for health.
 
@@ -29592,6 +29904,10 @@ class LlamaCppBackend:
                             # Best-effort; never block the load on logging.
                             logger.debug(f"Could not open llama-server log file: {e}")
                             self._llama_log_path = None
+                        # Here, per attempt, so a retry that turned the fitter back on
+                        # (--fit on after a full-offload crash, the --flash-attn off
+                        # respawn) is covered without a call at each retry site.
+                        run_cmd = _with_hidden_fit_margin(run_cmd)
                         _last_spawn_cmd = list(run_cmd)
                         # Read off the argv actually spawned rather than the intent, so
                         # every emitter is covered by construction.
@@ -29608,6 +29924,7 @@ class LlamaCppBackend:
                                 self._close_attempt_log()
                                 self._health_wait_cancelled = True
                                 return False
+                            self._note_launched_split_mode(run_cmd, env)
                             _spawned = subprocess.Popen(
                                 run_cmd,
                                 stdout = subprocess.PIPE,
@@ -29994,7 +30311,7 @@ class LlamaCppBackend:
                         _proc_snap1 = self._process  # snapshot: re-reading races the teardown
                         cpu_rc = _proc_snap1.poll() if _proc_snap1 is not None else None
                         detail = self._classify_llama_start_failure(
-                            "\n".join(self._stdout_lines[-50:]),
+                            self._startup_output_tail(),
                             gguf_path,
                             self._model_identifier,
                             cpu_rc,
@@ -30002,6 +30319,7 @@ class LlamaCppBackend:
                             self._llama_log_path,
                             (self._api_key,),
                             self._extra_args,
+                            gpu_memory_note = self._hidden_gpu_usage_note,
                         )
                         if _sched_abort_seen:
                             LlamaCppBackend._record_sched_reserve_abort(binary, _abort_memo_model)
@@ -30936,7 +31254,7 @@ class LlamaCppBackend:
                 # placement fails. llama.cpp owns mmproj offload separately from
                 # --gpu-layers, so retry it on CPU before removing --mmproj.
                 if not healthy:
-                    out = "\n".join(self._stdout_lines[-50:])
+                    out = self._startup_output_tail()
                     # Read the crash code before _kill_process() clears _process.
                     _proc_snap5 = self._process  # snapshot: re-reading races the teardown
                     _crash_rc = _proc_snap5.poll() if _proc_snap5 is not None else None
@@ -31012,7 +31330,7 @@ class LlamaCppBackend:
                                     "failed; image input remains available for this session."
                                 )
                             else:
-                                _cpu_projector_out = "\n".join(self._stdout_lines[-50:])
+                                _cpu_projector_out = self._startup_output_tail()
                                 # Snapshot: re-reading races the teardown.
                                 _proc_snap6 = self._process
                                 _cpu_projector_rc = (
@@ -31043,6 +31361,7 @@ class LlamaCppBackend:
                                             self._llama_log_path,
                                             (self._api_key,),
                                             self._extra_args,
+                                            gpu_memory_note = self._hidden_gpu_usage_note,
                                         )
                                     )
                         elif _projector_memory and _paravirtual_mmproj_pinnable(server_caps):
@@ -31058,6 +31377,7 @@ class LlamaCppBackend:
                                     self._llama_log_path,
                                     (self._api_key,),
                                     self._extra_args,
+                                    gpu_memory_note = self._hidden_gpu_usage_note,
                                 )
                             )
 
@@ -31157,7 +31477,7 @@ class LlamaCppBackend:
                                         )
                                 if not healthy:
                                     _retry_detail = self._classify_llama_start_failure(
-                                        "\n".join(self._stdout_lines[-50:]),
+                                        self._startup_output_tail(),
                                         gguf_path,
                                         self._model_identifier,
                                         _retry_rc,
@@ -31165,6 +31485,7 @@ class LlamaCppBackend:
                                         self._llama_log_path,
                                         (self._api_key,),
                                         self._extra_args,
+                                        gpu_memory_note = self._hidden_gpu_usage_note,
                                     )
                                     if _finish_cancelled_health_wait(
                                         "Load cancelled during the text-only recovery"
@@ -31210,6 +31531,7 @@ class LlamaCppBackend:
                                     self._llama_log_path,
                                     (self._api_key,),
                                     self._extra_args,
+                                    gpu_memory_note = self._hidden_gpu_usage_note,
                                 )
                             )
 
@@ -32917,14 +33239,20 @@ class LlamaCppBackend:
             import psutil
 
             try:
-                ppid = psutil.Process(pid).ppid()
+                proc = psutil.Process(pid)
+                if proc.ppid() <= 1:
+                    return False  # reparented to init -> orphan
+                # Not pid_exists(ppid): Windows never reparents an orphan, so its
+                # recorded parent PID can be reused by an unrelated process, which
+                # made a true orphan look owned and it was never reaped. parent()
+                # returns None when the process at that PID started AFTER the child
+                # (so it cannot be its parent), and is_running() also checks identity.
+                parent = proc.parent()
+                return parent is not None and parent.is_running()
             except psutil.NoSuchProcess:
                 return False  # the recorded server itself is gone
             except psutil.Error:
                 return True  # cannot tell -- never risk killing a live server
-            if ppid <= 1:
-                return False  # reparented to init -> orphan
-            return psutil.pid_exists(ppid)
         except ImportError:
             pass
         if sys.platform == "linux":
@@ -34402,7 +34730,7 @@ class LlamaCppBackend:
                 # Let the drain thread collect final output.
                 if self._stdout_thread is not None:
                     self._stdout_thread.join(timeout = 2)
-                output = "\n".join(self._stdout_lines[-50:])
+                output = self._startup_output_tail()
                 # Keep the TAIL: crash details (abort reason, ROCm/CUDA error
                 # text) print last, after the long startup banner. Head
                 # truncation has cut off exactly the diagnostic line before.
@@ -34481,6 +34809,241 @@ class LlamaCppBackend:
         self._stdout_lines.append(marker)
         logger.error(marker)
         return False
+
+    @staticmethod
+    def _gpu_memory_outside_child_mib(
+        gpu_mem: Iterable[tuple[int, int, int]],
+        ids: Optional[Iterable[int]] = None,
+    ) -> dict[int, float]:
+        """MiB per GPU in use by anything other than the child about to launch.
+
+        From the nvidia-smi rows (index, free, total), which see every process: in use is
+        total minus free, less what a WDDM llama-server already counts as unavailable on an
+        idle card (``_WDDM_IDLE_RESERVE_*``), since that much is not hidden from it. A row
+        without a total cannot be read this way and is left out, as are rows not in ``ids``.
+        Deliberately includes Studio's own processes (a training worker, the embedding
+        server): the child cannot see their memory either.
+        """
+        wanted = {int(i) for i in ids} if ids is not None else None
+        out: dict[int, float] = {}
+        for idx, free_mib, total_mib in gpu_mem:
+            if wanted is not None and int(idx) not in wanted:
+                continue
+            if not total_mib or total_mib <= 0:
+                continue
+            reserve = min(_WDDM_IDLE_RESERVE_MAX_MIB, _WDDM_IDLE_RESERVE_FRACTION * total_mib)
+            out[int(idx)] = max(0.0, float(total_mib) - reserve - float(free_mib))
+        return out
+
+    @staticmethod
+    def _nvidia_driver_models() -> Optional[dict[int, str]]:
+        """``{index: "WDDM" | "TCC" | ...}`` from nvidia-smi, or None when it cannot say."""
+        try:
+            from utils.hardware import gpu_query
+
+            result = gpu_query.run_nvidia_smi(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,driver_model.current",
+                    "--format=csv,noheader",
+                ],
+                capture_output = True,
+                text = True,
+                encoding = "utf-8",
+                errors = "replace",
+                timeout = 5,
+                env = child_env_without_native_path_secret(),
+                **_windows_hidden_subprocess_kwargs(),
+            )
+        except Exception as e:
+            logger.debug(f"nvidia-smi driver model query failed: {e}")
+            return None
+        if result.returncode != 0:
+            return None
+        models: dict[int, str] = {}
+        for line in (result.stdout or "").splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            try:
+                models[int(parts[0])] = parts[1].upper()
+            except ValueError:
+                continue
+        return models or None
+
+    @staticmethod
+    def _child_vram_probe_is_process_local(
+        binary: Optional[str], *, is_vulkan_backend: bool
+    ) -> bool:
+        """Whether the llama-server child's own free-VRAM reading is blind to other processes.
+
+        Windows + a CUDA build only (``_sysmem_fallback_risk``), and only when the rows came
+        from nvidia-smi / NVML: the torch fallback reads cudaMemGetInfo in this process, just
+        as blind, so its rows hold nothing to subtract. UNSLOTH_FIT_TARGET_OUTSIDE_USAGE=0
+        turns the correction off.
+        """
+        if os.environ.get("UNSLOTH_FIT_TARGET_OUTSIDE_USAGE", "1").strip() == "0":
+            return False
+        if sys.platform != "win32" or is_vulkan_backend:
+            return False
+        if LlamaCppBackend._GPU_IDS_ARE_PCI_INDICES is not True:
+            return False
+        return bool(LlamaCppBackend._sysmem_fallback_risk(binary))
+
+    @staticmethod
+    def _wddm_hidden_gpu_usage_mib(
+        binary: Optional[str],
+        gpu_mem: Sequence[tuple[int, int, int]],
+        ids: Optional[Iterable[int]],
+        *,
+        is_vulkan_backend: bool,
+    ) -> dict[int, float]:
+        """Per-GPU MiB a llama-server child will not see as used, where it is known to be
+        blind to it (``_child_vram_probe_is_process_local``); {} everywhere else, or when no
+        card carries at least ``_WDDM_OUTSIDE_USAGE_MIN_MIB``.
+
+        Never a card the driver runs in TCC mode, whose cudaMemGetInfo sees every process:
+        adding it there would hold back the same memory twice. An unreadable driver model
+        counts as WDDM, the only mode a GeForce card has.
+        """
+        if not gpu_mem or not LlamaCppBackend._child_vram_probe_is_process_local(
+            binary, is_vulkan_backend = is_vulkan_backend
+        ):
+            return {}
+        hidden = LlamaCppBackend._gpu_memory_outside_child_mib(gpu_mem, ids)
+        if not hidden or max(hidden.values()) < _WDDM_OUTSIDE_USAGE_MIN_MIB:
+            return {}
+        # Only now, so a host with nothing to correct never pays for the second query.
+        driver_models = LlamaCppBackend._nvidia_driver_models() or {}
+        hidden = {
+            idx: mib for idx, mib in hidden.items() if driver_models.get(idx, "WDDM") != "TCC"
+        }
+        if not hidden or max(hidden.values()) < _WDDM_OUTSIDE_USAGE_MIN_MIB:
+            return {}
+        return hidden
+
+    @staticmethod
+    def _fit_target_device_order(
+        gpu_indices: Optional[Sequence[int]],
+        *,
+        gpu_ids: Optional[Sequence[int]],
+        visible_ids: Sequence[int],
+        extra_args: Optional[Sequence[str]] = None,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> Optional[list[int]]:
+        """The physical ids in the order the child will number its CUDA devices, which is the
+        order a per-device ``--fit-target`` list is read in; None when that is not ours to
+        know, and the caller broadcasts one value instead.
+
+        Mirrors the launch's own pin: an explicit pick, or an automatic subset with no
+        inherited mask, is written to CUDA_VISIBLE_DEVICES in ``gpu_indices`` order under
+        CUDA_DEVICE_ORDER=PCI_BUS_ID. Unpinned, the child keeps whatever order it inherits,
+        which is PCI order only when the environment already says so (CUDA's own default,
+        FASTEST_FIRST, leaves it unspecified). A pass-through ``--device`` re-indexes the
+        list under us unless a pick strips it.
+        """
+        env = os.environ if env is None else env
+        if LlamaCppBackend._GPU_IDS_ARE_PCI_INDICES is not True:
+            return None
+        if not gpu_ids and (
+            _extra_args_set_any_flag(extra_args, {"--device", "-dev"})
+            or (env.get("LLAMA_ARG_DEVICE") or "").strip()
+        ):
+            return None
+        inherited_mask = env.get("CUDA_VISIBLE_DEVICES")
+        if gpu_indices is not None:
+            if gpu_ids or inherited_mask is None:
+                return [int(i) for i in gpu_indices]
+            return None
+        visible = [int(i) for i in visible_ids]
+        if (
+            inherited_mask is None
+            and (env.get("CUDA_DEVICE_ORDER") or "").strip().upper() == "PCI_BUS_ID"
+        ):
+            return sorted(visible)
+        return visible if len(visible) == 1 else None
+
+    @staticmethod
+    def _outside_usage_fit_target(
+        hidden_mib: Mapping[int, float],
+        *,
+        base_margin_mib: float,
+        device_order: Optional[Sequence[int]],
+    ) -> Optional[str]:
+        """The ``--fit-target`` value that leaves ``base_margin_mib`` REALLY free per card.
+
+        llama.cpp keeps ``margin`` free by its own reading (``free - margins[id]`` in
+        common/fit.cpp), and that reading overstates free by exactly the hidden usage, so
+        each device's margin is the one this launch already asks for plus what it cannot
+        see. Composed on top of the budget-adjusted margin, never instead of it. Per device
+        in the child's order when that is known (a card with nothing hidden keeps the base);
+        otherwise one value at the largest hidden figure, broadcast, which over-reserves on
+        the emptier cards rather than overcommit the fullest one. None when nothing is hidden.
+        """
+        if not hidden_mib:
+            return None
+        if device_order:
+            values = [hidden_mib.get(int(i), 0.0) for i in device_order]
+        else:
+            values = [max(hidden_mib.values())]
+        margins = [int(math.ceil(base_margin_mib + max(0.0, float(v)))) for v in values]
+        if len(set(margins)) == 1:
+            # Upstream broadcasts a single value, so say it once.
+            margins = margins[:1]
+        return ",".join(str(m) for m in margins)
+
+    @staticmethod
+    def _with_fit_target(flags: Sequence[str], value: str) -> list[str]:
+        """``flags`` (Unsloth's own integrity flags) with ``--fit-target value`` in place of
+        any margin they already carry."""
+        out: list[str] = []
+        skip = False
+        for token in flags:
+            if skip:
+                skip = False
+                continue
+            if token == "--fit-target":
+                skip = True
+                continue
+            out.append(token)
+        return [*out, "--fit-target", value]
+
+    def _hidden_gpu_usage_note(self) -> Optional[str]:
+        """Who holds the memory a WDDM child cannot see, for the warning and the OOM message.
+
+        Looked up at most once per load, and only once something needs it: the counter read
+        spawns PowerShell (about a second), which a load with nothing hidden never pays for.
+        """
+        state = getattr(self, "_hidden_gpu_usage", None)
+        if not state:
+            return None
+        if "note" in state:
+            return state["note"]
+        note: Optional[str] = None
+        try:
+            from utils.hardware import gpu_process_memory as _gpm
+
+            samples = _gpm.query_gpu_process_memory()
+            if samples:
+                used_by_index = {
+                    int(idx): max(0, int(total) - int(free)) * 1024 * 1024
+                    for idx, free, total in state.get("gpu_mem") or ()
+                    if total and total > 0
+                }
+                holders = _gpm.describe_gpu_memory_holders(
+                    samples,
+                    used_by_index = used_by_index,
+                    gpu_indices = sorted(state.get("mib") or ()),
+                    exclude_pids = _gpm.studio_process_ids(),
+                    nvidia_luids = _gpm.nvidia_adapter_luids(),
+                )
+                if holders:
+                    note = f"GPU memory in use by other programs: {holders}."
+        except Exception as e:
+            logger.debug(f"GPU memory holder lookup failed: {e}")
+            note = None
+        state["note"] = note
+        return note
 
     @staticmethod
     def _fit_target_margin_mib(
@@ -39888,6 +40451,10 @@ class LlamaCppBackend:
                 # jinja2, so messages[0] yields undefined rather than raising and the template
                 # returns its bare preamble. A placeholder turn would add a system block instead.
                 apply_template_failed = False
+                # Why, for the strict raise below: the route answers every failure with
+                # one generic 503, and the field case behind it (a template that raises
+                # "No user query found" on a prompt with no user turn yet) was invisible.
+                apply_template_reason = "unexpected /apply-template response"
                 try:
                     # llama-server's /apply-template renders tool declarations
                     # into the prompt when ``tools`` is supplied, so pass them
@@ -39927,18 +40494,28 @@ class LlamaCppBackend:
                             if should_abort is not None and should_abort():
                                 raise CountAborted()
                             return _tokenize(prompt)
+                    else:
+                        apply_template_reason = (
+                            f"/apply-template HTTP {resp.status_code}: "
+                            f"{_count_failure_detail(resp)}"
+                        )
                     apply_template_failed = True
                 except CountAborted:
                     # Not a template failure: swallowed, the text fallback tokenizes anyway,
                     # which is the work being declined. Must precede the generic except.
                     raise
-                except Exception:
+                except Exception as e:
                     apply_template_failed = True
+                    apply_template_reason = f"{type(e).__name__}: {str(e)[:300]}"
 
                 # The fallback drops role markers, special tokens and tool schemas (~30% of a
                 # six-turn two-tool prompt), so strict callers error rather than undercount.
                 if strict and apply_template_failed:
-                    raise RuntimeError("llama-server could not render the chat template")
+                    _render_error = RuntimeError("llama-server could not render the chat template")
+                    # An attribute, not the message: callers that echo str(exc) to an API
+                    # client keep today's text, and the server log can still say why.
+                    _render_error.reason = apply_template_reason
+                    raise _render_error
 
                 # 2. Fallback: concatenate plain text and tokenize. Append a
                 # serialized form of the tools so they still contribute to the

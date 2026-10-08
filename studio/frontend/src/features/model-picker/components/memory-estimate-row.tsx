@@ -8,6 +8,13 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useT } from "@/i18n";
+import {
+  loadVerdictLabel,
+  loadVerdictOtherApps,
+  loadVerdictSentence,
+  loadVerdictTone,
+} from "@/lib/load-verdict";
 import type { MemoryEstimate } from "../api/memory-estimate";
 import {
   type MemoryFitVerdict,
@@ -24,6 +31,14 @@ const MEMORY_VALUE_TONE: Record<MemoryFitVerdict, string> = {
   tight: "text-amber-500",
   exceeds: "text-red-500",
   unknown: "text-foreground",
+};
+
+/** The backend verdict's headline color, by how much the level costs the user. */
+const VERDICT_TONE: Record<ReturnType<typeof loadVerdictTone>, string> = {
+  ok: "text-emerald-600 dark:text-emerald-400",
+  warn: "text-amber-700 dark:text-amber-400",
+  danger: "text-red-600 dark:text-red-400",
+  muted: "text-muted-foreground",
 };
 
 /** Match the size and type of the surrounding numeric controls. */
@@ -203,6 +218,7 @@ export function MemoryEstimateRow({
   onExpandedChange: (next: boolean) => void;
 }) {
   const contentId = useId();
+  const t = useT();
   if (!estimate?.available) {
     // Hide unavailable estimates without flickering during loading.
     return null;
@@ -224,6 +240,19 @@ export function MemoryEstimateRow({
       reclaimableGpuBytes,
     },
   );
+  // The backend's verdict, against the memory free right now, is the one /load acts on, so it is
+  // the headline whenever the backend sent one. The page's own reading stays for an older backend
+  // and for MLX, which the guardrail does not judge.
+  const verdict = estimate.verdict ?? null;
+  const verdictOtherApps = verdict ? loadVerdictOtherApps(verdict, t) : null;
+  // With a verdict shown, only the notes about the estimate's own precision keep their line: the
+  // placement advisories are this page's older answer to the question the headline now answers.
+  const precisionNote =
+    !estimate.kvEstimable ||
+    estimate.drafterKvUnsized ||
+    estimate.adaptersUnsized ||
+    (estimate.moeOffloadUnmodelled && !cpuOnly);
+  const shownAdvisory = verdict && !precisionNote ? null : advisory;
   const kvNote = resolveKvNote(estimate);
   const draftCacheNote = resolveDraftCacheNote(
     estimate.drafterRuntimeGpuBytes,
@@ -252,6 +281,17 @@ export function MemoryEstimateRow({
           className={`size-3.5 shrink-0 text-muted-foreground transition-transform duration-200 group-hover:text-foreground motion-reduce:transition-none ${expanded ? "rotate-0" : "-rotate-90"}`}
         />
       </button>
+      {verdict && (
+        <p
+          data-load-verdict={verdict.level}
+          className={`mt-1 text-pretty text-ui-12 leading-relaxed ${VERDICT_TONE[loadVerdictTone(verdict.level)]} ${stale || loading ? "opacity-50" : ""}`}
+        >
+          <span className="font-medium">{loadVerdictLabel(verdict, t)}</span>
+          {" · "}
+          {loadVerdictSentence(verdict, t)}
+          {verdictOtherApps ? ` ${verdictOtherApps}` : ""}
+        </p>
+      )}
       <div
         aria-busy={loading || stale}
         className={`space-y-3 transition-opacity ${stale || loading ? "opacity-50" : ""}`}
@@ -333,11 +373,11 @@ export function MemoryEstimateRow({
           />
         )}
       </div>
-      {advisory && (
+      {shownAdvisory && (
         <p
-          className={`mt-1.5 text-pretty text-ui-12 leading-relaxed ${advisory.tone === "warn" ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground"}`}
+          className={`mt-1.5 text-pretty text-ui-12 leading-relaxed ${shownAdvisory.tone === "warn" ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground"}`}
         >
-          {advisory.text}
+          {shownAdvisory.text}
         </p>
       )}
     </div>

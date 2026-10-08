@@ -133,6 +133,8 @@ const PREFS_KEYS: string[] = [
   "unsloth_load_settings",
   "unsloth_model_advanced_settings",
   "unsloth_chat_load_on_selection",
+  // "Always load my last model": a reset should bring the question back.
+  "unsloth_chat_auto_load_last_model",
   // Model selector settings ("Select model settings" group)
   "unsloth_chat_expand_quantizations",
   "unsloth_chat_show_all_quantizations",

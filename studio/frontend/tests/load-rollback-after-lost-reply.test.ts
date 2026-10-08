@@ -91,6 +91,7 @@ function realAuthFetch(port: number): AuthApi {
       isTauri: false,
     },
     "@/lib/account-transition": { accountTransitionPending: () => false },
+    "@/lib/connection-monitor": { reportTransportFailure: () => {} },
     "./session": {
       clearAuthTokens: () => {},
       getAuthToken: () => "access-token",
@@ -137,6 +138,11 @@ function realLoadModel(auth: AuthApi): ChatApi {
     "@/lib/model-lifecycle-events": {
       withModelLoadNotice: async (_r: string, _p: string | null, run: () => Promise<unknown>) =>
         run(),
+    },
+    // No reply here is the memory guardrail's 409, so loadModel never asks "Load anyway".
+    "@/lib/load-verdict": { memoryOvercommitVerdict: () => null },
+    "../memory-overcommit-consent": {
+      requestMemoryOvercommitConsent: async () => "cancel",
     },
   });
 }

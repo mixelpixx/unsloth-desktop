@@ -78,6 +78,24 @@ export interface TrainingStartRequest {
   enable_tensorboard: boolean;
   tensorboard_dir: string | null;
   resume_from_checkpoint?: string | null;
+  /** Physical GPUs to pin the run to. Absent leaves placement to backend auto-selection. */
+  gpu_ids?: number[];
+}
+
+/** POST /api/train/estimate: the start fields that move the memory peak, plus the target. */
+export interface TrainingEstimateRequest {
+  model_name: string;
+  training_type: string;
+  hf_token: string | null;
+  load_in_4bit: boolean;
+  four_bit_available: boolean;
+  max_seq_length: number;
+  batch_size: number;
+  lora_r: number;
+  target_modules: string[];
+  gradient_checkpointing: string;
+  optim: string;
+  gpu_ids: number[] | null;
 }
 
 export interface TrainingStartResponse {

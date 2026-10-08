@@ -5,7 +5,10 @@ import {
   isRawTextDatasetFormat,
   toBackendTrainingType,
 } from "../lib/training-methods";
-import type { TrainingStartRequest } from "../types/api";
+import type {
+  TrainingEstimateRequest,
+  TrainingStartRequest,
+} from "../types/api";
 import type { TrainingConfigState } from "../types/config";
 
 function parseSliceValue(value: string | null): number | null {
@@ -50,9 +53,51 @@ export function trainingLoadsIn4Bit(
   return (adapterMethod && isQloraMethod) || (isCpt && isFourBitModel);
 }
 
+/** The fit planner's request: the same values buildTrainingStartPayload sends for every field
+ *  the backend estimator reads, so the preview prices the run Start would launch.
+ *
+ * `fourBitAvailable` false (the latest-transformers sidecar trains 16-bit) prices the run as
+ * the backend will load it, not as the method label promises. */
+export function buildTrainingEstimatePayload(
+  config: Pick<
+    TrainingConfigState,
+    | "selectedModel"
+    | "trainingMethod"
+    | "contextLength"
+    | "batchSize"
+    | "loraRank"
+    | "targetModules"
+    | "gradientCheckpointing"
+    | "optimizerType"
+  >,
+  options: {
+    hfToken: string | null;
+    gpuIds: number[] | null;
+    fourBitAvailable: boolean;
+  },
+): TrainingEstimateRequest {
+  const adapterMethod = config.trainingMethod !== "full";
+  return {
+    model_name: config.selectedModel ?? "",
+    training_type: toBackendTrainingType(config.trainingMethod),
+    hf_token: options.hfToken,
+    load_in_4bit: trainingLoadsIn4Bit(config) && options.fourBitAvailable,
+    four_bit_available: options.fourBitAvailable,
+    max_seq_length: config.contextLength,
+    batch_size: config.batchSize,
+    lora_r: config.loraRank,
+    target_modules: adapterMethod ? config.targetModules : [],
+    gradient_checkpointing: config.gradientCheckpointing,
+    optim: config.optimizerType,
+    gpu_ids: options.gpuIds,
+  };
+}
+
 export function buildTrainingStartPayload(
   config: TrainingConfigState,
   hfToken: string | null,
+  // Omitted (not null) on Auto so an Auto run's payload is byte-identical to before.
+  gpuIds: number[] | null = null,
 ): TrainingStartRequest {
   const isCpt = config.trainingMethod === "cpt";
   const adapterMethod = config.trainingMethod !== "full";
@@ -175,5 +220,6 @@ export function buildTrainingStartPayload(
     tensorboard_dir: config.enableTensorboard
       ? config.tensorboardDir.trim() || null
       : null,
+    ...(gpuIds && gpuIds.length > 0 ? { gpu_ids: [...gpuIds] } : {}),
   };
 }

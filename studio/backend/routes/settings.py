@@ -108,6 +108,12 @@ from utils.vram_budget_settings import (
     get_vram_budget_state,
     set_vram_budget_fraction,
 )
+from utils.load_guardrail_settings import (
+    LOAD_GUARDRAIL_DEFAULT,
+    LOAD_GUARDRAIL_MODES,
+    get_load_guardrail_state,
+    set_load_guardrail_mode,
+)
 from utils.openai_auto_switch_settings import (
     BATCH_SIZE_MAX,
     BATCH_SIZE_MIN,
@@ -788,6 +794,19 @@ class VramBudgetResponse(BaseModel):
     max_fraction: float = VRAM_FRACTION_MAX
     # Read when a load sizes itself, so a change cannot reach a running child.
     reload_required: bool
+
+
+class LoadGuardrailsPayload(BaseModel):
+    # None clears the stored mode so env/default applies again. Required, as VramBudgetPayload.
+    mode: Optional[str]
+
+
+class LoadGuardrailsResponse(BaseModel):
+    mode: str
+    # False when inherited from UNSLOTH_LOAD_GUARDRAILS or the default.
+    is_stored: bool
+    default_mode: str = LOAD_GUARDRAIL_DEFAULT
+    modes: list[str] = list(LOAD_GUARDRAIL_MODES)
 
 
 class HuggingFaceCachePayload(BaseModel):
@@ -1887,6 +1906,37 @@ def update_vram_budget(
             log = logger,
         ) from exc
     return _vram_budget_response()
+
+
+def _load_guardrails_response() -> LoadGuardrailsResponse:
+    mode, is_stored = get_load_guardrail_state()
+    return LoadGuardrailsResponse(mode = mode, is_stored = is_stored)
+
+
+@_owner_settings_router.get("/load-guardrails", response_model = LoadGuardrailsResponse)
+def get_load_guardrails(
+    current_subject: str = Depends(get_current_subject),
+) -> LoadGuardrailsResponse:
+    return _load_guardrails_response()
+
+
+@_owner_settings_router.put("/load-guardrails", response_model = LoadGuardrailsResponse)
+def update_load_guardrails(
+    payload: LoadGuardrailsPayload, current_subject: str = Depends(get_current_subject)
+) -> LoadGuardrailsResponse:
+    """Which memory verdicts stop ``/load`` for an explicit "Load anyway". Read per load, so a
+    change applies to the next one; nothing running is affected."""
+    try:
+        set_load_guardrail_mode(payload.mode)
+    except ValueError as exc:
+        raise log_and_http_error(
+            exc,
+            400,
+            safe_error_detail(exc, fallback = "Invalid load guardrail mode."),
+            event = "settings.update_load_guardrails_failed",
+            log = logger,
+        ) from exc
+    return _load_guardrails_response()
 
 
 class CodingAgentsResponse(BaseModel):
@@ -4199,6 +4249,8 @@ class DebugLogSourceModel(BaseModel):
     size_bytes: int
     modified_at: float
     is_current: bool
+    # An MCP server's log under the server's name. Additive: an older client shows `label`.
+    display_name: Optional[str] = None
 
 
 class DebugLogSourcesResponse(BaseModel):
@@ -4297,8 +4349,10 @@ def get_debug_log(
         # states above) so a stale picker refetches its sources.
         raise HTTPException(status_code = 404, detail = "Unknown log source.")
 
+    # The family comes from the id, which resolve_source_id just matched against the allowlist.
+    mask = debug_log_sources.source_mask(source_id.partition(":")[0], path)
     try:
-        result = debug_log_reader.read_since(path, cursor, lines)
+        result = debug_log_reader.read_since(path, cursor, lines, mask)
     except FileNotFoundError:
         return DebugLogResponse(
             status = "missing",

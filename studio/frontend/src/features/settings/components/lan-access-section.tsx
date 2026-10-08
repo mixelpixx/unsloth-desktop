@@ -20,6 +20,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { usePlatformStore } from "@/config/env";
 import {
   loadLanAccess,
   startLanAccess,
@@ -50,6 +51,13 @@ import { SettingsRow } from "./settings-row";
 
 type LanAccessOperation = "start" | "stop" | "auto" | "port";
 type PortMode = "automatic" | "custom";
+
+// The port keeps its own message under the port field.
+const ACTION_FAILURE: Record<Exclude<LanAccessOperation, "port">, string> = {
+  start: "Could not start LAN access.",
+  stop: "Could not stop LAN access.",
+  auto: "Could not change Start automatically.",
+};
 
 const STATE_LABEL: Record<LanAccessStatus["state"], string> = {
   off: "Off",
@@ -88,7 +96,16 @@ function AccessStatus({ status }: { status: LanAccessStatus | null }) {
   );
 }
 
-function CopyLanUrlButton({ url, label }: { url: string; label: string }) {
+function CopyLanUrlButton({
+  url,
+  label,
+  subject = url,
+}: {
+  url: string;
+  label: string;
+  /** What the button's accessible name says it copies; the URL itself by default. */
+  subject?: string;
+}) {
   const [copied, setCopied] = useState(false);
   const text = copied ? "Copied" : label;
   const copyTimer = useRef<number | null>(null);
@@ -105,7 +122,7 @@ function CopyLanUrlButton({ url, label }: { url: string; label: string }) {
       size="sm"
       variant="outline"
       className="gap-1.5"
-      aria-label={`${text} ${url}`}
+      aria-label={`${text} ${subject}`}
       onClick={async () => {
         if (!(await copyToClipboard(url))) {
           return;
@@ -230,10 +247,42 @@ function LanUrlPanel({ status }: { status: LanAccessStatus | null }) {
   );
 }
 
+// Windows Firewall drops inbound connections to a new listener unless the user allowed it, and
+// the prompt that offers to is easy to dismiss. The fix is one rule, so hand it over.
+function windowsFirewallRule(port: number): string {
+  return `New-NetFirewallRule -DisplayName "Unsloth LAN" -Direction Inbound -Protocol TCP -LocalPort ${port} -Profile Private -Action Allow`;
+}
+
+function WindowsFirewallHint({ port }: { port: number }) {
+  const command = windowsFirewallRule(port);
+  return (
+    <div className="flex flex-col gap-1.5 border-t border-border/60 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-xs text-muted-foreground leading-snug">
+          Other devices can’t connect? Allow the port through Windows Firewall
+          from an administrator PowerShell:
+        </span>
+        <CopyLanUrlButton
+          url={command}
+          label="Copy"
+          subject="Windows Firewall command"
+        />
+      </div>
+      <code className="block w-full break-all rounded-md border border-border bg-muted/40 px-3 py-2 font-mono text-xs text-foreground">
+        {command}
+      </code>
+    </div>
+  );
+}
+
 export function LanAccessSection() {
   const portErrorId = useId();
   const [status, setStatus] = useState<LanAccessStatus | null>(null);
   const [busy, setBusy] = useState<LanAccessOperation | null>(null);
+  // A start/stop/auto-start request the server refused. Cleared by the next one that succeeds.
+  const [actionError, setActionError] = useState<string | null>(null);
+  // The server's OS once /api/health has answered: the firewall in question is the server's.
+  const serverOnWindows = usePlatformStore((s) => s.deviceType === "windows");
 
   const [portMode, setPortMode] = useState<PortMode>("automatic");
   const [portDraft, setPortDraft] = useState("8888");
@@ -315,12 +364,20 @@ export function LanAccessSection() {
     setBusy(operation);
     try {
       applyStatus(await request());
+      setActionError(null);
       if (pausePollingAfterSuccess) {
         selfStopDisconnectExpected.current = true;
       }
-    } catch {
+    } catch (error) {
       if (operation === "port") {
         setPortError("Could not save the LAN port.");
+      } else {
+        const detail = error instanceof Error ? error.message : "";
+        setActionError(
+          detail
+            ? `${ACTION_FAILURE[operation]} ${detail}`
+            : ACTION_FAILURE[operation],
+        );
       }
       // polling resumes below and reconciles the visible state
     } finally {
@@ -361,6 +418,7 @@ export function LanAccessSection() {
     status?.configuredPort ?? null,
   );
   const stopAction = status?.state === "online";
+  const firewallPort = status?.activePort ?? status?.configuredPort ?? null;
   const actionDisabled =
     busy !== null || (stopAction ? !status?.canStop : !status?.canStart);
   const actionLabel =
@@ -410,11 +468,15 @@ export function LanAccessSection() {
         </Button>
       </div>
 
+      <StatusMessage message={actionError} destructive={true} />
       <StatusMessage
         message={blockMessage ?? errorMessage}
         destructive={!blockMessage}
       />
       <LanUrlPanel status={status} />
+      {serverOnWindows && stopAction && firewallPort !== null ? (
+        <WindowsFirewallHint port={firewallPort} />
+      ) : null}
 
       <div className="border-t border-border/60 px-4 py-1">
         {status?.portConfigurationSupported ? (

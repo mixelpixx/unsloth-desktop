@@ -560,11 +560,16 @@ def test_both_clients_reject_a_truncated_padded_body():
     ).read_text(encoding = "utf-8")
     assert "export function assertCompletedPaddedBody(" in web
     # Scoped to /load and /unload: shared parseJsonOrThrow serves ~30 endpoints,
-    # some legitimately with no body.
+    # some legitimately with no body. /load reads its body first (to spot the memory
+    # guardrail's 409 before asking "Load anyway"), so it passes the already-read body.
     chat_api = (
         _repo_root / "studio" / "frontend" / "src" / "features" / "chat" / "api" / "chat-api.ts"
     ).read_text(encoding = "utf-8")
-    assert re.findall(r'parseJsonOrThrow<[^>]*>\(\s*response,\s*"([^"]+)"', chat_api) == [
+    assert re.findall(
+        r'(?:parseJsonOrThrow<[^>]*>\(\s*response,|parsedBodyOrThrow<[^>]*>\(\s*response,\s*body,)'
+        r'\s*"([^"]+)"',
+        chat_api,
+    ) == [
         "Model load",
         "Model unload",
     ]

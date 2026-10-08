@@ -24,6 +24,7 @@ test("authFetch sends the browser timezone", async () => {
       {
         "@/lib/api-base": { apiUrl: (path: string) => path, isTauri: false },
         "@/lib/account-transition": { accountTransitionPending: () => false },
+        "@/lib/connection-monitor": { reportTransportFailure: () => {} },
         "./session": {
           clearAuthTokens: () => {},
           getAuthToken: () => "access-token",

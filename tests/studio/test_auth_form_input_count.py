@@ -333,6 +333,7 @@ def test_auth_redirect_targets_are_idempotent_and_concurrent(tmp_path: Path):
         .replace('from "@/lib/api-base"', 'from "./stubs.mjs"')
         .replace('from "./session"', 'from "./stubs.mjs"')
         .replace('from "@/lib/account-transition"', 'from "./stubs.mjs"')
+        .replace('from "@/lib/connection-monitor"', 'from "./stubs.mjs"')
     )
     (tmp_path / "api.ts").write_text(source)
     (tmp_path / "stubs.mjs").write_text(
@@ -346,6 +347,8 @@ def test_auth_redirect_targets_are_idempotent_and_concurrent(tmp_path: Path):
             // stub does not export is a SyntaxError at instantiation, not at call time.
             export const getApiPort = () => null;
             export const accountTransitionPending = () => false;
+            // The connection monitor's feed; this test is about redirects, not the banner.
+            export const reportTransportFailure = () => {};
             export const reset = (a = null, r = null) => { access = a; refresh = r; passwordChange = false; };
             export const clearAuthTokens = () => { access = null; refresh = null; };
             export const getAuthToken = () => access;

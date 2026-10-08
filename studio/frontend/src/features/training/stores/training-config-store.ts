@@ -10,7 +10,7 @@ import { getHfToken } from "@/features/hub";
 import { translate } from "@/i18n";
 import { toast } from "@/lib/toast";
 import { isAdapterMethod } from "@/types/training";
-import type { ModelType } from "@/types/training";
+import type { ModelType, TrainingMethod } from "@/types/training";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { DatasetFormatError, checkDatasetFormat } from "../api/datasets-api";
@@ -122,6 +122,22 @@ function notifyStreamingCompat(patch: Partial<TrainingConfigState>): void {
       }),
     );
   }
+}
+
+// Model selection picks LoRA or QLoRA from free VRAM. That used to flip the method without a
+// word, so a user who chose LoRA found QLoRA on Start; say what changed and offer it back.
+function notifyAutoTrainingMethodSwitch(
+  method: TrainingMethod,
+  undo: () => void,
+): void {
+  toast.info(
+    translate(
+      method === "qlora"
+        ? "trainingFit.autoSwitchedToQlora"
+        : "trainingFit.autoSwitchedToLora",
+    ),
+    { action: { label: translate("shell.sections.undo"), onClick: undo } },
+  );
 }
 
 export const useTrainingConfigStore = create<TrainingConfigStore>()(
@@ -467,11 +483,20 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
                           method === "full" ? LR_DEFAULT_FULL : LR_DEFAULT_LORA,
                       }
                     : {};
+                const previousMethod = get().trainingMethod;
                 set({
                   trainingMethod: method,
                   ...lrPatch,
                   isLoadingModelDefaults: false,
                 });
+                if (method !== previousMethod) {
+                  notifyAutoTrainingMethodSwitch(method, () => {
+                    // Only while the pick still stands: a later edit is the user's own.
+                    if (get().trainingMethod === method) {
+                      get().setTrainingMethod(previousMethod);
+                    }
+                  });
+                }
               });
             }
           })

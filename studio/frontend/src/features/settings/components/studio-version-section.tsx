@@ -78,20 +78,24 @@ export function StudioVersionSection({
   children?: ReactNode;
 } = {}) {
   const t = useT();
-  const [packageVersion, setPackageVersion] = useState("dev");
-  const [studioVersion, setStudioVersion] = useState("dev");
+  // null while the request is out. A version the server did not report shows as a dash, not as
+  // a made-up "dev" that reads like a real build.
+  const [versions, setVersions] = useState<StudioVersions | null>(null);
 
   useEffect(() => {
     let canceled = false;
     fetchStudioVersions().then((next) => {
-      if (canceled) return;
-      if (next.packageVersion) setPackageVersion(next.packageVersion);
-      if (next.studioVersion) setStudioVersion(next.studioVersion);
+      if (!canceled) setVersions(next);
     });
     return () => {
       canceled = true;
     };
   }, []);
+
+  const versionText = (version: string | null | undefined) =>
+    versions === null ? t("common.loading") : version || "—";
+  const studioVersion = versionText(versions?.studioVersion);
+  const packageVersion = versionText(versions?.packageVersion);
 
   return (
     <SettingsSection title="Unsloth" hideHeading={true}>

@@ -44,6 +44,7 @@ function loadAuthApi(options: {
         isTauri: options.isTauri ?? true,
       },
       "@/lib/account-transition": { accountTransitionPending: () => false },
+      "@/lib/connection-monitor": { reportTransportFailure: () => {} },
       "./session": {
         clearAuthTokens: () => {},
         getAuthToken: () => "access-token",

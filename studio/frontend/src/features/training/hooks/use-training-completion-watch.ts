@@ -15,6 +15,7 @@ import {
   isTrainingStartPending,
   useTrainingRuntimeStore,
 } from "../stores/training-runtime-store";
+import { maybeNotifyTrainingTerminalTransition } from "./use-training-runtime-lifecycle";
 
 const WATCH_INTERVAL_MS = 6000;
 
@@ -41,7 +42,13 @@ export function useTrainingCompletionWatch(): void {
         const status = await getTrainingStatus(requestKey);
         const runtime = useTrainingRuntimeStore.getState();
         if (!cancelled && isTrainingStatusRequestCurrent(requestKey, runtime)) {
+          // `runtime` is the snapshot before this status lands; off the Train page this
+          // poll is the only one that sees the run finish, so it notifies here too.
           runtime.applyStatus(status);
+          maybeNotifyTrainingTerminalTransition(
+            runtime,
+            useTrainingRuntimeStore.getState(),
+          );
         }
       } catch {
         // Transient network/auth hiccup; the next tick retries.

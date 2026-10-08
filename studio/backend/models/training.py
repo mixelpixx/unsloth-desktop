@@ -674,6 +674,97 @@ class TrainingStartRequest(BaseModel):
         return self
 
 
+TrainingFitVerdict = Literal["fits", "tight", "exceeds", "unknown"]
+
+
+class TrainingEstimateRequest(BaseModel):
+    """What the fit planner prices before Start.
+
+    The subset of TrainingStartRequest that estimate_required_model_memory_gb reads, with the
+    same bounds, plus the GPUs the run would be pinned to. Gradient accumulation is absent on
+    purpose: it replays micro-batches one after another, so it never moves the peak.
+    """
+
+    model_name: str = Field(..., min_length = 1, description = "Model identifier or local path")
+    # Same identity the picker was shown, resolved the way /start resolves it.
+    _resolve_the_handle = field_validator("model_name")(_resolve_inventory_handle)
+    training_type: Literal["LoRA/QLoRA", "Full Finetuning", "Continued Pretraining"] = Field(
+        ..., description = "Training type, as TrainingStartRequest.training_type"
+    )
+    hf_token: Optional[str] = Field(None, description = "HuggingFace token for gated metadata")
+    load_in_4bit: bool = Field(True, description = "Price a 4-bit base (QLoRA)")
+    four_bit_available: bool = Field(
+        True,
+        description = (
+            "False when the model trains 16-bit whatever the method says (the latest-transformers "
+            "sidecar), so QLoRA is not offered as a remedy the run could not honour."
+        ),
+    )
+    max_seq_length: int = Field(2048, ge = 1, le = _MAX_SEQ_LENGTH)
+    batch_size: int = Field(1, ge = 1, le = _MAX_BATCH_SIZE)
+    lora_r: int = Field(16, ge = 1, le = _MAX_LORA_R)
+    target_modules: List[str] = Field(default_factory = list, max_length = 64)
+    gradient_checkpointing: str = Field("", max_length = 32)
+    optim: str = Field("adamw_8bit", max_length = 64)
+    gpu_ids: Optional[List[int]] = Field(
+        None,
+        max_length = 64,
+        description = "Physical GPU indices the run would be pinned to; omit or [] for auto.",
+    )
+
+    @field_validator("target_modules", mode = "before")
+    @classmethod
+    def _normalize_target_modules(cls, value: Any) -> Any:
+        return [] if value is None else value
+
+
+class TrainingEstimateBreakdown(BaseModel):
+    """The estimator's own parts (VramBreakdown.to_gb_dict), in GiB."""
+
+    model_weights_gb: float
+    lora_adapters_gb: float
+    optimizer_states_gb: float
+    gradients_gb: float
+    activations_gb: float
+    cuda_overhead_gb: float
+    total_gb: float
+
+
+class TrainingEstimateGpu(BaseModel):
+    index: int
+    name: Optional[str] = None
+    total_gb: Optional[float] = None
+    free_gb: Optional[float] = None
+    selected: bool = False
+
+
+class TrainingEstimateSuggestion(BaseModel):
+    """A cheaper setting the estimator priced and found to fit the same target."""
+
+    kind: Literal["qlora", "batch_size"]
+    required_gb: float
+    verdict: Literal["fits", "tight"]
+    gpu_ids: List[int] = Field(default_factory = list)
+    batch_size: Optional[int] = None
+
+
+class TrainingEstimateResponse(BaseModel):
+    verdict: TrainingFitVerdict
+    # Machine code: why the verdict is unknown, or which check an "exceeds" failed.
+    reason: Optional[str] = None
+    required_gb: Optional[float] = None
+    # "detailed" carries a breakdown; "fallback" is the config-less ratio estimate and has none.
+    estimation_mode: Optional[Literal["detailed", "fallback"]] = None
+    breakdown: Optional[TrainingEstimateBreakdown] = None
+    selection_mode: Literal["auto", "explicit"] = "auto"
+    gpu_ids: List[int] = Field(default_factory = list)
+    usable_gb: Optional[float] = None
+    # Activations do not shard, so each selected GPU needs at least this much free.
+    min_per_gpu_gb: Optional[float] = None
+    gpus: List[TrainingEstimateGpu] = Field(default_factory = list)
+    suggestion: Optional[TrainingEstimateSuggestion] = None
+
+
 class TrainingJobResponse(BaseModel):
     """Immediate response when training is initiated"""
 

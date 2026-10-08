@@ -17,6 +17,7 @@ type EditRecipePageProps = {
 type LoadState =
   | { status: "loading" }
   | { status: "missing" }
+  | { status: "error"; message: string }
   | { status: "ready"; record: RecipeRecord };
 
 function RecipeLoadState({
@@ -64,17 +65,32 @@ export function EditRecipePage({ recipeId }: EditRecipePageProps): ReactElement 
       setLoadState({ status: "loading" });
     }
 
-    void getRecipe(recipeId).then((record) => {
-      if (!active) {
-        return;
-      }
-      if (!record) {
-        setLoadState({ status: "missing" });
-        return;
-      }
-      primeRecipeCache(record);
-      setLoadState({ status: "ready", record });
-    });
+    getRecipe(recipeId)
+      .then((record) => {
+        if (!active) {
+          return;
+        }
+        if (!record) {
+          setLoadState({ status: "missing" });
+          return;
+        }
+        primeRecipeCache(record);
+        setLoadState({ status: "ready", record });
+      })
+      .catch((error: unknown) => {
+        if (!active) {
+          return;
+        }
+        // A cached copy already on screen stays usable; only a blank load becomes an error.
+        setLoadState((current) =>
+          current.status === "ready"
+            ? current
+            : {
+                status: "error",
+                message: error instanceof Error ? error.message : "",
+              },
+        );
+      });
     return () => {
       active = false;
     };
@@ -106,6 +122,20 @@ export function EditRecipePage({ recipeId }: EditRecipePageProps): ReactElement 
       <RecipeLoadState
         title="Loading recipe..."
         description="Please wait while we load your recipe."
+        onBack={() => void navigate({ to: "/data-recipes" })}
+      />
+    );
+  }
+
+  if (loadState.status === "error") {
+    return (
+      <RecipeLoadState
+        title="Couldn't load recipe"
+        description={
+          loadState.message
+            ? `Something went wrong while reading this recipe: ${loadState.message}`
+            : "Something went wrong while reading this recipe. Try again from the recipes list."
+        }
         onBack={() => void navigate({ to: "/data-recipes" })}
       />
     );

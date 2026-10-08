@@ -25,7 +25,7 @@ import {
   RECIPE_STUDIO_WARNING_ICON_TONE,
 } from "../utils/ui-tones";
 
-type StatusTone = "success" | "error";
+type StatusTone = "success" | "error" | "failed" | "unloaded";
 
 type RecipeStudioHeaderProps = {
   activeView: RecipeStudioView;
@@ -43,6 +43,8 @@ type RecipeStudioHeaderProps = {
 const STATUS_MESSAGE_CLASS: Record<StatusTone, string> = {
   success: "Saved",
   error: "Needs saving",
+  failed: "Save failed",
+  unloaded: "Not loaded",
 };
 
 export function RecipeStudioHeader({
@@ -118,7 +120,14 @@ export function RecipeStudioHeader({
               {workflowName}
             </button>
           )}
-          <Badge variant="secondary" className="h-6 shrink-0 text-ui-10">
+          <Badge
+            variant={
+              saveTone === "failed" || saveTone === "unloaded"
+                ? "destructive"
+                : "secondary"
+            }
+            className="h-6 shrink-0 text-ui-10"
+          >
             {STATUS_MESSAGE_CLASS[saveTone]}
           </Badge>
           <span

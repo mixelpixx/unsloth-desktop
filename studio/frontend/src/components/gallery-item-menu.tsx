@@ -13,6 +13,16 @@ import {
 import { HugeiconsIcon } from "@hugeicons/react";
 import { type ReactNode, useEffect, useState } from "react";
 
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -77,11 +87,14 @@ export function GalleryItemMenu({
   // cannot contain it when the tab goes away.
   const t = useT();
   const [open, setOpen] = useState(false);
+  // Delete is permanent, so it goes through a confirm rather than firing from the menu.
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const project = useProjectSubmenu({ noun, onAddToProject });
   const closeProject = project.close;
   useEffect(() => {
     if (!active) {
       setOpen(false);
+      setConfirmDelete(false);
       closeProject();
     }
   }, [active, closeProject]);
@@ -147,7 +160,7 @@ export function GalleryItemMenu({
           {archived ? "Restore from archive" : "Archive"}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem variant="destructive" onClick={onDelete}>
+        <DropdownMenuItem variant="destructive" onClick={() => setConfirmDelete(true)}>
           <HugeiconsIcon icon={Delete02Icon} strokeWidth={1.75} className="size-icon" />
           Delete
         </DropdownMenuItem>
@@ -156,12 +169,32 @@ export function GalleryItemMenu({
   );
 
   const newProjectDialog = project.dialog;
+  const deleteDialog = (
+    <AlertDialog
+      open={active && confirmDelete}
+      onOpenChange={(o) => setConfirmDelete(active && o)}
+    >
+      <AlertDialogContent size="sm">
+        <AlertDialogHeader>
+          <AlertDialogTitle>Delete this {noun}?</AlertDialogTitle>
+          <AlertDialogDescription>This can't be undone.</AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction variant="destructive" onClick={onDelete}>
+            Delete
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
 
   if (!overlay && !row) {
     return (
       <>
         {menu}
         {newProjectDialog}
+        {deleteDialog}
       </>
     );
   }
@@ -176,6 +209,7 @@ export function GalleryItemMenu({
     >
       {menu}
       {newProjectDialog}
+      {deleteDialog}
     </span>
   );
 }

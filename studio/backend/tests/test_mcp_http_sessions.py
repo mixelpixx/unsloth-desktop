@@ -472,10 +472,10 @@ def test_oauth_flip_before_connect_blocks_dispatch(clients):
     release = threading.Event()
     real_slot = mcp_client._connect_slot
 
-    def paused_slot(url, headers):
+    def paused_slot(url, headers, cwd = None):
         reached.set()
         release.wait(10)
-        return real_slot(url, headers)
+        return real_slot(url, headers, cwd)
 
     mcp_client._connect_slot = paused_slot
     try:

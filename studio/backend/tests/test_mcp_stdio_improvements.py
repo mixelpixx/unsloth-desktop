@@ -77,7 +77,9 @@ def test_client_builds_stdio_with_encoded_arguments_without_shell(monkeypatch):
     assert captured["args"] == ["-m", "mod", "--name", "a b", "", "  keep padding  "]
     assert captured["env"]["API_KEY"] == "secret"
     assert captured["keep_alive"] is False
-    assert set(captured) == {"command", "args", "env", "keep_alive"}
+    # No working directory configured: the backend's own, as before cwd existed.
+    assert captured["cwd"] is None
+    assert set(captured) == {"command", "args", "env", "cwd", "keep_alive"}
 
 
 def test_client_http_unaffected_by_gate(monkeypatch):

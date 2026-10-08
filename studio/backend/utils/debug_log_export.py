@@ -20,7 +20,7 @@ import stat
 import tempfile
 import time
 import zipfile
-from typing import IO, Iterator
+from typing import IO, Callable, Iterator, Optional
 
 from utils import debug_log_sources
 from utils.log_redaction import redact_log_text
@@ -169,7 +169,7 @@ def _open_verified(path: str) -> tuple[IO[bytes], int]:
     return os.fdopen(fd, "rb"), fd
 
 
-def _redact_record(raw: bytes) -> str:
+def _redact_record(raw: bytes, mask: Optional[Callable[[str], str]] = None) -> str:
     """One record, masked, or refused if the redactor cannot read it.
 
     `errors="replace"` is unsafe: a UTF-16 log decoded as UTF-8 keeps a NUL
@@ -183,7 +183,8 @@ def _redact_record(raw: bytes) -> str:
         text = raw.decode("utf-8", errors = "strict")
     except UnicodeDecodeError:
         return UNREADABLE_MARKER
-    return redact_log_text(text.rstrip("\r"))
+    text = text.rstrip("\r")
+    return redact_log_text(mask(text) if mask is not None else text)
 
 
 def _seek_to_tail(handle: IO[bytes], fd: int, allowance: int) -> tuple[int, int]:
@@ -226,7 +227,13 @@ def _seek_to_tail(handle: IO[bytes], fd: int, allowance: int) -> tuple[int, int]
     return size, size
 
 
-def _redacted_records(handle: IO[bytes], fd: int, limit: int, deadline: float) -> Iterator[str]:
+def _redacted_records(
+    handle: IO[bytes],
+    fd: int,
+    limit: int,
+    deadline: float,
+    mask: Optional[Callable[[str], str]] = None,
+) -> Iterator[str]:
     """Every line of one log, masked, in bounded chunks, stopping after `limit`.
 
     Never `handle.read()`: a runner log can be gigabytes.
@@ -278,7 +285,7 @@ def _redacted_records(handle: IO[bytes], fd: int, limit: int, deadline: float) -
                 # Terminated inside one chunk, so the buffer guard never saw it.
                 yield OVERSIZED_MARKER
             else:
-                yield _redact_record(record)
+                yield _redact_record(record, mask)
         if len(buffer) > MAX_RECORD_BYTES:
             # A log with no newline at all must not be held in memory whole.
             dropping = True
@@ -304,7 +311,7 @@ def _redacted_records(handle: IO[bytes], fd: int, limit: int, deadline: float) -
                 cut = os.fstat(fd).st_size > consumed
             except OSError:
                 cut = True  # cannot tell; take the side that cannot mislead
-        yield CUT_MARKER if cut else _redact_record(buffer)
+        yield CUT_MARKER if cut else _redact_record(buffer, mask)
 
 
 def _newest_first_across_families(
@@ -351,8 +358,15 @@ def build_log_archive() -> tempfile.SpooledTemporaryFile:
         used: set[str] = set()
         remaining = MAX_TOTAL_SOURCE_BYTES
         deadline = time.monotonic() + MAX_BUILD_SECONDS
+        sources = debug_log_sources.list_sources()
+        # Read once for every MCP log rather than once per file: it is the server list.
+        owners = (
+            debug_log_sources.mcp_log_owners()
+            if any(source.family == debug_log_sources.MCP_FAMILY for source in sources)
+            else {}
+        )
         with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-            for source in _newest_first_across_families(debug_log_sources.list_sources()):
+            for source in _newest_first_across_families(sources):
                 member = _member_name(source.family, source.label, used)
                 if remaining <= 0:
                     # Named, so the bundle says what is missing rather than
@@ -404,7 +418,12 @@ def build_log_archive() -> tempfile.SpooledTemporaryFile:
                                 )
                             before = handle.tell()
                             try:
-                                for record in _redacted_records(handle, fd, allowance, deadline):
+                                mask = debug_log_sources.source_mask(
+                                    source.family, source.realpath, owners
+                                )
+                                for record in _redacted_records(
+                                    handle, fd, allowance, deadline, mask
+                                ):
                                     destination.write((record + "\n").encode("utf-8"))
                             finally:
                                 # Charged even on a partial read: those bytes were

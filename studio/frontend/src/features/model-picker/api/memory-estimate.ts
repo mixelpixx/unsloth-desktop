@@ -3,6 +3,7 @@
 
 import { authFetch } from "@/features/auth";
 import { consumeNativePathToken } from "@/features/native-intents/api";
+import { type LoadVerdict, parseLoadVerdict } from "@/lib/load-verdict";
 
 /** GB, to two decimals. Lives in the import-free module beside the fit rules so the node test
  *  runner can reach it; re-exported here because every caller already imports this file. */
@@ -57,6 +58,9 @@ export interface MemoryEstimate {
   gpuLayers: number | null;
   /** `--n-cpu-moe` is set, so the GPU figure ignores it and reads high. */
   moeOffloadUnmodelled: boolean;
+  /** The backend's load guardrail verdict against the memory free now: the same one /load
+   *  acts on. Absent on an older backend and for MLX, where the page keeps its own reading. */
+  verdict?: LoadVerdict | null;
 }
 
 /** The load settings that move the estimate. Mirrors the fields /load takes. */
@@ -133,6 +137,7 @@ interface ApiEstimateResponse {
   layer_count: number | null;
   gpu_layers: number | null;
   moe_offload_unmodelled: boolean;
+  verdict?: unknown;
 }
 
 function estimateRequestBody(
@@ -248,6 +253,8 @@ function toMemoryEstimate(body: ApiEstimateResponse): MemoryEstimate {
     layerCount: nullableCount(body.layer_count),
     gpuLayers: nullableCount(body.gpu_layers),
     moeOffloadUnmodelled: flag(body.moe_offload_unmodelled, false),
+    // A shape this bundle cannot read is no verdict, and the page falls back to its own.
+    verdict: parseLoadVerdict(body.verdict),
   };
 }
 

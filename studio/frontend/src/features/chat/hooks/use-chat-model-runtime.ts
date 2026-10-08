@@ -73,6 +73,7 @@ import {
   getInferenceStatus,
   getLoadProgress,
   fetchGgufStagedMetadata,
+  isUserCancelledLoad,
   listLoras,
   listModels,
   loadModel,
@@ -80,6 +81,7 @@ import {
   validateModel,
 } from "../api/chat-api";
 import { formatEta, formatRate } from "../utils/format-transfer";
+import { modelLoadErrorHint } from "../utils/model-load-error-hint";
 import {
   ownsModelLoadRun,
   releaseOwnedModelLoadRun,
@@ -142,6 +144,11 @@ import {
   replayMaxTokensCap,
 } from "../presets/preset-policy";
 import { recordLastLocalModelLoad } from "../utils/last-local-model-load";
+import {
+  nextServerModelPollDelay,
+  SERVER_MODEL_POLL_MIN_MS,
+  sleepUnlessAborted,
+} from "../utils/server-model-poll";
 import { loadFallbackNotice } from "../utils/mmproj-fallback";
 import { resolveQwenThinkingParams } from "../utils/qwen-sampling-table";
 import { refreshContextUsage } from "../utils/refresh-context-usage";
@@ -363,6 +370,7 @@ const CLI_LOAD_POLL_MAX_MS = 600_000;
 async function waitForServerModel(signal?: AbortSignal): Promise<void> {
   const started = Date.now();
   let sawLoad = false;
+  let delayMs = SERVER_MODEL_POLL_MIN_MS;
 
   while (
     !signal?.aborted &&
@@ -388,8 +396,9 @@ async function waitForServerModel(signal?: AbortSignal): Promise<void> {
       return;
     }
 
+    let loading = false;
     if (status) {
-      const loading = (status.loading?.length ?? 0) > 0;
+      loading = (status.loading?.length ?? 0) > 0;
       sawLoad ||= loading;
       if (!loading && status.active_model) {
         await tryAdoptServerActiveModel({ status });
@@ -400,7 +409,11 @@ async function waitForServerModel(signal?: AbortSignal): Promise<void> {
     const elapsed = Date.now() - started;
     if (!sawLoad && elapsed >= CLI_LOAD_POLL_IDLE_MS) return;
     if (elapsed >= CLI_LOAD_POLL_MAX_MS) return;
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    delayMs = nextServerModelPollDelay(delayMs, {
+      loading,
+      hidden: typeof document !== "undefined" && document.visibilityState === "hidden",
+    });
+    await sleepUnlessAborted(delayMs, signal);
   }
 }
 
@@ -781,7 +794,10 @@ async function refreshAndWaitForServerModel(options?: {
 export async function resyncInferenceStatusAfterServerModelChange(): Promise<void> {
   // Both llama.cpp update paths land here, and an update replaces the binary whose --help the flag catalogue describes.
   invalidateLlamaFlagCatalog();
-  if (!isExternalModelId(useChatRuntimeStore.getState().params.checkpoint)) {
+  const checkpoint = useChatRuntimeStore.getState().params.checkpoint;
+  // With nothing picked there is nothing to drop, and clearCheckpoint also turns off the composer's
+  // tool toggles (MCP included), which a reconnect to a restarted backend must not do on its own.
+  if (checkpoint && !isExternalModelId(checkpoint)) {
     useChatRuntimeStore.getState().clearCheckpoint();
   }
   await syncInferenceStatusToStore();
@@ -3369,11 +3385,19 @@ export function useChatModelRuntime() {
             });
           }
         } catch (err) {
-          if (!abortCtrl.signal.aborted) {
+          if (isUserCancelledLoad(err)) {
+            // "Load anyway" declined (or a dismissed token prompt): nothing failed, so the
+            // loading toast closes instead of turning into a red error.
+            toast.dismiss(toastId);
+          } else if (!abortCtrl.signal.aborted) {
             const message =
               err instanceof Error ? err.message : "Failed to load model";
             const [summary, ...rest] = message.split("\n");
-            const detail = rest.join("\n").trim();
+            // The raw runner text stays below a plain-language next step when one applies.
+            const hint = modelLoadErrorHint(message);
+            const detail = [hint, rest.join("\n").trim()]
+              .filter(Boolean)
+              .join("\n\n");
             const runnerLogPath = failureLogPath(message);
             const logsAction = runnerLogPath
               ? viewLogsAction(
@@ -3414,6 +3438,11 @@ export function useChatModelRuntime() {
         if (modelSelectionIntentEpoch === loadIntentId) restorePreviousConfig();
         if (abortCtrl.signal.aborted) return; // User cancelled, nothing to report
         resetLoadingUiForRun(loadRun);
+        if (isUserCancelledLoad(error)) {
+          // Declined, not failed: no error banner, but a caller awaiting the load still hears it.
+          if (throwOnError) throw error;
+          return;
+        }
         const message =
           error instanceof Error ? error.message : "Failed to load model";
         setModelsError(message);

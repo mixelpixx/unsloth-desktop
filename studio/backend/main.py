@@ -275,6 +275,7 @@ import ipaddress
 import mimetypes
 import re as _re
 import shutil
+import uuid
 import warnings
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version as package_version
@@ -306,6 +307,12 @@ def _studio_root_id() -> str:
     """Same-install discriminator for /api/health (cached at import). Empty when no installer token is
     present."""
     return _STUDIO_ROOT_ID_CACHE
+
+
+# Per process, where studio_root_id is per install and survives a restart. The SPA compares it across a
+# reconnect to tell "this backend was briefly unreachable" from "a new process answered", and only the second
+# means every model it had loaded is gone. Random, so it fingerprints nothing and is safe to serve unauthenticated.
+_INSTANCE_ID: str = uuid.uuid4().hex
 
 
 # Some Windows installs map .js to text/plain, which mimetypes (hence StaticFiles) inherits
@@ -1922,6 +1929,9 @@ async def liveness_check():
         "supports_desktop_auth": True,
         "supports_desktop_backend_ownership": True,
         "studio_root_id": _studio_root_id(),
+        # Lockstep with /api/health: the SPA's connection monitor reads it here, and either route has to
+        # answer the same question about which process is behind the port.
+        "instance_id": _INSTANCE_ID,
         **({"desktop_owner": owner} if (owner := _desktop_owner()) else {}),
     }
     # Same unsettled markers /api/health publishes, and for the desktop health watchdog they are the point of the
@@ -1962,7 +1972,7 @@ async def health_check(request: Request):
     """Liveness plus launcher capability bits; host fingerprint gated on a bearer.
 
     Unauthenticated callers get non-sensitive fields (service, studio_root_id,
-    chat_only, desktop_*, native_path_leases_supported) to re-adopt a sibling
+    instance_id, chat_only, desktop_*, native_path_leases_supported) to re-adopt a sibling
     backend and gate UI before a token exists. version / studio_version /
     device_type require a bearer since they fingerprint the host.
     """
@@ -1991,6 +2001,8 @@ async def health_check(request: Request):
         "supports_desktop_backend_ownership": True,
         # Opaque per-install id; launchers reject sibling Unsloth instances on the same port.
         "studio_root_id": _studio_root_id(),
+        # Opaque per-process id, in lockstep with /api/liveness; changes on every restart.
+        "instance_id": _INSTANCE_ID,
         "native_path_leases_supported": native_path_leases_supported(),
         # Unauthenticated on purpose: an endpoint URL is not a host fingerprint,
         # and the frontend needs it before a token exists.

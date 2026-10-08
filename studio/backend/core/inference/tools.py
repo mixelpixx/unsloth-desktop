@@ -62,6 +62,7 @@ import urllib.request
 from core.inference.mcp_client import (
     MCP_TOOL_PREFIX,
     TOOL_CACHE_INVALIDATING_FIELDS,
+    _session_log_id,
     cache_tools,
     call_tool_sync,
     get_cached_tools,
@@ -13612,6 +13613,7 @@ async def get_enabled_mcp_tools() -> list[dict]:
                     headers = parse_server_headers(s),
                     timeout = probe_timeout(s["url"], bool(s.get("use_oauth"))),
                     use_oauth = bool(s.get("use_oauth")),
+                    cwd = s.get("cwd"),
                 )
                 for s in uncached
             ),
@@ -13627,10 +13629,12 @@ async def get_enabled_mcp_tools() -> list[dict]:
             ):
                 continue
             if isinstance(payload, BaseException):
+                # Never the raw address: a stdio command line can carry a token in its argv and an HTTP URL in
+                # its query string; the log id is the program/host plus a short digest.
                 logger.warning(
                     "MCP server '%s' (%s) discovery failed: %s",
                     server.get("display_name") or server["id"],
-                    server.get("url"),
+                    _session_log_id(server.get("url") or ""),
                     payload,
                 )
                 # Failures aren't cached, but record one so a down server isn't re-probed every send during the
@@ -13873,12 +13877,14 @@ def execute_tool(
         headers = parse_server_headers(server)
         url = server["url"]
         use_oauth = bool(server.get("use_oauth"))
+        cwd = server.get("cwd")
 
         def _config_current() -> bool:
             # Re-read before an MCP session is cached: this call may have read the row just before an update/delete
             # closed its sessions. use_oauth belongs here with the rest: a row switched to OAuth after we read it must
             # not be reached through the unauthenticated client this call is about to open, and a close cannot stop
-            # that on its own (nothing is cached yet, so it has no generation to bump).
+            # that on its own (nothing is cached yet, so it has no generation to bump). cwd likewise: a process
+            # started in the old folder must not be cached for the edited row.
             row = mcp_servers_db.get_server(server_id)
             return (
                 row is not None
@@ -13886,6 +13892,7 @@ def execute_tool(
                 and row.get("url") == url
                 and parse_server_headers(row) == headers
                 and bool(row.get("use_oauth")) == use_oauth
+                and row.get("cwd") == cwd
             )
 
         result = call_tool_sync(
@@ -13898,6 +13905,7 @@ def execute_tool(
             cancel_event = cancel_event,
             scope = mcp_scope,
             config_check = _config_current,
+            cwd = cwd,
         )
         if tool is not None and isinstance(result, str) and result.startswith("Error:"):
             return _mcp_schema_page(

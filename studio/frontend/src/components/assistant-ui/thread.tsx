@@ -2582,7 +2582,7 @@ const ComposerAnimated: FC<{
   threadId?: string | null;
   menuSide?: "top" | "bottom";
   disableQueue?: boolean;
-}> = ({ disabled, threadId, menuSide, disableQueue }) => {
+}> = ({ disabled, placeholder, threadId, menuSide, disableQueue }) => {
   return (
     // unsloth-composer-shell is the size container the tight (mobile) layout
     // in index.css queries. It sits outside the surface so those rules can
@@ -2593,6 +2593,7 @@ const ComposerAnimated: FC<{
       <div className="relative z-10 w-full">
         <Composer
           disabled={disabled}
+          placeholder={placeholder}
           threadId={threadId}
           menuSide={menuSide}
           disableQueue={disableQueue}
@@ -2642,7 +2643,7 @@ const Composer: FC<{
   threadId?: string | null;
   menuSide?: "top" | "bottom";
   disableQueue?: boolean;
-}> = ({ disabled, threadId, menuSide, disableQueue }) => {
+}> = ({ disabled, placeholder, threadId, menuSide, disableQueue }) => {
   const aui = useAui();
   const isDictating = useAuiState((s) => s.composer.dictation != null);
   const pageDragging = useContext(PageDragContext);
@@ -5391,7 +5392,9 @@ const Composer: FC<{
                 id={inputId}
                 submitMode="none"
                 placeholder={
-                  overlay ? "Type your edits for your image" : "Ask anything"
+                  overlay
+                    ? "Type your edits for your image"
+                    : (placeholder ?? "Ask anything")
                 }
                 ref={inputRef}
                 className="aui-composer-input unsloth-composer-input"
@@ -7322,8 +7325,12 @@ const MessageError: FC = () => {
   const researchActive = useThreadResearchActive();
   return (
     <MessagePrimitive.Error>
-      <ErrorPrimitive.Root className="aui-message-error-root mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-md bg-destructive/10 p-3 text-destructive text-sm dark:bg-destructive/5 dark:text-red-200">
-        <ErrorPrimitive.Message className="aui-message-error-message line-clamp-2 min-w-0 flex-1" />
+      <ErrorPrimitive.Root
+        role="alert"
+        className="aui-message-error-root mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-md bg-destructive/10 p-3 text-destructive text-sm dark:bg-destructive/5 dark:text-red-200"
+      >
+        {/* Scrolls rather than clamps: a load or runner failure is only useful whole. */}
+        <ErrorPrimitive.Message className="aui-message-error-message max-h-40 min-w-0 flex-1 overflow-y-auto whitespace-pre-wrap break-words select-text" />
         {/* Recovery path for interrupted/failed turns: regenerate in place. */}
         {!researchRunId && !researchActive && (
           <ActionBarPrimitive.Reload asChild={true}>
@@ -7349,7 +7356,15 @@ const GeneratingIndicator: FC = () => {
   if (!show) {
     return null;
   }
-  return <span className="text-sm text-muted-foreground">Generating...</span>;
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      className="text-sm text-muted-foreground"
+    >
+      Generating…
+    </span>
+  );
 };
 
 // Placeholder when stop fires before any visible content (e.g. mid-think).
@@ -8420,7 +8435,7 @@ const AssistantActionBar: FC = () => {
         // every menu open fanned out across the whole thread.
         //
         // "not-last", not "always": an unmounted bar is out of the tab order too, and these are
-        // the only Copy, Refresh, Read aloud and More controls a message has. The newest reply
+        // the only Copy, Regenerate, Read aloud and More controls a message has. The newest reply
         // keeps its bar, so a keyboard user still reaches the message they are acting on, and
         // the other N-1 still go: 8 tooltip subscriptions on a 500-message thread instead of
         // ~250. "never" while speaking because this bar carries the only Stop reading control,
@@ -8436,7 +8451,7 @@ const AssistantActionBar: FC = () => {
         {inlineEdit && <EditAssistantMessageButton />}
         {!researchRunId && !researchActive && (
           <ActionBarPrimitive.Reload asChild={true}>
-            <TooltipIconButton tooltip="Refresh">
+            <TooltipIconButton tooltip="Regenerate">
               <RefreshCwIcon strokeWidth={1.75} className="size-icon" />
             </TooltipIconButton>
           </ActionBarPrimitive.Reload>

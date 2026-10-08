@@ -18,6 +18,9 @@ import {
   mcpServerFromProvenance,
   mcpToolFromProvenance,
 } from "@/features/chat/utils/mcp-tool-name";
+// eslint-disable-next-line no-restricted-imports -- the feature barrel imports this component
+import { useToolAwaitingApproval } from "@/features/chat/tool-approval";
+import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { stripAnsi, stringifyToolResult } from "@/lib/strip-ansi";
 import { cn } from "@/lib/utils";
 import {
@@ -32,6 +35,7 @@ import {
   XCircleIcon,
 } from "lucide-react";
 import { Tick02Icon } from "@/lib/tick-icon";
+import { Copy01Icon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
   type CSSProperties,
@@ -39,9 +43,12 @@ import {
   type ElementType,
   memo,
   useCallback,
+  useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
+import { IconActionButton } from "./icon-action-button";
 import {
   isToolCallCancelled,
   isToolCallRunning,
@@ -52,8 +59,10 @@ import {
   syncToolActivityPreference,
   toolActivityOpen,
 } from "./tool-activity-open-state";
+import { ToolResultOutput } from "./tool-result-output";
 
 const ANIMATION_DURATION = 200;
+const COPY_RESET_MS = 2000;
 
 export type ToolFallbackRootProps = Omit<
   ComponentProps<typeof Collapsible>,
@@ -171,6 +180,8 @@ function ToolFallbackTrigger({
   mcpTool,
   status,
   icon: ToolIcon,
+  awaitingApproval = false,
+  failed = false,
   className,
   ...props
 }: ComponentProps<typeof CollapsibleTrigger> & {
@@ -182,13 +193,22 @@ function ToolFallbackTrigger({
   mcpTool?: string;
   status?: ToolCallMessagePartStatus;
   icon?: ElementType;
+  /** Parked on Allow/Deny: still "running", but nothing runs until the user answers. */
+  awaitingApproval?: boolean;
+  /** Completed with an error result, which the status alone reports as success. */
+  failed?: boolean;
 }) {
   const statusType = status?.type ?? "complete";
   const isRunning = isToolCallRunning(status);
   const isCancelled = isToolCallCancelled(status);
+  const isFailed = failed && !isRunning && !isCancelled;
 
-  const StatusIcon = statusIconMap[statusType];
-  const label = toolFallbackLabel(status);
+  const StatusIcon = isFailed ? AlertCircleIcon : statusIconMap[statusType];
+  const label = awaitingApproval
+    ? "Waiting for approval"
+    : isFailed
+      ? "Tool failed"
+      : toolFallbackLabel(status);
   const name = toolArgText(toolName);
   const displayName = formatMcpToolName(name, mcpServer, mcpTool) ?? name;
 
@@ -205,7 +225,7 @@ function ToolFallbackTrigger({
     >
       {isRunning ? (
         <Spinner className="aui-tool-fallback-trigger-icon" />
-      ) : ToolIcon ? (
+      ) : ToolIcon && !isFailed ? (
         <ToolIcon
           data-slot="tool-fallback-trigger-icon"
           className={cn(
@@ -219,6 +239,7 @@ function ToolFallbackTrigger({
           className={cn(
             "aui-tool-fallback-trigger-icon size-4 shrink-0",
             isCancelled && "text-muted-foreground",
+            isFailed && "text-destructive",
           )}
         />
       )}
@@ -294,6 +315,15 @@ function ToolFallbackContent({
   );
 }
 
+// Indented when the arguments parse; otherwise (still streaming, or not JSON) shown as sent.
+function prettyToolArgs(argsText: string): string {
+  try {
+    return JSON.stringify(JSON.parse(argsText), null, 2);
+  } catch {
+    return argsText;
+  }
+}
+
 function ToolFallbackArgs({
   argsText,
   className,
@@ -301,6 +331,10 @@ function ToolFallbackArgs({
 }: ComponentProps<"div"> & {
   argsText?: string;
 }) {
+  const prettyArgs = useMemo(
+    () => (argsText ? prettyToolArgs(argsText) : ""),
+    [argsText],
+  );
   if (!argsText) {
     return null;
   }
@@ -311,10 +345,46 @@ function ToolFallbackArgs({
       className={cn("aui-tool-fallback-args", className)}
       {...props}
     >
-      <pre className="aui-tool-fallback-args-value whitespace-pre-wrap">
-        {argsText}
+      <p className="aui-tool-fallback-args-header font-semibold">Arguments:</p>
+      <pre className="aui-tool-fallback-args-value mt-1 whitespace-pre-wrap break-words font-mono text-xs">
+        {prettyArgs}
       </pre>
     </div>
+  );
+}
+
+// CopyBtn in tool-code-cell.tsx draws the same button, but importing it would pull streamdown
+// into every card that falls back here.
+function ToolFallbackCopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timer.current) {
+        clearTimeout(timer.current);
+      }
+    };
+  }, []);
+
+  const copy = useCallback(async () => {
+    if (await copyToClipboard(text)) {
+      setCopied(true);
+      if (timer.current) {
+        clearTimeout(timer.current);
+      }
+      timer.current = setTimeout(() => setCopied(false), COPY_RESET_MS);
+    }
+  }, [text]);
+
+  return (
+    <IconActionButton label={copied ? "Copied" : "Copy result"} onClick={copy}>
+      {copied ? (
+        <HugeiconsIcon icon={Tick02Icon} strokeWidth={2} className="size-3" />
+      ) : (
+        <HugeiconsIcon icon={Copy01Icon} className="size-3" />
+      )}
+    </IconActionButton>
   );
 }
 
@@ -344,10 +414,13 @@ function isMcpImageResult(val: unknown): val is McpImageResult {
 
 function ToolFallbackResult({
   result,
+  failed = false,
   className,
   ...props
 }: ComponentProps<"div"> & {
   result?: unknown;
+  /** An "Error: ..." result, shown in the error colour. */
+  failed?: boolean;
 }) {
   if (result === undefined) {
     return null;
@@ -356,7 +429,9 @@ function ToolFallbackResult({
   const imageResult = isMcpImageResult(result) ? result : null;
   // Colourised CLIs (ls --color, grep --color, npm, cargo, pytest) emit SGR escapes that a plain
   // <pre> cannot style; strip them so the pane stays readable (#7962).
-  const resultText = imageResult ? null : stringifyToolResult(result);
+  const resultText = imageResult
+    ? stripAnsi(imageResult.text)
+    : stringifyToolResult(result);
 
   return (
     <div
@@ -364,31 +439,34 @@ function ToolFallbackResult({
       className={cn("aui-tool-fallback-result pt-2", className)}
       {...props}
     >
-      <p className="aui-tool-fallback-result-header font-semibold">Result:</p>
-      {imageResult ? (
-        <>
-          {imageResult.text && (
-            <pre className="aui-tool-fallback-result-content whitespace-pre-wrap">
-              {stripAnsi(imageResult.text)}
-            </pre>
+      <div className="flex items-center justify-between">
+        <p className="aui-tool-fallback-result-header font-semibold">Result:</p>
+        {resultText ? <ToolFallbackCopyButton text={resultText} /> : null}
+      </div>
+      {/* Tailed and height-capped like the terminal card; Copy above takes the full text. */}
+      {resultText ? (
+        <div
+          className={cn(
+            "aui-tool-fallback-result-content",
+            failed && "text-destructive",
           )}
-          <div className="mt-2 flex flex-col gap-2">
-            {imageResult.images.map((img, i) => (
-              <img
-                key={i}
-                src={`data:${img.mimeType};base64,${img.data}`}
-                alt={`Tool result ${i + 1}`}
-                loading="lazy"
-                className="max-w-full rounded border border-border"
-              />
-            ))}
-          </div>
-        </>
-      ) : (
-        <pre className="aui-tool-fallback-result-content whitespace-pre-wrap">
-          {resultText}
-        </pre>
-      )}
+        >
+          <ToolResultOutput text={resultText} />
+        </div>
+      ) : null}
+      {imageResult ? (
+        <div className="mt-2 flex flex-col gap-2">
+          {imageResult.images.map((img, i) => (
+            <img
+              key={i}
+              src={`data:${img.mimeType};base64,${img.data}`}
+              alt={`Tool result ${i + 1}`}
+              loading="lazy"
+              className="max-w-full rounded border border-border"
+            />
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -417,6 +495,7 @@ function ToolFallbackError({
 
   const isCancelled = status.reason === "cancelled";
   const headerText = isCancelled ? "Cancelled reason:" : "Error:";
+  const tone = isCancelled ? "text-muted-foreground" : "text-destructive";
 
   return (
     <div
@@ -424,17 +503,16 @@ function ToolFallbackError({
       className={cn("aui-tool-fallback-error", className)}
       {...props}
     >
-      <p className="aui-tool-fallback-error-header font-semibold text-muted-foreground">
+      <p className={cn("aui-tool-fallback-error-header font-semibold", tone)}>
         {headerText}
       </p>
-      <p className="aui-tool-fallback-error-reason text-muted-foreground">
-        {errorText}
-      </p>
+      <p className={cn("aui-tool-fallback-error-reason", tone)}>{errorText}</p>
     </div>
   );
 }
 
 const ToolFallbackImpl: ToolCallMessagePartComponent = ({
+  toolCallId,
   toolName,
   argsText,
   result,
@@ -443,20 +521,29 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
 }) => {
   // Allow/Deny confirmation controls are rendered uniformly for every tool
   // card (built-in and fallback) by the `withToolConfirmation` wrapper in
-  // thread.tsx, so this renderer stays purely presentational.
+  // thread.tsx; this renderer only reads whether it is parked on them.
   const provenance = (rest as { provenance?: unknown }).provenance;
   const isCancelled = isToolCallCancelled(status);
+  // The arguments being approved live inside the content while Allow/Deny
+  // render outside it, so a parked call stays open whatever the preference.
+  const awaitingApproval = useToolAwaitingApproval(toolCallId);
+  // The backend hands MCP failures back as a completed call whose result
+  // starts "Error:", so the result is the only place the failure shows.
+  const failed = typeof result === "string" && /^\s*Error:/.test(result);
 
   return (
     <ToolFallbackRoot
       className={cn(isCancelled && "bg-muted/30")}
       defaultOpen={isToolCallRunning(status)}
+      awaitingApproval={awaitingApproval}
     >
       <ToolFallbackTrigger
         toolName={toolName}
         mcpServer={mcpServerFromProvenance(provenance)}
         mcpTool={mcpToolFromProvenance(provenance)}
         status={status}
+        awaitingApproval={awaitingApproval}
+        failed={failed}
       />
       <ToolFallbackContent>
         <ToolFallbackError status={status} />
@@ -464,7 +551,7 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
           argsText={argsText}
           className={cn(isCancelled && "opacity-60")}
         />
-        {!isCancelled && <ToolFallbackResult result={result} />}
+        {!isCancelled && <ToolFallbackResult result={result} failed={failed} />}
       </ToolFallbackContent>
     </ToolFallbackRoot>
   );

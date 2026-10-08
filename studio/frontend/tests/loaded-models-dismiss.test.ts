@@ -28,9 +28,10 @@ function reset(): void {
   store.clear();
 }
 
-test("the indicator is off until it is switched on", () => {
+// On by default: it is where a user sees what still holds memory before the next load.
+test("the indicator is on until it is switched off", () => {
   reset();
-  assert.equal(getShowLoadedModels(), false);
+  assert.equal(getShowLoadedModels(), true);
 });
 
 // Written either way, never removed. A pre-update tab reads a missing key as
@@ -52,12 +53,12 @@ test("an older explicit false still reads as off", () => {
   assert.equal(getShowLoadedModels(), false);
 });
 
-// Reset all local preferences removes the key, and the default must survive it.
-test("a cleared key falls back to off, not on", () => {
+// Reset all local preferences removes the key, and that is a return to the default: on.
+test("a cleared key falls back to the default, on", () => {
   reset();
-  setShowLoadedModels(true);
+  setShowLoadedModels(false);
   store.delete(LOADED_MODELS_PREFERENCE_KEYS.show);
-  assert.equal(getShowLoadedModels(), false);
+  assert.equal(getShowLoadedModels(), true);
 });
 
 test("the card is open until something closes it", () => {

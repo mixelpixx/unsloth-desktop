@@ -3,6 +3,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
+import { toast } from "@/lib/toast";
 import { toastError, toastSuccess } from "@/shared/toast";
 import { normalizeNonEmptyName } from "@/utils";
 import { removeUnstructuredBlock } from "../api";
@@ -14,7 +15,9 @@ import { useRecipeStudioStore } from "../stores/recipe-studio";
 import { importRecipePayload, type RecipeSnapshot } from "../utils/import";
 import type { RecipePayloadResult } from "../utils/payload/types";
 
-type SaveTone = "success" | "error";
+// "error" is the unsaved state; "failed" a save that threw; "unloaded" a stored payload that
+// would not import, so what is on screen is not the saved recipe.
+type SaveTone = "success" | "error" | "failed" | "unloaded";
 
 type PersistRecipeFn = (input: {
   id: string | null;
@@ -44,6 +47,7 @@ type UseRecipePersistenceResult = {
   saveLoading: boolean;
   saveTone: SaveTone;
   savedAtLabel: string;
+  loadError: string | null;
   copied: boolean;
   importOpen: boolean;
   setImportOpen: (open: boolean) => void;
@@ -230,6 +234,14 @@ export function useRecipePersistence({
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [savedSignature, setSavedSignature] = useState("");
   const [saveLoading, setSaveLoading] = useState(false);
+  // The signature a save failed at: autosave waits for the content to change before retrying,
+  // instead of re-toasting every 800ms.
+  const [saveErrorSignature, setSaveErrorSignature] = useState<string | null>(
+    null,
+  );
+  // Set when the stored payload would not import. The store then holds an empty recipe, so
+  // autosave stays off: it would overwrite the real recipe with that empty one.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
 
@@ -244,8 +256,13 @@ export function useRecipePersistence({
   );
   const isDirty =
     savedSignature.length > 0 && currentSignature !== savedSignature;
-  const saveTone: SaveTone =
-    !isDirty && Boolean(lastSavedAt) ? "success" : "error";
+  const saveTone: SaveTone = loadError
+    ? "unloaded"
+    : saveErrorSignature === currentSignature
+      ? "failed"
+      : !isDirty && Boolean(lastSavedAt)
+        ? "success"
+        : "error";
   const savedAtLabel = formatSavedLabel(lastSavedAt);
 
   useEffect(() => {
@@ -255,14 +272,23 @@ export function useRecipePersistence({
     setWorkflowName(nextName);
     setLastSavedAt(initialSavedAt);
     setCopied(false);
+    setSaveErrorSignature(null);
 
     const parsed = importRecipePayload(JSON.stringify(initialPayload), {
       preserveUnstructuredUploads: true,
     });
     if (parsed.snapshot) {
       loadRecipe(parsed.snapshot);
+      setLoadError(null);
     } else {
       console.error("Failed to load recipe payload.", parsed.errors);
+      const reason = parsed.errors[0] ?? "Invalid recipe payload.";
+      setLoadError(reason);
+      // Keyed, so a re-run of this effect (a fresher copy of the same record) does not stack toasts.
+      toast.error("Couldn't load this recipe", {
+        id: `recipe-load-error:${recipeId}`,
+        description: reason,
+      });
     }
 
     const payload = getCurrentPayloadFromStore();
@@ -296,9 +322,13 @@ export function useRecipePersistence({
       });
       setLastSavedAt(result.updatedAt);
       setSavedSignature(buildSignature(nextName, currentPayload));
+      setSaveErrorSignature(null);
+      // An explicit save replaced the stored recipe, so there is nothing left to protect.
+      setLoadError(null);
       drainQueuedUploadCleanups(currentPayload);
     } catch (error) {
       console.error("Save recipe failed:", error);
+      setSaveErrorSignature(buildSignature(nextName, currentPayload));
       toastError("Save failed", "Could not save recipe.");
     } finally {
       setSaveLoading(false);
@@ -306,14 +336,26 @@ export function useRecipePersistence({
   }, [currentPayload, onPersistRecipe, recipeId, saveLoading, workflowName]);
 
   useEffect(() => {
-    if (!isDirty || saveLoading) {
+    if (
+      !isDirty ||
+      saveLoading ||
+      loadError !== null ||
+      saveErrorSignature === currentSignature
+    ) {
       return;
     }
     const timeoutId = window.setTimeout(() => {
       void persistRecipe();
     }, 800);
     return () => window.clearTimeout(timeoutId);
-  }, [isDirty, persistRecipe, saveLoading]);
+  }, [
+    currentSignature,
+    isDirty,
+    loadError,
+    persistRecipe,
+    saveErrorSignature,
+    saveLoading,
+  ]);
 
   // Drain queued cleanups even when autosave is skipped: a net-zero edit (add then remove an
   // unstructured seed before the 800ms debounce) keeps isDirty false, so the autosave effect never
@@ -321,11 +363,12 @@ export function useRecipePersistence({
   // recipe, and drain skips the uid it still references, so only dirs no saved recipe points at are
   // deleted (keeps the save-first invariant).
   useEffect(() => {
-    if (!initialRecipeReady || isDirty || saveLoading) {
+    // After a failed load the store is not the saved recipe, so "not dirty" proves nothing.
+    if (!initialRecipeReady || isDirty || saveLoading || loadError !== null) {
       return;
     }
     drainQueuedUploadCleanups(currentPayload);
-  }, [currentPayload, initialRecipeReady, isDirty, saveLoading]);
+  }, [currentPayload, initialRecipeReady, isDirty, loadError, saveLoading]);
 
   const copyRecipe = useCallback(async (): Promise<void> => {
     setCopied(false);
@@ -366,6 +409,7 @@ export function useRecipePersistence({
     saveLoading,
     saveTone,
     savedAtLabel,
+    loadError,
     copied,
     importOpen,
     setImportOpen,

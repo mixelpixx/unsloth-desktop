@@ -195,7 +195,8 @@ class TestOllamaAndFallback:
 
     def test_generic_oom_keeps_memory_message(self):
         msg = _classify(_OOM_OUT, "/models/big.gguf", "local/big")
-        assert "enough memory" in msg.lower()
+        # A CUDA allocation failure now names GPU memory outright.
+        assert "not enough gpu memory" in msg.lower()
         assert "diffusion" not in msg.lower()
 
     def test_empty_output_is_safe(self):
@@ -515,7 +516,7 @@ class TestMissingSharedLibrary:
 
     def test_a_normal_failure_is_untouched(self):
         msg = _classify(_OOM_OUT, "/models/big.gguf", "local/big", 1)
-        assert "enough memory" in msg.lower()
+        assert "not enough gpu memory" in msg.lower()
         assert "system library" not in msg
 
     def test_a_named_arch_wins_over_exit_127(self):
@@ -823,9 +824,11 @@ class TestANonGgufFile:
 
 
 class TestStartupDiagnostics:
+    # No allocation line: a GPU buffer that failed to allocate now has its own
+    # message (TestGpuMemoryStartFailure), and this pins the unknown fallback.
     _UNKNOWN_OUT = (
         "build: 9415 (06d26dfd) with Apple clang version 17.0.0 for arm64-apple-darwin24.6.0\n"
-        "ggml_metal_init: error: failed to allocate buffer\n"
+        "ggml_metal_init: picking default device: Apple M2\n"
         "GGML_ASSERT(ctx->device != nil) failed"
     )
 
@@ -867,6 +870,167 @@ class TestStartupDiagnostics:
         assert "Images page" in msg
         assert "Full log" not in msg
         assert "llama-server output:" not in msg
+
+
+def _unused_tensor_line(i: int) -> str:
+    return (
+        f"llama_model_load: model has unused tensor blk.{i}.nextn.eh_proj.weight "
+        "(size = 26214400 bytes) -- ignoring"
+    )
+
+
+class TestGpuBufferAllocationFailure:
+    """A failed GPU allocation is a memory problem, not a bad file.
+
+    Field report: Windows, 2x 24 GB cards. Another program held ~13.5 GB on each,
+    which Studio's nvidia-smi probe saw, but llama-server's own probe reported
+    ~23 GB free, so its fit planned a full GPU load and cudaMalloc failed. The
+    user was told to check that the GGUF was valid, above ~2 KB of "unused
+    tensor" lines.
+    """
+
+    _ALLOC_FAILURE = [
+        "ggml_backend_cuda_buffer_type_alloc_buffer: allocating 7012.00 MiB on device 0: "
+        "cudaMalloc failed: out of memory",
+        "alloc_tensor_range: failed to allocate CUDA0 buffer of size 7352614912",
+        "llama_model_load: error loading model: unable to allocate CUDA0 buffer",
+        "llama_model_load_from_file_impl: failed to load model",
+    ]
+    _FIELD_OUT = "\n".join(
+        ["load_tensors: offloading 48 repeating layers to GPU"]
+        + [_unused_tensor_line(i) for i in range(30)]
+        + _ALLOC_FAILURE
+    )
+
+    def test_the_field_failure_names_gpu_memory_not_the_file(self, tmp_path):
+        log = tmp_path / "llama-1-port-8080.log"
+        msg = _classify(self._FIELD_OUT, "/models/big.gguf", "local/big", 1, None, log)
+        assert msg.startswith("Not enough GPU memory to load this model")
+        assert "could not allocate a GPU buffer" in msg
+        # Leads with the cause Studio cannot fix for the user: another program.
+        head = msg.split("\n\n", 1)[0]
+        assert head.index("Another program") < head.index("lower the context length")
+        assert "close or unload it there" in head
+        assert "eject other models" in head
+        # System RAM stays, but as the secondary clause.
+        assert head.index("system RAM") > head.index("eject other models")
+        assert "GGUF file is valid" not in msg
+        assert "llama-server failed to start" not in msg
+        # Nothing the route rewrites to "not supported yet" on sight.
+        assert not any(
+            phrase in head
+            for phrase in ("is not supported", "does not support", "not yet supported")
+        )
+        # The evidence and the log stay attached.
+        assert "cudaMalloc failed: out of memory" in msg
+        assert f"Full log: {log}" in msg
+
+    def test_the_summary_line_alone_is_enough(self):
+        # A short tail can keep only llama_model_load's own summary of the failure.
+        out = "llama_model_load: error loading model: unable to allocate CUDA0 buffer"
+        msg = _classify(out, "/models/big.gguf", "local/big", 1)
+        assert msg.startswith("Not enough GPU memory to load this model")
+
+    @pytest.mark.parametrize(
+        "out",
+        [
+            "ggml_vulkan: alloc_tensor_range: failed to allocate Vulkan0 buffer of size 1024",
+            "ggml_backend_hip_buffer_type_alloc_buffer: failed to allocate ROCm0 buffer",
+            "ggml_metal_buffer_type_alloc_buffer: error: failed to allocate buffer, size = 9000 MiB",
+        ],
+    )
+    def test_other_gpu_backends_are_named_too(self, out):
+        assert _classify(out, "/models/x.gguf", "local/x", 1).startswith(
+            "Not enough GPU memory to load this model"
+        )
+
+    @pytest.mark.parametrize(
+        "out",
+        [
+            # Host allocations: nothing ties them to a GPU, so not this message.
+            "llama_model_load: error loading model: unable to allocate buffer",
+            "std::bad_alloc: out of memory",
+            "ggml_cuda_init: found 1 CUDA device\nstd::bad_alloc: out of memory",
+        ],
+    )
+    def test_a_host_allocation_failure_keeps_the_fallback(self, out):
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert msg.startswith("llama-server failed to start.")
+
+    def test_a_specific_diagnosis_still_wins(self):
+        msg = _classify(_QWEN_IMAGE_OUT + "\n" + _OOM_OUT, "/models/q.gguf", "local/q", 1)
+        assert "Images page" in msg
+        assert "Not enough GPU memory" not in msg
+
+    def test_unused_tensor_noise_is_dropped_from_the_tail(self):
+        msg = _classify(self._FIELD_OUT, "/models/big.gguf", "local/big", 1)
+        assert "model has unused tensor blk." not in msg
+        assert '[30 harmless "model has unused tensor" lines omitted]' in msg
+        # Everything else survives, in order.
+        tail = msg.split("llama-server output:\n", 1)[1]
+        assert tail.index("offloading 48 repeating layers") < tail.index("unable to allocate CUDA0")
+
+    def test_a_tail_of_nothing_but_noise_still_says_what_was_dropped(self):
+        out = "\n".join(_unused_tensor_line(i) for i in range(3))
+        msg = LlamaCppBackend._with_startup_diagnostics("base", out, None)
+        assert msg == (
+            'base\n\nllama-server output:\n[3 harmless "model has unused tensor" lines omitted]'
+        )
+
+    def test_a_tail_without_noise_is_unchanged(self):
+        out = "line one\nline two"
+        msg = LlamaCppBackend._with_startup_diagnostics("base", out, None)
+        assert msg == "base\n\nllama-server output:\nline one\nline two"
+
+    def test_the_note_is_not_itself_a_notice(self):
+        # A second pass (the classifier's tail, then the diagnostics block) must keep it.
+        note = LlamaCppBackend._unused_tensor_note(7)
+        assert not LlamaCppBackend._is_unused_tensor_notice(note)
+        assert LlamaCppBackend._without_unused_tensor_lines(note) == (note, 0)
+
+
+class TestStartupOutputTail:
+    """The 50-line window a failed start is classified from.
+
+    The notices used to be counted INTO that window, so a model with more unused
+    tensors than the window holds pushed the allocation failure out of it, and
+    the classifier never saw the line that names the cause.
+    """
+
+    @staticmethod
+    def _backend(lines):
+        backend = LlamaCppBackend.__new__(LlamaCppBackend)
+        backend._stdout_lines = list(lines)
+        return backend
+
+    def test_notices_do_not_push_the_failure_out_of_the_window(self):
+        lines = (
+            ["load_tensors: offloading 48 repeating layers to GPU"]
+            + TestGpuBufferAllocationFailure._ALLOC_FAILURE[:3]
+            + [_unused_tensor_line(i) for i in range(80)]
+            + ["main: exiting due to model loading error"]
+        )
+        # What the old "\n".join(lines[-50:]) handed the classifier.
+        assert "unable to allocate CUDA0" not in "\n".join(lines[-50:])
+        out = self._backend(lines)._startup_output_tail()
+        assert "unable to allocate CUDA0 buffer" in out
+        assert "model has unused tensor blk." not in out
+        assert out.startswith('[80 harmless "model has unused tensor" lines omitted]\n')
+        msg = _classify(out, "/models/big.gguf", "local/big", 1)
+        assert msg.startswith("Not enough GPU memory to load this model")
+        # One note, not two: the diagnostics pass finds nothing left to drop.
+        assert msg.count("lines omitted]") == 1
+
+    def test_the_window_still_holds_fifty_real_lines(self):
+        lines = [f"line {i}" for i in range(120)]
+        out = self._backend(lines)._startup_output_tail()
+        assert out.split("\n") == lines[-50:]
+
+    def test_no_notices_means_no_note(self):
+        assert self._backend(["a", "b"])._startup_output_tail() == "a\nb"
+
+    def test_empty_output_is_empty(self):
+        assert self._backend([])._startup_output_tail() == ""
 
 
 class TestMacOSLoaderEdgeCases:
@@ -1817,7 +1981,7 @@ class TestRejectedArguments:
         # The two new branches sit ahead of the generic diagnosis, so this pins
         # that they do not swallow it.
         msg = _classify(_OOM_OUT, "/models/big.gguf", "local/big", 1)
-        assert "enough memory" in msg.lower()
+        assert "not enough gpu memory" in msg.lower()
         assert "argument" not in msg.lower()
 
     def test_the_argument_scan_reads_only_the_tail(self):

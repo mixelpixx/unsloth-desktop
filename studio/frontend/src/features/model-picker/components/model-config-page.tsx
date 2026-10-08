@@ -997,6 +997,11 @@ function GpuMemorySettings({
                   {d.memoryTotalGb
                     ? ` · ${Math.round(d.memoryTotalGb)} GiB`
                     : ""}
+                  {/* What another program holds shows up here, and only here: the total
+                      reads the same whether the card is idle or nearly full. */}
+                  {d.memoryFreeKnown && Number.isFinite(d.memoryFreeGb)
+                    ? ` · ${Math.max(0, d.memoryFreeGb).toFixed(1)} GiB free`
+                    : ""}
                 </span>
                 {showSplit && isGpuChecked(d.index) && (
                   <div className="ml-auto flex shrink-0 items-center gap-1">
@@ -1048,6 +1053,7 @@ function GpuMemorySettings({
                 )}
                 <Switch
                   className="panel-switch shrink-0"
+                  aria-label={`Use GPU ${d.index}`}
                   checked={isGpuChecked(d.index)}
                   onCheckedChange={() => toggleGpu(d.index)}
                   disabled={isGpuChecked(d.index) && singleGpuInUse}
@@ -2842,7 +2848,11 @@ export function ModelConfigPage({
           llamaExtraArgs: runtimeConfig.llamaExtraArgs ?? null,
         }
       : null;
-  const memoryEstimate = useMemoryEstimate(memoryEstimateRequest);
+  // Re-probes free memory with each estimate: the verdicts compare against it, and a snapshot taken
+  // before another program claimed VRAM called a load a fit that then failed at allocation.
+  const memoryEstimate = useMemoryEstimate(memoryEstimateRequest, {
+    refreshMemory: true,
+  });
   const mlxFittedWindow = targetIsMlx
     ? servedWindow(memoryEstimate.estimate?.contextFitted)
     : null;

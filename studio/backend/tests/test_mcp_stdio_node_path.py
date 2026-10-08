@@ -527,7 +527,17 @@ def test_client_does_not_touch_env_for_a_python_server(managed_node, monkeypatch
     monkeypatch.setenv("UNSLOTH_STUDIO_ALLOW_STDIO_MCP", "1")
     monkeypatch.setenv("PATH", "/usr/bin")
     client = mcp_client._client("python -m my_server", {"API_KEY": "sk-1"})
-    assert client.transport.env == {"API_KEY": "sk-1"}
+    env = client.transport.env
+    assert env["API_KEY"] == "sk-1"
+    # No managed Node prepended to a PATH of its own: the SDK's default env carries the host PATH.
+    assert not any(key.upper() == "PATH" for key in env)
+    # Beyond the configured var, only the inherited host allowlist.
+    allowlist = (
+        mcp_client._INHERITED_WINDOWS_ENV
+        + mcp_client._INHERITED_NETWORK_ENV
+        + mcp_client._INHERITED_POSIX_PROXY_ENV
+    )
+    assert set(env) - {"API_KEY"} <= set(allowlist)
 
 
 def test_windows_npx_sibling_runtime_is_the_one_validated(

@@ -143,3 +143,19 @@ export {
   TRAINING_PARAM_MODE_STORAGE_KEY,
   TRAINING_UI_PREFERENCE_KEYS,
 } from "./lib/training-ui-preferences";
+export {
+  TRAINING_FIT_PARTS,
+  type TrainingFitEstimate,
+  type TrainingFitPart,
+  type TrainingGpuDevice,
+  type TrainingGpuTarget,
+  formatFitGiB,
+  trainingFitBarGeometry,
+  trainingFitLine,
+  trainingGpuTargetOptions,
+  trainingHardwareSummary,
+  trainingStartNeedsFitConfirm,
+} from "./lib/training-fit";
+export { useTrainingFitStore } from "./stores/training-fit-store";
+export { useTrainingFitEstimate } from "./hooks/use-training-fit-estimate";
+export { useTrainingFitLineText } from "./hooks/use-training-fit-line-text";

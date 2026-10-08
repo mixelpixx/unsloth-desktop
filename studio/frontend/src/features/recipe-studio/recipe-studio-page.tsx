@@ -331,6 +331,7 @@ export function RecipeStudioPage({
     saveLoading,
     saveTone,
     savedAtLabel,
+    loadError,
     copied,
     importOpen,
     setImportOpen,
@@ -666,6 +667,8 @@ export function RecipeStudioPage({
         }}
         onNodesChange={handleNodesChange}
         onEdgesChange={handleEdgesChange}
+        // Delete as well as Backspace: the Delete key alone did nothing on a selected node.
+        deleteKeyCode={["Backspace", "Delete"]}
         onConnect={onConnect}
         onNodeClick={handleNodeClick}
         onNodeDoubleClick={handleNodeDoubleClick}
@@ -844,6 +847,16 @@ export function RecipeStudioPage({
               void persistRecipe();
             }}
           />
+          {loadError && (
+            <div
+              role="alert"
+              className="border-b border-destructive/30 bg-destructive/5 px-4 py-2 text-xs text-destructive"
+            >
+              This recipe could not be loaded ({loadError}), so the editor shows
+              an empty recipe. Autosave is off to keep the saved copy; clicking
+              Save replaces it with what is shown here.
+            </div>
+          )}
           <div
             data-tour="recipe-canvas"
             className="flex min-h-0 w-full flex-1 rounded-t-none"

@@ -51,9 +51,12 @@ test("the message names the operation and points at the model's status", () => {
 });
 
 test("only the two padded routes require a payload", () => {
-  // Scoped: parseJsonOrThrow serves ~30 endpoints, some legitimately with no body.
+  // Scoped: parseJsonOrThrow serves ~30 endpoints, some legitimately with no body. /load reads
+  // its body first (to spot the memory guardrail's 409), so it hands the body it already read.
   const labelled = [
-    ...chatApi.matchAll(/parseJsonOrThrow<[^>]*>\(\s*response,\s*"([^"]+)"/g),
+    ...chatApi.matchAll(
+      /(?:parseJsonOrThrow<[^>]*>\(\s*response,|parsedBodyOrThrow<[^>]*>\(\s*response,\s*body,)\s*"([^"]+)"/g,
+    ),
   ].map((match) => match[1]);
   assert.deepEqual(labelled, ["Model load", "Model unload"]);
   assert.ok(chatApi.includes("assertCompletedPaddedBody(body, paddedLabel)"));

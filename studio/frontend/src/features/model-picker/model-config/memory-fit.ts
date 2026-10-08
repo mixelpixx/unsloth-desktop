@@ -206,9 +206,11 @@ export interface MemoryFitResult {
   cpuOnly: boolean;
   /** The GPU verdict before the free-memory warning is folded in. */
   rawGpuFit: MemoryFitVerdict;
-  /** What the GPU figure is coloured with: rawGpuFit, nudged to tight under pressure. */
+  /** What the GPU figure is coloured with: rawGpuFit, nudged to tight under pressure, and to
+   *  exceeds when free VRAM cannot hold the share and no unload would free more. */
   gpuFit: MemoryFitVerdict;
-  /** The footprint against post-unload availability, capped at a warning by its caller. */
+  /** The footprint against post-unload availability. A warning in gpuFit, unless nothing is
+   *  reclaimable, when its "exceeds" is gpuFit's too. */
   freeGpuFit: MemoryFitVerdict;
   gpuPressured: boolean;
   /** Bytes this placement pins outside the GPU. */
@@ -230,7 +232,8 @@ export interface MemoryFitResult {
  *  refuses a load whose offloaded weights exceed psutil's AVAILABLE memory less a reserve,
  *  not the physical total, so a 70 GB host share read as fitting a 128 GB box with 32 GB
  *  free. The free-memory verdicts here WARN instead: the bytes a pending load reclaims are
- *  mostly the resident model's own, which Studio unloads first. */
+ *  mostly the resident model's own, which Studio unloads first. With nothing to reclaim, free
+ *  VRAM that cannot hold the GPU share is an "exceeds", since no unload will change it. */
 export function resolveMemoryFit(
   estimate: MemoryFitEstimate,
   capacity: MemoryFitCapacity,
@@ -255,11 +258,12 @@ export function resolveMemoryFit(
   // One pool means the WHOLE load draws on that memory, so the pressure question goes to the
   // total rather than a GPU share that is not a separate reservation. Asking it of gpuBytes
   // alone let a partly CPU-offloaded load on a Vulkan iGPU look comfortable.
+  const freeGpuCredit = singleMemoryPool ? reclaimableTotal : reclaimableGpu;
   const freeGpuFit = classifyAvailableMemory(
     singleMemoryPool ? estimate.totalBytes : estimate.gpuBytes,
     capacity.freeGpuCapacityGb,
     capacity.freeGpuCapacityKnown,
-    singleMemoryPool ? reclaimableTotal : reclaimableGpu,
+    freeGpuCredit,
     capacity.freeGpuReserveDeficitGb,
   );
   const gpuPressured = freeGpuFit === "exceeds" || freeGpuFit === "tight";
@@ -279,7 +283,16 @@ export function resolveMemoryFit(
   );
   const hostPressured =
     usableHostFit === "exceeds" || usableHostFit === "tight";
-  const gpuFit = rawGpuFit === "fits" && gpuPressured ? "tight" : rawGpuFit;
+  // The free reading only warns while an unload could still change it: the resident model's
+  // bytes come back first, and that credit is an estimate. With nothing to reclaim it is what the
+  // load will actually meet, so a share it cannot hold is red, not amber. A card that held the
+  // load on paper while other processes held the VRAM read "tight", and the load then failed.
+  const gpuFit: MemoryFitVerdict =
+    freeGpuFit === "exceeds" && freeGpuCredit === 0
+      ? "exceeds"
+      : rawGpuFit === "fits" && gpuPressured
+        ? "tight"
+        : rawGpuFit;
   // The host share must fit host RAM on its own: unused VRAM cannot hold bytes pinned outside
   // the GPU, so the combined ceiling alone called a 70 GB CPU placement a fit on a 24 GB card
   // plus 64 GB of RAM. Skipped where the two are one pool.
@@ -452,20 +465,29 @@ export function resolveMemoryAdvisory(
     };
   }
   if (verdicts.gpuFit === "exceeds") {
+    // The card holds it on paper, but not what is free on it right now.
+    if (verdicts.rawGpuFit !== "exceeds") {
+      return {
+        tone: "warn",
+        text: "Exceeds the GPU memory free right now. Free VRAM, or try Auto context or fewer GPU layers; loading may fail.",
+      };
+    }
     return {
       tone: "warn",
       text: "Exceeds GPU memory. Try Auto context or fewer GPU layers; loading may still fail.",
     };
   }
+  // Amber, not body text: a load that cannot get the memory it needs fails at allocation, and
+  // read as a fit it was the last thing the user was told before that failure.
   if (verdicts.hostPressured) {
     return {
-      tone: "muted",
+      tone: "warn",
       text: "Fits system RAM, but little is free right now. Free memory, or try a shorter context or smaller model.",
     };
   }
   if (verdicts.rawGpuFit === "fits" && verdicts.gpuPressured) {
     return {
-      tone: "muted",
+      tone: "warn",
       text: "Fits this GPU, but little VRAM is free right now. Free memory or try Auto context.",
     };
   }

@@ -27,6 +27,8 @@ async def load_with_tensor_fallback(
     extra_args: Optional[list[str]],
     label: str = "",
     cancelled: Optional[Callable[[], bool]] = None,
+    tensor_engaged: Optional[Callable[[], Optional[bool]]] = None,
+    is_gpu_memory_failure: Optional[Callable[[BaseException], bool]] = None,
 ) -> bool:
     """Run a GGUF load with the tensor-parallel -> layer-split auto-fallback.
 
@@ -46,8 +48,21 @@ async def load_with_tensor_fallback(
     cancellation: ``attempt_load`` also returns False when the load was
     cancelled, so without this the helper would restart a load the user just
     cancelled.
+
+    ``tensor_engaged()`` reports whether the failed attempt actually LAUNCHED
+    tensor parallel (True / False), or None when it cannot say (nothing was
+    spawned). A request is not a launch: the planner downgrades tensor to layer
+    split when the pooled budget cannot hold it, and retrying that relaunched an
+    identical layer command while blaming tensor parallelism. False skips the
+    retry and lets the first failure stand.
+
+    ``is_gpu_memory_failure(exc)`` marks a GPU allocation failure. It only decides
+    when ``tensor_engaged`` cannot: a tensor launch that ran out of GPU memory still
+    retries, since layer split is a different placement and lets llama.cpp's fitter
+    move layers to system RAM, which tensor mode cannot.
     """
     tensor_requested = _effective_tensor_parallel(extra_args, requested_tensor)
+    failure: Optional[BaseException] = None
     try:
         success = await attempt_load(requested_tensor, extra_args)
     except Exception as exc:
@@ -55,6 +70,7 @@ async def load_with_tensor_fallback(
             raise
         logger.warning("Tensor-parallel load raised for '%s': %s", label, exc)
         success = False
+        failure = exc
 
     if success or not tensor_requested:
         return success
@@ -63,6 +79,36 @@ async def load_with_tensor_fallback(
     # relaunch the cancelled load.
     if cancelled is not None and cancelled():
         return success
+
+    engaged: Optional[bool] = None
+    if tensor_engaged is not None:
+        try:
+            engaged = tensor_engaged()
+        except Exception:
+            engaged = None
+    if engaged is False:
+        # The relaunch would differ only by an explicit --split-mode layer, the default the
+        # failed launch already ran with, so it fails the same way and doubles the wait.
+        logger.warning(
+            "Tensor-parallel was requested for '%s' but this load ran layer split, so "
+            "there is no layer-split retry to make; reporting the failure as is",
+            label,
+        )
+        if failure is not None:
+            raise failure
+        return success
+    if engaged is None and failure is not None and is_gpu_memory_failure is not None:
+        try:
+            out_of_gpu_memory = bool(is_gpu_memory_failure(failure))
+        except Exception:
+            out_of_gpu_memory = False
+        if out_of_gpu_memory:
+            logger.warning(
+                "Load of '%s' ran out of GPU memory; not retrying with layer split, "
+                "which cannot free that memory",
+                label,
+            )
+            raise failure
 
     logger.warning(
         "Tensor-parallel load failed for '%s'; retrying with layer split "

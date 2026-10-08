@@ -125,9 +125,13 @@ function buildRelativeSaveDirectory(
   checkpoint: string | null,
 ): string {
   if (exportMethod === "gguf") {
+    // Every run has a "checkpoint-500", so the checkpoint alone would let runs overwrite each
+    // other's GGUF folder. The run's own final save is listed under the run name itself.
     const rawName =
       sourceMode === "checkpoint"
-        ? (checkpoint ?? selectedModelIdx ?? sourceBaseModelName)
+        ? selectedModelIdx && checkpoint && checkpoint !== selectedModelIdx
+          ? `${selectedModelIdx}-${checkpoint}`
+          : (checkpoint ?? selectedModelIdx ?? sourceBaseModelName)
         : sourceBaseModelName;
     return `${safePathSegment(rawName)}-GGUF`;
   }

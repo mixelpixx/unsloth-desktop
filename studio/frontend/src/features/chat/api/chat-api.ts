@@ -19,10 +19,12 @@ import { consumeNativePathToken } from "@/features/native-intents/api";
 // eslint-disable-next-line no-restricted-imports
 import { checkDiskSpace } from "@/features/settings/low-disk-check";
 import { formatApiErrorBody } from "@/lib/format-fastapi-error";
+import { memoryOvercommitVerdict } from "@/lib/load-verdict";
 import {
   type ModelRuntime,
   withModelLoadNotice,
 } from "@/lib/model-lifecycle-events";
+import { requestMemoryOvercommitConsent } from "../memory-overcommit-consent";
 import { showLoadWarning } from "../utils/load-warning-toast";
 import type {
   MessageRecord,
@@ -188,6 +190,15 @@ async function parseJsonOrThrow<T>(
   paddedLabel?: string,
 ): Promise<T> {
   const body = await response.json().catch(() => null);
+  return parsedBodyOrThrow<T>(response, body, paddedLabel);
+}
+
+/** `parseJsonOrThrow` for a body already read, so a caller can inspect it first. */
+function parsedBodyOrThrow<T>(
+  response: Response,
+  body: unknown,
+  paddedLabel?: string,
+): T {
   if (!response.ok) {
     throw new Error(parseErrorText(response.status, body));
   }
@@ -263,6 +274,16 @@ export async function getActiveGenerations(): Promise<ActiveGenerationsResponse>
   return parseJsonOrThrow<ActiveGenerationsResponse>(response);
 }
 
+/** A load the user called off (a dismissed token prompt, Cancel on "Load anyway"), as opposed to
+ *  one that failed: callers skip the error toast for these. */
+export function isUserCancelledLoad(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { unslothUserCancelled?: unknown }).unslothUserCancelled === true
+  );
+}
+
 export async function loadModel(
   payload: LoadModelRequest,
   options?: {
@@ -296,18 +317,45 @@ export async function loadModel(
       // Throttled like every other caller, so picking through several models costs one read.
       void checkDiskSpace();
       try {
-        const response = await authFetch("/api/inference/load", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            ...payload,
-            hf_token: preparedToken.token,
-            native_path_lease: payload.nativePathLease ?? null,
-            nativePathLease: undefined,
-          }),
-          signal: options?.signal,
-        });
-        const loaded = await parseJsonOrThrow<LoadModelResponse>(response, "Model load");
+        const postLoad = (allowMemoryOvercommit: boolean) =>
+          authFetch("/api/inference/load", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ...payload,
+              hf_token: preparedToken.token,
+              native_path_lease: payload.nativePathLease ?? null,
+              nativePathLease: undefined,
+              // Only once the user has said so; omitted otherwise, so an older backend that
+              // predates the field never sees it.
+              ...(allowMemoryOvercommit ? { allow_memory_overcommit: true } : {}),
+            }),
+            signal: options?.signal,
+          });
+        let response = await postLoad(payload.allow_memory_overcommit === true);
+        let body: unknown = await response.json().catch(() => null);
+        // The memory guardrail refused: the backend judged this load too large for the memory
+        // free right now, and left whatever was loaded alone. Asked HERE rather than by each
+        // caller so every surface that loads a model gets the same question, and retried with
+        // the same request (load_request_id included, so a Stop still reaches it).
+        const overcommit = memoryOvercommitVerdict(response.status, body);
+        if (overcommit && payload.allow_memory_overcommit !== true) {
+          const decision = await requestMemoryOvercommitConsent(
+            { modelLabel: payload.model_path, verdict: overcommit },
+            options?.signal,
+          );
+          if (options?.signal?.aborted)
+            throw options.signal.reason ?? new DOMException("Aborted", "AbortError");
+          if (decision !== "load") {
+            // The marker every caller already reads as "the user said no", not a failure.
+            throw Object.assign(new Error("Model load cancelled."), {
+              unslothUserCancelled: true,
+            });
+          }
+          response = await postLoad(true);
+          body = await response.json().catch(() => null);
+        }
+        const loaded = parsedBodyOrThrow<LoadModelResponse>(response, body, "Model load");
         // Unconditional: absent on nearly every load, anything malformed is ignored,
         // and the model is already resident by the time this runs. Both identities are
         // passed -- a cached Hub candidate is requested by its loadId while the runtime

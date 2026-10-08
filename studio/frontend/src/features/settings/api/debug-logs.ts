@@ -24,6 +24,9 @@ export interface DebugLogSource {
   sizeBytes: number;
   modifiedAt: number;
   isCurrent: boolean;
+  /** An MCP server's log under the server's name. Null for the other families and on
+   * a backend older than this field, where the picker shows `label`. */
+  displayName: string | null;
 }
 
 export interface DebugLogSources {
@@ -77,6 +80,10 @@ export async function loadDebugLogSources(
       sizeBytes: Number(source.size_bytes ?? 0),
       modifiedAt: Number(source.modified_at ?? 0),
       isCurrent: Boolean(source.is_current),
+      displayName:
+        typeof source.display_name === "string" && source.display_name
+          ? source.display_name
+          : null,
     })),
     defaultSourceId: body.default_source_id ?? null,
     matchedSourceId: body.matched_source_id ?? null,

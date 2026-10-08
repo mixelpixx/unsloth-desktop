@@ -142,8 +142,12 @@ KNOWN_UNCLASSIFIED_POLLS: frozenset[str] = frozenset()
 #
 # Chat detail and fork polls are included in the busy replay at 60 heartbeat lines.
 # Media milestones remove 120 access lines, reducing the combined replay from 299 to 179.
-STEADY_IDLE_LINE_ENVELOPE = 1170
-BUSY_LINE_ENVELOPE = 195
+#
+# Ratcheted again when the quiet-poll heartbeat went from 10s to 60s (a field server log
+# was 41% /api/inference/status and /monitor lines at their ~10s cadence): idle measured
+# 270 and busy 30 afterwards. Same headroom as before on top, 60 and 15 lines.
+STEADY_IDLE_LINE_ENVELOPE = 330
+BUSY_LINE_ENVELOPE = 45
 
 # One-shot requests the app makes once on startup. Present so the boot window is not
 # mistaken for steady state, and so a mutation record and a failure record exist to assert

@@ -3,6 +3,7 @@
 
 import { accountTransitionPending } from "@/lib/account-transition";
 import { apiUrl, getApiPort, isTauri } from "@/lib/api-base";
+import { reportTransportFailure } from "@/lib/connection-monitor";
 import {
   clearAuthTokens,
   getAuthToken,
@@ -240,6 +241,13 @@ async function nativeBackendIsGone(): Promise<boolean> {
   }
 }
 
+/** Every tagged failure goes through here, so the connection monitor hears each one before the
+ *  caller can toast it: that ordering is what lets the banner stand in for the toast. */
+function reportedTransportFailure<T extends Error>(failure: T): T {
+  reportTransportFailure(failure.message);
+  return failure;
+}
+
 async function asTransportFailure(err: unknown): Promise<unknown> {
   // fetch TypeError = offline | backend down | CORS/DNS. Tagged so callers tell "never reached"
   // from "rejected"; under Tauri the launcher is asked before claiming the backend is gone.
@@ -249,24 +257,30 @@ async function asTransportFailure(err: unknown): Promise<unknown> {
     typeof navigator !== "undefined" &&
     navigator.onLine === false
   ) {
-    return Object.assign(
-      new Error(
-        "You appear to be offline. Check your network connection and try again.",
+    return reportedTransportFailure(
+      Object.assign(
+        new Error(
+          "You appear to be offline. Check your network connection and try again.",
+        ),
+        { unslothTransportFailure: true },
       ),
-      { unslothTransportFailure: true },
     );
   }
   // A failed fetch in the webview is not proof the backend died, and "please relaunch it"
   // throws away a running backend and whatever it has in flight.
   if (await nativeBackendIsAlive()) {
-    return Object.assign(new Error(BACKEND_NOT_ANSWERING_MESSAGE), {
-      unslothTransportFailure: true,
-      unslothBackendStillRunning: true,
-    });
+    return reportedTransportFailure(
+      Object.assign(new Error(BACKEND_NOT_ANSWERING_MESSAGE), {
+        unslothTransportFailure: true,
+        unslothBackendStillRunning: true,
+      }),
+    );
   }
-  return Object.assign(new Error(BACKEND_NOT_RUNNING_MESSAGE), {
-    unslothTransportFailure: true,
-  });
+  return reportedTransportFailure(
+    Object.assign(new Error(BACKEND_NOT_RUNNING_MESSAGE), {
+      unslothTransportFailure: true,
+    }),
+  );
 }
 
 async function retryWithCurrentToken(

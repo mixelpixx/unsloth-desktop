@@ -789,3 +789,28 @@ def test_verbose_restores_every_thread_poll_line(logs, monkeypatch):
     for _ in range(3):
         _run(mw(_http_scope("/api/chat/threads/abc"), _noop_receive, _drop))
     assert len(_paths_logged(logs)) == 3
+
+
+def test_the_status_poll_default_window_outlasts_the_poll():
+    """Field log: /api/inference/status and /monitor, polled every ~10.3s, were 41% of the
+    server log. The 10s default stamps only on emit, so a poll as slow as the window was
+    never inside one and every request logged anyway."""
+    # The default as written, not whatever this shell exports (the override still works).
+    source = Path(hmod.__file__).read_text(encoding = "utf-8")
+    match = re.search(
+        r'_QUIET_POLL_DEDUP_MS = _env_int\("UNSLOTH_STUDIO_ACCESS_LOG_POLL_DEDUP_MS", (\d+)\)', source
+    )
+    assert match is not None
+    assert int(match.group(1)) == 60000
+
+
+@pytest.mark.parametrize("window_ms,expected", [(10000, 59), (60000, 10)])
+def test_a_ten_second_poll_collapses_only_under_the_wider_window(monkeypatch, window_ms, expected):
+    monkeypatch.setattr(hmod, "_QUIET_POLL_DEDUP_MS", window_ms)
+    mw = LoggingMiddleware(_status_app(200))
+    # Ten minutes of the field cadence.
+    logged = sum(
+        not mw._is_redundant_repeat("GET", "/api/inference/status", b"", 200, i * 10.3)
+        for i in range(59)
+    )
+    assert logged == expected

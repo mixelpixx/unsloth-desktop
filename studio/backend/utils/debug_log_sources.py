@@ -10,13 +10,15 @@ import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-# (subdirectory under a studio home, filename glob). backend-* is the Tauri shell's capture of backend stdout, and the only record that exists when the backend dies before disk logging starts. Python writers are run.py:_setup_server_disk_logging and the llama / diffusion runners in core/inference/llama_cpp.py; the desktop families come from src-tauri/src/diagnostics/phase_log.rs and land in the logs directory ITSELF, with tauri.log at the home root.
+# (subdirectory under a studio home, filename glob). backend-* is the Tauri shell's capture of backend stdout, and the only record that exists when the backend dies before disk logging starts. Python writers are run.py:_setup_server_disk_logging, the llama / diffusion runners in core/inference/llama_cpp.py and, for mcp, each local-program MCP server's stderr (core/inference/mcp_client.py:_StdioLaunch.open_log, one file per command, masked as it is written); the desktop families come from src-tauri/src/diagnostics/phase_log.rs and land in the logs directory ITSELF, with tauri.log at the home root.
+MCP_FAMILY = "mcp"
 FAMILIES: dict[str, tuple[str, str]] = {
     "server": ("logs/server", "server-*.log"),
     "llama-server": ("logs/llama-server", "llama-*.log"),
     "diffusion-server": ("logs/diffusion-server", "diffusion-*.log"),
+    MCP_FAMILY: ("logs/mcp", "*.log"),
     "desktop-backend": ("logs", "backend-*.log"),
     "desktop-install": ("logs", "install-*.log"),
     "desktop-update": ("logs", "update-*.log"),
@@ -26,6 +28,10 @@ FAMILIES: dict[str, tuple[str, str]] = {
 
 # Per family, so a busy host cannot make the picker unusable. Several, not one: the llama runner writes a file per load ATTEMPT, so after a retry the useful one is often not the newest.
 MAX_SOURCES_PER_FAMILY = 10
+
+# Families whose file names carry no time (an MCP log is <program>-<command digest>.log, appended to on every start), so the name presort in _family_files would keep arbitrary files. These are stat'ed instead, at most this many: there is one file per distinct command ever run, not one per attempt.
+_UNTIMED_FAMILIES = frozenset({MCP_FAMILY})
+_MAX_UNTIMED_ENTRIES = 500
 
 _DIGEST_CHARS = 16
 
@@ -39,6 +45,9 @@ class LogSource:
     size_bytes: int
     modified_at: float
     is_current: bool
+    # What the picker shows instead of the file name: an MCP log is named after the server that wrote it (else its
+    # stem). None for every other family.
+    display_name: Optional[str] = None
 
 
 def candidate_roots() -> list[Path]:
@@ -127,7 +136,10 @@ def _family_files(family: str) -> list[Path]:
         except OSError:
             continue
         # Nothing prunes logs/llama-server and one file is written per load ATTEMPT (11,794 on this host), so a filename presort, which tracks time order, leaves a handful to stat. Every family's filename embeds its creation time (server-YYYYmmdd-HHMMSS, llama-<epoch>, diffusion-<epoch>, desktop ms epoch), and realpath + stat on every file cost ~356ms at a 1 Hz poll.
-        entries.sort(key = lambda entry: entry.name, reverse = True)
+        if family in _UNTIMED_FAMILIES:
+            entries = sorted(entries[:_MAX_UNTIMED_ENTRIES], key = _mtime_or_zero, reverse = True)
+        else:
+            entries.sort(key = lambda entry: entry.name, reverse = True)
         entries = entries[: MAX_SOURCES_PER_FAMILY * 3]
         for entry in entries:
             try:
@@ -148,7 +160,48 @@ def _family_files(family: str) -> list[Path]:
     return [path for path, _ in ordered[:MAX_SOURCES_PER_FAMILY]]
 
 
+def _mtime_or_zero(entry: Path) -> float:
+    try:
+        return entry.stat().st_mtime
+    except (OSError, ValueError):
+        return 0.0
+
+
+def mcp_log_owners() -> dict[str, tuple[str, list[str]]]:
+    """MCP log file name -> (server display name, its configured secret values). Empty when the server
+    list cannot be read, so the family still lists, by file stem, with shape-based redaction only."""
+    try:
+        from core.inference.mcp_client import stdio_log_owners
+
+        return stdio_log_owners()
+    except Exception:
+        return {}
+
+
+def source_mask(
+    family: str,
+    path,
+    owners: Optional[dict[str, tuple[str, list[str]]]] = None,
+) -> Optional[Callable[[str], str]]:
+    """Masking a source needs on top of `redact_log_text`, to run before it: an MCP log's own server's
+    configured values (env, headers, argv credentials), which have no shape a pattern can find. The
+    writer already masks them; this covers a file an older build wrote raw. None when there is
+    nothing to add."""
+    if family != MCP_FAMILY:
+        return None
+    owners = mcp_log_owners() if owners is None else owners
+    secrets = owners.get(Path(path).name, ("", []))[1]
+    if not secrets:
+        return None
+    from core.inference.mcp_client import mask_secret_values
+
+    return lambda text: mask_secret_values(text, secrets)
+
+
 def _is_current(family: str, path: Path, newest: Optional[Path]) -> bool:
+    if family == MCP_FAMILY:
+        # Every running server appends to its own file, so "the current one" would name nothing.
+        return False
     if family == "server":
         # uvicorn is single process here, so our own pid is in the active session's filename: an exact match, not a newest-file guess. Anchored on the suffix because a substring test for "pid1234" would also match a retained ...-pid12345.log.
         return path.name.endswith(f"-pid{os.getpid()}.log")
@@ -160,6 +213,8 @@ def list_sources() -> list[LogSource]:
     for family in FAMILIES:
         files = _family_files(family)
         newest = files[0] if files else None
+        # Only when there is a file to name: it reads the server list.
+        owners = mcp_log_owners() if family == MCP_FAMILY and files else {}
         for path in files:
             try:
                 stat = path.stat()
@@ -175,6 +230,11 @@ def list_sources() -> list[LogSource]:
                     size_bytes = stat.st_size,
                     modified_at = stat.st_mtime,
                     is_current = _is_current(family, path, newest),
+                    display_name = (
+                        (owners.get(path.name, ("",))[0] or path.stem)
+                        if family == MCP_FAMILY
+                        else None
+                    ),
                 )
             )
     return sources

@@ -77,6 +77,7 @@ async function clickStopServer(outcome: Outcome) {
       "@/shared/toast": {
         toastError: (message: string) => toasts.push(message),
       },
+      "@/lib/connection-monitor": { stopConnectionMonitor: () => {} },
       "@/components/ui/alert-dialog": {
         AlertDialog: "AlertDialog",
         AlertDialogAction: "AlertDialogAction",

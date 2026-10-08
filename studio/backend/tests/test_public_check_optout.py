@@ -1,24 +1,32 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Coverage for UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK (#7307 Problem 8).
+"""Coverage for UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK (#7307 Problem 8) and the desktop default.
 
 A wildcard bind asks ifconfig.me for the public IP and check-host.net whether the
-port is reachable. Both stay on by default; setting the var skips both, which is
-what lab and privacy-sensitive deployments asked for.
+port is reachable. Both stay on by default on a server OS; setting the var skips
+both, which is what lab and privacy-sensitive deployments asked for.
+
+On Windows and macOS both are skipped by default: a desktop behind a home router
+can only be told its router is unreachable, with an ssh tunnel to the router as the
+suggested fix. UNSLOTH_STUDIO_FORCE_PUBLIC_CHECK turns them back on there, and the
+disable switch still beats it everywhere.
 """
 
 import socket
 import urllib.request
+from types import SimpleNamespace
 
 import pytest
 
 import run
 from run import (
     DISABLE_PUBLIC_CHECK_ENV,
+    FORCE_PUBLIC_CHECK_ENV,
     _resolve_external_ip,
     _verify_global_reachability,
     public_check_disabled,
+    public_check_skipped,
 )
 
 IFCONFIG = "https://ifconfig.me"
@@ -40,7 +48,8 @@ class _FakeSocket:
 
 @pytest.fixture
 def calls(monkeypatch):
-    """Record every outbound URL and fail it, so resolution reaches the LAN step."""
+    """Record every outbound URL and fail it, so resolution reaches the LAN step. On a server OS,
+    whatever this test runs on, so "by default" below means the server default."""
     seen = []
 
     def _urlopen(req, *args, **kwargs):
@@ -49,8 +58,21 @@ def calls(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
     monkeypatch.setattr(socket, "socket", lambda *a, **k: _FakeSocket())
+    monkeypatch.setattr(run, "_on_desktop_os", lambda: False)
     monkeypatch.delenv(DISABLE_PUBLIC_CHECK_ENV, raising = False)
+    monkeypatch.delenv(FORCE_PUBLIC_CHECK_ENV, raising = False)
     return seen
+
+
+@pytest.fixture
+def desktop(monkeypatch, calls):
+    """The same recorder on Windows or macOS. The logger is quietened because an unconfigured one
+    writes debug records to stdout, where a real launch filters them out at INFO."""
+    monkeypatch.setattr(run, "_on_desktop_os", lambda: True)
+    monkeypatch.setattr(run, "_stdout_color_ok", lambda: False)
+    quiet = lambda *a, **k: None
+    monkeypatch.setattr(run, "logger", SimpleNamespace(debug = quiet, info = quiet, warning = quiet))
+    return calls
 
 
 # ── public_check_disabled ───────────────────────────────────────────
@@ -140,3 +162,94 @@ def test_reachability_probe_skipped_when_disabled(monkeypatch, calls, capsys):
 
     assert not any(CHECK_HOST in url for url in calls)
     assert run._public_reachable is None, "skipping must not claim a reachability result"
+
+
+# ── the desktop default ─────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "platform, is_desktop", [("win32", True), ("darwin", True), ("linux", False)]
+)
+def test_desktop_platforms(monkeypatch, platform, is_desktop):
+    monkeypatch.setattr(run.sys, "platform", platform)
+    assert run._on_desktop_os() is is_desktop
+
+
+def test_desktop_skips_both_lookups_by_default(desktop):
+    assert public_check_disabled() is False, "the operator opt-out itself is untouched"
+    assert public_check_skipped() is True
+
+    assert _resolve_external_ip() == "192.168.1.50", "the LAN address still resolves"
+    _verify_global_reachability("95.216.11.2", 8888)
+
+    assert IFCONFIG not in desktop
+    assert not any(CHECK_HOST in url for url in desktop)
+    assert run._public_reachable is None, "skipping must not claim a reachability result"
+
+
+def test_desktop_skip_is_one_line_naming_the_lan_url(desktop, capsys):
+    _verify_global_reachability("95.216.11.2", 8888, lan_host = "192.168.1.50")
+    out = capsys.readouterr().out
+
+    assert out.count("\n") == 1, out
+    assert "http://192.168.1.50:8888/" in out
+    assert FORCE_PUBLIC_CHECK_ENV in out, "the line says how to run the check anyway"
+    assert "NOT reachable" not in out and "ssh -L" not in out
+
+
+def test_desktop_skip_brackets_an_ipv6_lan_host(desktop, capsys):
+    _verify_global_reachability("2001:4860:4860::8844", 8888, lan_host = "fd00::50")
+    assert "http://[fd00::50]:8888/" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("lan_host", ["", "0.0.0.0", "::", "127.0.0.1"])
+def test_desktop_skip_is_silent_without_a_usable_lan_address(desktop, capsys, lan_host):
+    # Nothing is looked up to fill the gap: the line is only for an address the banner already had.
+    _verify_global_reachability("95.216.11.2", 8888, lan_host = lan_host)
+    assert capsys.readouterr().out == ""
+    assert desktop == []
+
+
+def test_desktop_private_address_note_is_unchanged(desktop, capsys):
+    # The usual desktop case once ifconfig.me is skipped: the route lookup answers with a LAN address,
+    # which is decided locally, before any skip, exactly as on a server.
+    _verify_global_reachability("192.168.1.50", 8888, lan_host = "192.168.1.50")
+    assert "private/LAN address" in capsys.readouterr().out
+    assert run._public_reachable is False
+    assert desktop == []
+
+
+@pytest.mark.parametrize("raw", ["1", "true", "YES", " yes "])
+def test_force_runs_both_lookups_on_a_desktop(desktop, monkeypatch, raw):
+    monkeypatch.setenv(FORCE_PUBLIC_CHECK_ENV, raw)
+    assert public_check_skipped() is False
+
+    _resolve_external_ip()
+    _verify_global_reachability("95.216.11.2", 8888)
+
+    assert IFCONFIG in desktop
+    assert any(CHECK_HOST in url for url in desktop)
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "off", ""])
+def test_anything_else_does_not_force(desktop, monkeypatch, raw):
+    monkeypatch.setenv(FORCE_PUBLIC_CHECK_ENV, raw)
+    assert public_check_skipped() is True
+
+
+def test_disable_beats_force(desktop, monkeypatch):
+    monkeypatch.setenv(FORCE_PUBLIC_CHECK_ENV, "1")
+    monkeypatch.setenv(DISABLE_PUBLIC_CHECK_ENV, "1")
+    assert public_check_skipped() is True
+
+    _resolve_external_ip()
+    _verify_global_reachability("95.216.11.2", 8888)
+
+    assert IFCONFIG not in desktop
+    assert not any(CHECK_HOST in url for url in desktop)
+
+
+def test_server_default_is_unchanged(calls, monkeypatch):
+    assert public_check_skipped() is False
+    monkeypatch.setenv(DISABLE_PUBLIC_CHECK_ENV, "1")
+    assert public_check_skipped() is True

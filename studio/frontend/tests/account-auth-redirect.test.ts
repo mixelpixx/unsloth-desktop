@@ -29,6 +29,7 @@ for (const mode of ["single", "multi"]) {
       {
         "@/lib/api-base": { apiUrl: (path: string) => path, isTauri: false },
         "@/lib/account-transition": { accountTransitionPending: () => false },
+        "@/lib/connection-monitor": { reportTransportFailure: () => {} },
         "./session": {
           getAuthToken: () => "setup-token",
           getRefreshToken: () => null,

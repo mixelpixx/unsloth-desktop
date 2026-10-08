@@ -434,6 +434,14 @@ class LoadRequest(BaseModel):
             "replaces the llama-server every open conversation decodes on."
         ),
     )
+    allow_memory_overcommit: bool = Field(
+        False,
+        description = (
+            "Load even when the load guardrail judges this GGUF too large for the memory "
+            "free right now, instead of refusing with 409 code 'memory_overcommit'. The "
+            "user's explicit \"Load anyway\"; the load can then fail out of memory."
+        ),
+    )
 
 
 class UnloadRequest(BaseModel):
@@ -984,6 +992,56 @@ class EstimateMemoryRequest(BaseModel):
     _resolve_the_handle = field_validator("model_path")(resolve_inventory_handle)
 
 
+class LoadVerdictInfo(BaseModel):
+    """The load guardrail's plain answer: will this load fit in the memory free right now.
+
+    Computed by ``core.inference.load_verdict`` from the same estimate as the rest of the
+    response, and the same one ``/load`` acts on. ``reason`` is a stable code the UI keys its
+    copy off; ``message`` is an English sentence for logs and API callers.
+    """
+
+    level: Literal[
+        "full_gpu",
+        "fits_barely",
+        "partial_gpu",
+        "cpu",
+        "disk_streaming",
+        "likely_too_large",
+        "unknown",
+    ]
+    reason: str
+    message: str
+    gpu_need_bytes: Optional[int] = Field(
+        None, description = "GPU memory the load needs, on the card(s) in gpu_indices"
+    )
+    gpu_free_bytes: Optional[int] = Field(
+        None,
+        description = "Free on those cards now, plus what unloading Studio's resident model frees",
+    )
+    gpu_total_bytes: Optional[int] = None
+    gpu_indices: List[int] = Field(default_factory = list)
+    other_apps_bytes: Optional[int] = Field(
+        None, description = "GPU memory other programs hold on those cards, when known"
+    )
+    other_apps_note: Optional[str] = Field(
+        None,
+        description = "Which programs hold it (\"LM Studio.exe (PID 1372) ~13.8 GB on GPU 0\"). "
+        "Windows only, and only on a /load refusal: the lookup costs a counter read.",
+    )
+    ram_need_bytes: Optional[int] = None
+    ram_free_bytes: Optional[int] = None
+    runtime_bytes: Optional[int] = Field(
+        None, description = "KV cache, compute buffers and runtime state: what cannot page from disk"
+    )
+    headroom_bytes: Optional[int] = None
+    needs_confirmation: bool = Field(
+        False,
+        description = "Whether the current load guardrail mode would stop /load for an explicit "
+        "\"Load anyway\" (allow_memory_overcommit).",
+    )
+    mode: Optional[str] = Field(None, description = "The load guardrail mode this was judged under")
+
+
 class EstimateMemoryResponse(BaseModel):
     """Itemized memory an inference load would occupy, or why it could not be sized."""
 
@@ -1073,6 +1131,11 @@ class EstimateMemoryResponse(BaseModel):
         False,
         description = "True when --n-cpu-moe is set: experts move per-tensor, not "
         "per-block, so the GPU/host split above ignores it and reads high.",
+    )
+    verdict: Optional[LoadVerdictInfo] = Field(
+        None,
+        description = "The load guardrail's verdict for a GGUF load against the memory free "
+        "now. Null for MLX, for an unavailable estimate, and on a backend predating it.",
     )
 
 

@@ -128,6 +128,8 @@ from models.training import (
     DiffusionTrainingStatusResponse,
     DiffusionTrainingStopRequest,
     TRAINING_REQUEST_ID_PATTERN,
+    TrainingEstimateRequest,
+    TrainingEstimateResponse,
 )
 from models.responses import TrainingStopResponse, TrainingMetricsResponse
 from pydantic import (
@@ -1331,6 +1333,54 @@ async def get_visible_hardware_utilization(current_subject: str = Depends(get_cu
     # route.
     with gpu_query.display_reads():
         return await asyncio.to_thread(get_visible_gpu_utilization)
+
+
+@router.post("/estimate", response_model = TrainingEstimateResponse)
+async def estimate_training_memory(
+    request: TrainingEstimateRequest,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
+):
+    """
+    Price a training config against the GPUs it would run on, before Start.
+
+    The fit planner's backing route: required memory with the estimator's per-part breakdown,
+    the GPUs Start would use (gpu_ids, or auto-selection), their free memory and a verdict.
+    Reads config/metadata and GPU telemetry only, and never fails the request over a config
+    it cannot price: the verdict is "unknown" with a reason instead.
+    """
+    if managed_account():
+        validate_job_paths(request.model_dump())
+
+    from routes.training_vram import estimate_training_fit
+    from utils.hardware import ensure_hardware_detected, gpu_query
+    from utils.hardware import hardware as _hw
+
+    await asyncio.to_thread(ensure_hardware_detected)
+    hf_token = hf_token_arg(request.hf_token, allow_ambient_token = via_api_key is not True)
+    device_backend = getattr(_hw.DEVICE, "value", "") or ""
+    # Display reads: the planner re-prices on every config edit and is advisory. /start sizes and admits
+    # against fresh readings of its own, so a seconds-old free figure here decides nothing.
+    with gpu_query.display_reads():
+        result = await asyncio.to_thread(
+            estimate_training_fit,
+            model_name = request.model_name,
+            hf_token = hf_token,
+            training_type = request.training_type,
+            load_in_4bit = request.load_in_4bit,
+            four_bit_available = request.four_bit_available,
+            batch_size = request.batch_size,
+            max_seq_length = request.max_seq_length,
+            lora_rank = request.lora_r,
+            target_modules = request.target_modules,
+            gradient_checkpointing = request.gradient_checkpointing,
+            optimizer = normalize_training_optimizer_for_device(
+                request.optim,
+                device_backend = device_backend,
+            ),
+            gpu_ids = request.gpu_ids,
+        )
+    return TrainingEstimateResponse(**result)
 
 
 @router.get("/start-requests/{start_request_id}", response_model = TrainingStartRequestStatus)

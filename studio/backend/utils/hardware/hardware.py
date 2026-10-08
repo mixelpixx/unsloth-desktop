@@ -4,6 +4,7 @@
 """Hardware detection: call detect_hardware() once at FastAPI lifespan startup, then read DEVICE / DeviceType / is_apple_silicon anywhere."""
 
 import ast
+import contextvars
 import copy
 import gc
 import glob
@@ -5157,7 +5158,62 @@ def _load_config_for_gpu_estimate(model_name: str, hf_token: Optional[str] = Non
         return None
 
 
+# The training fit preview re-prices on every config edit, from the backend process itself. The exact
+# resolver below lives in unsloth, and importing unsloth there takes ~10 s and pins a ~300 MiB CUDA context
+# on GPU 0 for the life of the server, before anything has trained. Previews skip it unless unsloth is
+# already loaded; /start keeps the exact path. A ContextVar so asyncio.to_thread callers inherit it.
+_ATTENTION_PREVIEW = contextvars.ContextVar("gpu_estimate_attention_preview", default = False)
+
+
+@contextmanager
+def attention_preview_estimates():
+    token = _ATTENTION_PREVIEW.set(True)
+    try:
+        yield
+    finally:
+        _ATTENTION_PREVIEW.reset(token)
+
+
+def _model_class_for_gpu_estimate(config):
+    from transformers import AutoModel, AutoModelForCausalLM
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    model_type = getattr(config, "model_type", None)
+    config_class = CONFIG_MAPPING[model_type] if model_type in CONFIG_MAPPING else config.__class__
+    for auto_model in (AutoModelForCausalLM, AutoModel):
+        mapping = getattr(auto_model, "_model_mapping", None)
+        if mapping is None:
+            continue
+        try:
+            if config_class in mapping:
+                return mapping[config_class]
+        except Exception:
+            continue
+    return None
+
+
+def _approximate_attention_impl_for_gpu_estimate(config) -> str:
+    """CUDA-free stand-in for the preview: the model class's own sdpa / flash / flex flags. It misses
+    unsloth's per-model exclusions, so a model unsloth forces to eager prices on the linear path here;
+    /start re-prices with the exact resolver before anything is placed."""
+    model_class = _model_class_for_gpu_estimate(config)
+    # The exact resolver's own answer for an unmapped class.
+    if model_class is None:
+        return "eager"
+    if getattr(model_class, "_supports_sdpa", False):
+        return "sdpa"
+    if getattr(model_class, "_supports_flash_attn", False) or getattr(
+        model_class, "_supports_flash_attn_2", False
+    ):
+        return "flash_attention_2"
+    if getattr(model_class, "_supports_flex_attn", False):
+        return "flex_attention"
+    return "eager"
+
+
 def _determine_attention_impl_for_gpu_estimate(config) -> str:
+    if _ATTENTION_PREVIEW.get() and "unsloth" not in sys.modules:
+        return _approximate_attention_impl_for_gpu_estimate(config)
     # torch.distributed is incomplete on Windows ROCm (torch._C._distributed_c10d will not import), so inject stubs into sys.modules before importing it, then patch the missing process-group helpers.
     if sys.platform == "win32" and IS_ROCM:
         # Dummy for any name torch.distributed imports from these stubs.

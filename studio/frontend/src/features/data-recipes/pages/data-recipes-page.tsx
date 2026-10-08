@@ -2,6 +2,16 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { useAppShellReadySignal } from "@/components/app-readiness";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -322,6 +332,12 @@ export function DataRecipesPage(): ReactElement {
   const [loadingTemplateId, setLoadingTemplateId] = useState<string | null>(
     null,
   );
+  // Kept after close so the dialog text does not blank out during its exit animation.
+  const [deleteTarget, setDeleteTarget] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const reloadReadySent = useRef(false);
   const tourSteps = useMemo(
     () => buildDataRecipesTourSteps({ ready, hasRecipes: recipes.length > 0 }),
@@ -411,8 +427,18 @@ export function DataRecipesPage(): ReactElement {
     }).catch(() => undefined);
   }
 
-  async function handleDeleteRecipe(recipeId: string): Promise<void> {
-    await deleteRecipe(recipeId);
+  async function handleDeleteRecipe(recipe: {
+    id: string;
+    name: string;
+  }): Promise<void> {
+    try {
+      await deleteRecipe(recipe.id);
+    } catch (error) {
+      toastError(
+        `Couldn't delete "${recipe.name}".`,
+        error instanceof Error ? error.message : undefined,
+      );
+    }
   }
 
   const isBusy = creatingRecipe || Boolean(loadingTemplateId);
@@ -536,7 +562,8 @@ export function DataRecipesPage(): ReactElement {
                     size="icon"
                     className="size-8"
                     onClick={() => {
-                      handleDeleteRecipe(recipe.id).catch(() => undefined);
+                      setDeleteTarget({ id: recipe.id, name: recipe.name });
+                      setDeleteDialogOpen(true);
                     }}
                     aria-label={`Delete ${recipe.name}`}
                   >
@@ -557,6 +584,30 @@ export function DataRecipesPage(): ReactElement {
           </div>
         )}
       </main>
+
+      <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete recipe?</AlertDialogTitle>
+            <AlertDialogDescription>
+              "{deleteTarget?.name}" will be deleted. This can't be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                if (deleteTarget) {
+                  void handleDeleteRecipe(deleteTarget);
+                }
+              }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <Dialog open={learningDialogOpen} onOpenChange={setLearningDialogOpen}>
         <DialogContent

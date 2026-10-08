@@ -525,3 +525,136 @@ def test_a_record_whose_pid_is_not_ascii_digits_is_discarded(monkeypatch, tmp_pa
 
     assert result.exit_code == 0, result.output
     assert not (tmp_path / "studio-8901-1.pid").exists()
+
+
+# ---------------------------------------------------------------------------
+# Startup markers. run.py writes studio-starting-<pid>.marker before it binds and removes it when
+# it stops serving, but taskkill /F runs no exit hook, so every Windows stop leaked one.
+# ---------------------------------------------------------------------------
+
+
+def _write_marker(tmp_path, pid, created = None):
+    path = tmp_path / f"studio-starting-{pid}.marker"
+    path.write_text(f"{pid}\n{'' if created is None else created}\n", encoding = "utf-8")
+    return path
+
+
+def test_stop_removes_the_marker_of_the_server_it_stopped(monkeypatch, tmp_path):
+    studio_mod, _live, killed = _install(monkeypatch, tmp_path, alive = {8550})
+    _write_pid(tmp_path, "studio-8901-8550.pid", 8550)
+    marker = _write_marker(tmp_path, 8550, 111.5)
+
+    result = _run_stop(studio_mod)
+
+    assert result.exit_code == 0, result.output
+    assert killed == [8550]
+    assert not marker.exists()
+
+
+def test_stop_keeps_the_marker_of_a_backend_still_starting(monkeypatch, tmp_path):
+    # No PID file yet, so stop does not touch the process, and a sibling reads this marker to know
+    # not to clear the compiled cache under it.
+    studio_mod, _live, killed = _install(monkeypatch, tmp_path, alive = {8550, 9000})
+    _write_pid(tmp_path, "studio-8901-8550.pid", 8550)
+    starting = _write_marker(tmp_path, 9000, 222.5)
+
+    result = _run_stop(studio_mod)
+
+    assert result.exit_code == 0, result.output
+    assert killed == [8550]
+    assert starting.exists()
+
+
+def test_stop_keeps_the_marker_of_a_server_still_shutting_down(monkeypatch, tmp_path):
+    studio_mod = _studio()
+    monkeypatch.setattr(studio_mod, "STUDIO_HOME", tmp_path)
+    monkeypatch.setattr(studio_mod, "_PID_FILE", tmp_path / "studio.pid")
+    monkeypatch.setattr(studio_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(studio_mod, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(studio_mod, "_pid_is_studio_server", lambda pid, created_times = (): True)
+    monkeypatch.setattr(studio_mod.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(sys, "platform", "linux")
+    _write_pid(tmp_path, "studio-8901-8550.pid", 8550)
+    marker = _write_marker(tmp_path, 8550)
+
+    result = _run_stop(studio_mod)
+
+    assert "shutting down" in result.output.lower()
+    assert marker.exists()
+
+
+def test_stop_with_nothing_running_still_drops_a_leaked_marker(monkeypatch, tmp_path):
+    # The leak from an earlier stop: no PID file left, only the marker.
+    studio_mod, _live, killed = _install(monkeypatch, tmp_path, alive = set())
+    marker = _write_marker(tmp_path, 8550, 111.5)
+
+    result = _run_stop(studio_mod)
+
+    assert result.exit_code == 0, result.output
+    assert "no running unsloth server" in result.output.lower()
+    assert killed == []
+    assert not marker.exists()
+
+
+def test_stop_drops_a_marker_whose_pid_was_reused(monkeypatch, tmp_path):
+    studio_mod, _live, _killed = _install(monkeypatch, tmp_path, alive = {8550})
+    monkeypatch.setattr(studio_mod, "_pid_is_studio_server", _REAL_IS_STUDIO_SERVER)
+
+    class _FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            return 999.0
+
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process = _FakeProcess))
+    reused = _write_marker(tmp_path, 8550, 111.5)
+
+    result = _run_stop(studio_mod)
+
+    assert result.exit_code == 0, result.output
+    assert not reused.exists()
+
+
+def test_stop_keeps_a_marker_it_cannot_parse(monkeypatch, tmp_path):
+    # A marker caught mid-write reads as empty; deleting it would hide a backend that is binding.
+    studio_mod, _live, _killed = _install(monkeypatch, tmp_path, alive = set())
+    empty = tmp_path / "studio-starting-8550.marker"
+    empty.write_text("", encoding = "utf-8")
+
+    result = _run_stop(studio_mod)
+
+    assert result.exit_code == 0, result.output
+    assert empty.exists()
+
+
+def test_stop_drops_markers_on_the_failure_path_too(monkeypatch, tmp_path):
+    studio_mod, _live, _killed = _install(monkeypatch, tmp_path, alive = {8550})
+    hidden = tmp_path / "studio-8901-8550.pid"
+    hidden.write_text("8550", encoding = "utf-8")
+    leaked = _write_marker(tmp_path, 7777, 111.5)
+    real_read_text = Path.read_text
+
+    def deny(self, *args, **kwargs):
+        if self == hidden:
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny)
+
+    result = _run_stop(studio_mod)
+
+    assert result.exit_code == 1
+    assert not leaked.exists()
+
+
+def test_stop_marker_name_matches_what_the_backend_writes():
+    # The CLI does not import run.py (it would pull the whole backend in), so the two spellings are
+    # compared as text.
+    import re
+
+    run_py = (_REPO_ROOT / "studio" / "backend" / "run.py").read_text(encoding = "utf-8")
+    backend_glob = re.search(r'^STARTUP_MARKER_GLOB = "([^"]+)"$', run_py, flags = re.MULTILINE)
+    assert backend_glob is not None
+    assert _studio().STARTUP_MARKER_GLOB == backend_glob.group(1)
+    assert 'f"studio-starting-{me}.marker"' in run_py

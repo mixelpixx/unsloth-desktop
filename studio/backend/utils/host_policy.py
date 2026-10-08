@@ -14,6 +14,9 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 # Whether a loopback launch in THIS process auto-enabled the gate. run_server normally runs once per process, but if it is reused with a different host (embedders, tests) we only ever take back a value we set ourselves.
 _auto_enabled = False
+# Why the last launch withheld the auto-default: None (it did not), "network" (a non-loopback bind such as
+# -H 0.0.0.0) or "colab". Lets the gate tell users the actual cause instead of only naming the env var.
+_auto_withheld_reason: str | None = None
 _remote_connector_active = False
 _lan_connector_active = False
 
@@ -230,21 +233,28 @@ def cors_origins_for_mode(*, api_only: bool, secure: bool) -> list[str]:
 
 def apply_stdio_mcp_loopback_default(host: str, *, is_colab: bool = False) -> None:
     """Default stdio MCP servers on when bound to loopback. A loopback bind is the user's own machine, the same trust boundary the Tauri desktop app relies on (see main.py, which uses this same helper). Colab is excluded: even its loopback is a hosted VM reachable through Colab's proxy, so it stays off unless opted in. An explicit operator value wins: a pre-set `UNSLOTH_STUDIO_ALLOW_STDIO_MCP=0` force-disables and `=1` opts in, including on a network bind. We only ever set or clear a default we applied ourselves, so reusing run_server with a public host after a loopback one does not leave the gate on."""
-    global _auto_enabled
+    global _auto_enabled, _auto_withheld_reason
     current = os.environ.get("UNSLOTH_STUDIO_ALLOW_STDIO_MCP")
     # If our prior auto-default was changed out from under us, relinquish ownership: an explicit =0 is then a sticky force-disable, while a cleared var falls back to the host default.
     if _auto_enabled and current != "1":
         _auto_enabled = False
+    _auto_withheld_reason = None
     # An explicit operator value is one we did not set; never touch it.
     if current is not None and not _auto_enabled:
         return
     if is_colab or is_external_host(host):
+        _auto_withheld_reason = "colab" if is_colab else "network"
         if _auto_enabled:
             os.environ.pop("UNSLOTH_STUDIO_ALLOW_STDIO_MCP", None)
             _auto_enabled = False
     else:
         os.environ["UNSLOTH_STUDIO_ALLOW_STDIO_MCP"] = "1"
         _auto_enabled = True
+
+
+def stdio_mcp_withheld_reason() -> str | None:
+    """Why the launch left local-command MCP off: "network" for a non-loopback bind, "colab", or None when it did not withhold it (loopback bind, or an explicit operator value)."""
+    return _auto_withheld_reason
 
 
 def loopback_default_active() -> bool:
@@ -281,7 +291,8 @@ def remote_connector_active() -> bool:
 
 def _reset_loopback_default_state() -> None:
     """Test hook: forget runtime trust state applied earlier in this process."""
-    global _auto_enabled, _remote_connector_active, _lan_connector_active
+    global _auto_enabled, _auto_withheld_reason, _remote_connector_active, _lan_connector_active
     _auto_enabled = False
+    _auto_withheld_reason = None
     _remote_connector_active = False
     _lan_connector_active = False

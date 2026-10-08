@@ -9,8 +9,11 @@ import {
 import { hfApiToken, ownerOf, useHfTokenStore } from "@/features/hub";
 import {
   TRAINING_METHOD_META,
+  type TrainingTransformersUpgradeNotice,
   isLocalTrainingModelSelection,
+  trainingHardwareSummary,
   useTrainingConfigStore,
+  useTrainingFitEstimate,
   useTrainingReadiness,
   useTrainingResourceNotices,
   useTrainingTransformersUpgradeNotice,
@@ -24,9 +27,11 @@ import { type ReactElement, type ReactNode, useMemo } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { useTrainingResourceDisplayNames } from "../hooks/use-training-resource-display-names";
 import { countNonDefaultAdvancedSettings } from "./advanced-settings-summary";
+import { TrainingFitPanel } from "./training-fit-panel";
 import type { ParamMode } from "./training-param-mode";
 
 const LEARNING_RATE_ZERO_RE = /\.?0+e/;
+const NO_CHECKPOINT_WARNING_MIN_STEPS = 500;
 const PREVIEW_COUNT_KEYS = {
   step: {
     zero: "studio.preview.stepZero",
@@ -60,10 +65,13 @@ function MetaRow({
   label,
   value,
   mono,
+  title,
 }: {
   label: string;
   value: ReactNode;
   mono?: boolean;
+  /** The full value, for a row narrow enough to truncate it. */
+  title?: string;
 }): ReactElement {
   return (
     <div className="flex items-baseline justify-between gap-3">
@@ -71,6 +79,7 @@ function MetaRow({
         {label}
       </span>
       <span
+        title={title}
         className={cn(
           "min-w-0 truncate text-ui-12p5 text-foreground/90",
           mono && "font-mono text-ui-12",
@@ -169,11 +178,17 @@ function ResourceNoticeList({
  * routed to the latest-transformers sidecar always loads 16-bit, so "QLoRA · 4-bit" for
  * one of those is a VRAM promise the run cannot keep. Stated here, before Start. When
  * the model also ships its own code the dialog offers both ways in and only one keeps
- * 4-bit, so the precision line names the action rather than asserting one answer. */
-function TransformersUpgradeNotice(): ReactElement | null {
+ * 4-bit, so the precision line names the action rather than asserting one answer.
+ *
+ * The notice arrives as a prop: the fit estimate needs the same 16-bit answer, and the hook
+ * behind it fetches per consumer, so the card asks once and hands it to both. */
+function TransformersUpgradeNotice({
+  notice,
+}: {
+  notice: TrainingTransformersUpgradeNotice;
+}): ReactElement | null {
   const t = useT();
-  const { installVersion, fourBitUnavailable, installSwitchesTo16Bit } =
-    useTrainingTransformersUpgradeNotice();
+  const { installVersion, fourBitUnavailable, installSwitchesTo16Bit } = notice;
   if (!(installVersion || fourBitUnavailable || installSwitchesTo16Bit)) {
     return null;
   }
@@ -346,6 +361,7 @@ export function RunPreviewCard({
     datasetSplit,
     maxSteps,
     epochs,
+    saveSteps,
     batchSize,
     gradientAccumulation,
     learningRate,
@@ -364,6 +380,7 @@ export function RunPreviewCard({
       datasetSplit: s.datasetSplit,
       maxSteps: s.maxSteps,
       epochs: s.epochs,
+      saveSteps: s.saveSteps,
       batchSize: s.batchSize,
       gradientAccumulation: s.gradientAccumulation,
       learningRate: s.learningRate,
@@ -376,6 +393,23 @@ export function RunPreviewCard({
   const hasToken = hfApiToken(hfToken) !== undefined;
   const { isReady, hasModel, hasDataset } = useTrainingReadiness();
   const resourceNotices = useTrainingResourceNotices();
+  const upgradeNotice = useTrainingTransformersUpgradeNotice();
+  const fit = useTrainingFitEstimate(upgradeNotice.fourBitUnavailable);
+  const hardwareSummary = trainingHardwareSummary(fit.allDevices, fit.target);
+  // Per card, or the pinned card: memoryTotalGb is the SUM across GPUs, and "RTX 3090 ·
+  // 48 GiB" read as one 48 GiB card that no run on this host can use whole.
+  const hardwareLabel = !gpu.available
+    ? t("studio.preview.noGpu")
+    : hardwareSummary
+      ? hardwareSummary.key
+        ? t(hardwareSummary.key, hardwareSummary.params)
+        : hardwareSummary.text
+      : gpu.deviceCount > 1
+        ? t("trainingFit.hardwareCount", {
+            count: String(gpu.deviceCount),
+            memory: `${gpu.memoryTotalGb} GiB`,
+          })
+        : `${gpu.name} · ${gpu.memoryTotalGb} GiB`;
   const nonDefaultAdvancedSettings = useTrainingConfigStore((state) =>
     countNonDefaultAdvancedSettings(state, state.advancedSettingsBaseline),
   );
@@ -415,6 +449,11 @@ export function RunPreviewCard({
     PREVIEW_COUNT_KEYS[lengthUnit][pluralRules.select(lengthCount)],
     { count: numberFormatter.format(lengthCount) },
   );
+  // save_steps 0 writes no checkpoint until the end, so a crash late in a long run leaves
+  // nothing to resume. Epoch length depends on the dataset, so epochs count as long.
+  const noCheckpointsOnLongRun =
+    !(saveSteps > 0) &&
+    (lengthUnit === "epoch" || maxSteps > NO_CHECKPOINT_WARNING_MIN_STEPS);
 
   return (
     <aside
@@ -511,12 +550,12 @@ export function RunPreviewCard({
       <section className="flex flex-col gap-3">
         <MetaRow
           label={t("studio.preview.hardware")}
-          value={
-            gpu.available
-              ? `${gpu.name} · ${gpu.memoryTotalGb} GiB`
-              : t("studio.preview.noGpu")
-          }
+          value={hardwareLabel}
+          title={hardwareLabel}
         />
+        {gpu.available ? (
+          <TrainingFitPanel devices={fit.devices} target={fit.target} />
+        ) : null}
         <MetaRow
           label={t("studio.preview.hfToken")}
           value={
@@ -527,7 +566,15 @@ export function RunPreviewCard({
 
       <ResourceNoticeList notices={resourceNotices} />
 
-      <TransformersUpgradeNotice />
+      <TransformersUpgradeNotice notice={upgradeNotice} />
+
+      {noCheckpointsOnLongRun ? (
+        <section className="rounded-lg border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2.5">
+          <p className="text-ui-10p5 leading-relaxed text-foreground/80">
+            {t("studio.preview.noCheckpointsWarning")}
+          </p>
+        </section>
+      ) : null}
 
       <div className="-mx-6 h-px bg-[color-mix(in_oklab,var(--foreground)_calc(7%*var(--contrast-wash-gain,1)),transparent)] dark:bg-[rgb(255_255_255_/_calc(0.06*var(--contrast-wash-gain,1)))]" />
 

@@ -54,6 +54,9 @@ export interface LoadModelRequest {
   /** Stop any chats still generating instead of getting a 409: a load replaces the single
    *  llama-server they all decode on. Set only after the user confirms. */
   force_cancel_active?: boolean;
+  /** Load past the memory guardrail's "this probably won't fit" 409. Set only by loadModel's
+   *  retry after the user picks "Load anyway". */
+  allow_memory_overcommit?: boolean;
   nativePathLease?: string | null;
   hf_token: string | null;
   max_seq_length: number;

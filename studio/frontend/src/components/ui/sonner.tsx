@@ -9,8 +9,36 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useTheme } from "@/features/settings/stores/theme-store";
+import { suppressTransportErrorToast } from "@/lib/connection-monitor";
 import { createLoadingToastIcon } from "@/lib/toast";
-import { Toaster as Sonner, type ToasterProps } from "sonner";
+import { Toaster as Sonner, type ToasterProps, toast } from "sonner";
+
+// Sonner's Toaster takes one duration for every type, and an error needs longer than 5 s to be
+// read. So errors get their own default on the shared `toast` instance, which also reaches the
+// call sites that import "sonner" directly rather than "@/lib/toast". A caller's own duration
+// still wins.
+const ERROR_TOAST_DURATION_MS = 15_000;
+// Returned for a toast held back below; no toast has it, so a later dismiss() by it is a no-op.
+const SUPPRESSED_TOAST_ID = "connection-suppressed";
+const showErrorToast = toast.error;
+toast.error = (message, data) => {
+  const show = () =>
+    showErrorToast(message, {
+      ...data,
+      duration: data?.duration ?? ERROR_TOAST_DURATION_MS,
+    });
+  // While the connection banner says the backend cannot be reached, a toast per failed request is
+  // the same news again, once per request in flight. Only that news is held back; any other error
+  // still shows. A toast with an id is updating one already on screen, a loading toast more often
+  // than not, so it always goes through rather than leave that one spinning.
+  if (
+    data?.id === undefined &&
+    suppressTransportErrorToast([message, data?.description], show)
+  ) {
+    return SUPPRESSED_TOAST_ID;
+  }
+  return show();
+};
 
 // Make toast text selectable. Sonner's onPointerDown calls setPointerCapture(), which steals the
 // drag and blocks text selection. dismissible:false would stop it but also kills the close button.

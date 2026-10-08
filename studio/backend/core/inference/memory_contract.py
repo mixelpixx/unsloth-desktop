@@ -206,6 +206,9 @@ def project_estimate_memory_response(estimate: MemoryEstimate) -> dict:
         "layer_count": estimate.layer_count,
         "gpu_layers": estimate.gpu_layers,
         "moe_offload_unmodelled": estimate.moe_offload_unmodelled,
+        # Not the estimate's to give: the load guardrail's verdict also needs the memory
+        # free right now, which only the route measures. The route fills it in.
+        "verdict": None,
     }
 
 

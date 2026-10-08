@@ -251,6 +251,58 @@ test("every mutable MCP form editor is locked for the full pending interval", ()
   );
 });
 
+test("a local program's working directory is edited, prefilled, and sent with test and save", () => {
+  assert.match(
+    CHAT_MCP_SERVERS_DIALOG,
+    /addressIsCommand && \(\s*<div className="grid gap-2">\s*<Label htmlFor="mcp-cwd">Working directory<\/Label>/,
+  );
+  assert.match(
+    CHAT_MCP_SERVERS_DIALOG,
+    /id="mcp-cwd"[\s\S]*?disabled=\{formPending\}[\s\S]*?\/>/,
+    "the working directory is locked with the rest of the form",
+  );
+  assert.match(CHAT_MCP_SERVERS_DIALOG, /cwd: server\.cwd \?\? ""/);
+  assert.match(
+    CHAT_MCP_SERVERS_DIALOG,
+    /function cwdForTransport[\s\S]*?form\.transport === "stdio" \? form\.cwd\.trim\(\) \|\| null : null/,
+    "only a local program sends one, and blank clears it",
+  );
+  const testContinuation = sourceBetween(
+    CHAT_MCP_SERVERS_DIALOG,
+    "async function testConnection",
+    "async function submitForm",
+  );
+  assert.match(
+    testContinuation,
+    /testMcpServer\(\{\s*url,[\s\S]*?cwd: cwdForTransport\(form\)/,
+  );
+  const crudContinuation = sourceBetween(
+    CHAT_MCP_SERVERS_DIALOG,
+    "async function submitForm",
+    "async function splitPastedCommand",
+  );
+  assert.match(
+    crudContinuation,
+    /await updateMcpServer\([\s\S]*?cwd: stdio \? cwdForTransport\(form\) : undefined/,
+  );
+  assert.match(
+    crudContinuation,
+    /await createMcpServer\(\{[\s\S]*?cwd: cwdForTransport\(form\)/,
+  );
+  assert.match(
+    sourceBetween(MCP_SERVERS_API, "export function createMcpServer", "export function updateMcpServer"),
+    /cwd: payload\.cwd \?\? null/,
+  );
+  assert.match(
+    sourceBetween(MCP_SERVERS_API, "export function updateMcpServer", "export function deleteMcpServer"),
+    /if \(payload\.cwd !== undefined\) body\.cwd = payload\.cwd/,
+  );
+  assert.match(
+    sourceBetween(MCP_SERVERS_API, "export function testMcpServer", "export function decodeMcpStdioCommand"),
+    /cwd: payload\.cwd \?\? null/,
+  );
+});
+
 test("a decode error is announced and executable edits unlock manual recovery", () => {
   assert.match(
     CHAT_MCP_SERVERS_DIALOG,
@@ -368,7 +420,7 @@ test("composer applies mutation responses before releasing each preset", () => {
   );
   assert.match(
     MCP_COMPOSER_BUTTON,
-    /disabled=\{!serversLoaded \|\| pendingUrls\.has\(normalizeMcpUrl\(opts\.url\)\)\}/,
+    /disabled=\{!serversLoaded \|\| pendingUrls\.has\(normalizeMcpUrl\(opts\.url\)\) \|\| localOff\}/,
   );
 });
 

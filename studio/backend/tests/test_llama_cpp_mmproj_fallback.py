@@ -189,6 +189,8 @@ class TestGpuMemoryStartFailure:
             _OOM_OUT,
             "ggml_backend_cuda_buffer_type_alloc: failed to allocate buffer",
             "CUDA error: out of memory",
+            # llama_model_load's summary line, on its own.
+            "llama_model_load: error loading model: unable to allocate CUDA0 buffer",
         ],
     )
     def test_gpu_allocation_errors_match(self, out):
@@ -199,6 +201,7 @@ class TestGpuMemoryStartFailure:
         [
             "ggml_alloc: failed to allocate 512.00 MiB",
             "std::bad_alloc: out of memory",
+            "llama_model_load: error loading model: unable to allocate buffer",
         ],
     )
     def test_host_allocation_errors_do_not_match(self, out):

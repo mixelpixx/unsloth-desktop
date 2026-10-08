@@ -12,6 +12,8 @@ class McpServerCreate(BaseModel):
     headers: Optional[dict[str, str]] = None
     is_enabled: bool = True
     use_oauth: bool = False
+    # Local programs only: the absolute folder the program starts in. None = the backend's own.
+    cwd: Optional[str] = None
 
 
 class McpServerUpdate(BaseModel):
@@ -21,6 +23,8 @@ class McpServerUpdate(BaseModel):
     headers: Optional[dict[str, str]] = None
     is_enabled: Optional[bool] = None
     use_oauth: Optional[bool] = None
+    # Absent = leave as-is; null or blank = clear.
+    cwd: Optional[str] = None
 
 
 class McpServerResponse(BaseModel):
@@ -31,6 +35,7 @@ class McpServerResponse(BaseModel):
     headers: dict[str, str] = Field(default_factory = dict)
     is_enabled: bool = True
     use_oauth: bool = False
+    cwd: Optional[str] = None
     created_at: str
     updated_at: str
 
@@ -39,6 +44,7 @@ class McpServerTestRequest(BaseModel):
     url: str
     headers: Optional[dict[str, str]] = None
     use_oauth: bool = False
+    cwd: Optional[str] = None
 
 
 class BlenderSettings(BaseModel):
@@ -78,6 +84,13 @@ class McpStdioCommand(BaseModel):
 
 class McpStdioEncodeResponse(BaseModel):
     url: str
+
+
+class McpCapabilities(BaseModel):
+    # Whether this caller may add local-program (stdio) servers right now, and why not, so the dialog can
+    # say so before the user fills in an executable instead of after Save.
+    stdio_enabled: bool
+    stdio_disabled_reason: Optional[str] = None
 
 
 class McpServerProbeResult(BaseModel):

@@ -316,6 +316,7 @@ export { DeleteChatFilesSwitch } from "./components/delete-chat-files-switch";
 export { ChatSearchDialog } from "./components/chat-search-dialog";
 export { NewProjectDialog } from "./components/new-project-dialog";
 export { StopRunningChatsDialog } from "./components/stop-running-chats-dialog";
+export { MemoryOvercommitDialog } from "./components/memory-overcommit-dialog";
 export { setTrainingCompareHandoff } from "./lib/training-compare-handoff";
 export type { ProjectRecord } from "./types";
 export { EditProjectDialog } from "./components/edit-project-dialog";

@@ -128,7 +128,7 @@ install_torchao_windows_rocm_stub()
 import _platform_compat  # noqa: F401
 
 from loggers import get_logger, install_uvicorn_duplicate_exception_filter
-from startup_banner import print_studio_access_banner, print_studio_stop_hint
+from startup_banner import print_studio_access_banner, print_studio_stop_hint as _default_stop_hint
 from utils.host_policy import (
     is_wildcard_host,
     normalize_wildcard_bind_host,
@@ -141,6 +141,7 @@ from utils.host_policy import (
 logger = get_logger(__name__)
 
 DISABLE_PUBLIC_CHECK_ENV = "UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK"
+FORCE_PUBLIC_CHECK_ENV = "UNSLOTH_STUDIO_FORCE_PUBLIC_CHECK"
 
 
 def public_check_disabled() -> bool:
@@ -149,6 +150,25 @@ def public_check_disabled() -> bool:
     outside service this machine is running one, which lab and privacy-sensitive deployments do not
     want (#7307 Problem 8)."""
     return os.environ.get(DISABLE_PUBLIC_CHECK_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
+def _on_desktop_os() -> bool:
+    """Windows and macOS, where a wildcard bind is nearly always a PC behind a home or office router. A
+    function rather than an inline sys.platform test so tests can choose the platform without changing
+    it for the whole interpreter."""
+    return sys.platform in ("win32", "darwin")
+
+
+def public_check_skipped() -> bool:
+    """True when the two third-party lookups should not run: the operator disabled them, which wins over
+    everything, or this is a desktop OS and nobody set UNSLOTH_STUDIO_FORCE_PUBLIC_CHECK. On a desktop the
+    probe can only find the router's address unreachable and suggest an ssh tunnel to it, and it holds up
+    startup while it waits; a Windows or macOS cloud VM is what the force switch is for."""
+    if public_check_disabled():
+        return True
+    if not _on_desktop_os():
+        return False
+    return os.environ.get(FORCE_PUBLIC_CHECK_ENV, "").strip().lower() not in {"1", "true", "yes"}
 
 
 def _resolve_lan_ip(ip_version: int = 4) -> str:
@@ -166,8 +186,8 @@ def _resolve_lan_ip(ip_version: int = 4) -> str:
 
 
 def _resolve_external_ip() -> str:
-    """Resolve the machine's external IP address: GCE metadata server, then ifconfig.me (skipped by
-    UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK), then the default route's own source address. This is the
+    """Resolve the machine's external IP address: GCE metadata server, then ifconfig.me (skipped whenever
+    public_check_skipped() says so), then the default route's own source address. This is the
     INTERNET-facing address, used for the reachability probe and the Cloudflare messaging, not for
     "another device on your network", which _network_share_host_for_bind answers. The fallback stays
     a raw route lookup rather than _resolve_lan_ip, which filters out every address a LAN peer
@@ -190,7 +210,7 @@ def _resolve_external_ip() -> str:
         pass
 
     # 2. Public IP service. Third-party, so skippable; the LAN address below still works.
-    if not public_check_disabled():
+    if not public_check_skipped():
         try:
             with urllib.request.urlopen("https://ifconfig.me", timeout = 3) as resp:
                 ip = resp.read().decode().strip()
@@ -211,9 +231,43 @@ def _resolve_external_ip() -> str:
         return "0.0.0.0"
 
 
+# On Windows, name every way to stop it: the web UI's Shutdown and `unsloth studio stop` work from anywhere,
+# Ctrl+C only from this console, and there is no Command key to confuse with Control.
+_WINDOWS_STOP_HINT = (
+    '  To stop Unsloth Studio: use Shutdown in the app menu, run "unsloth studio stop", '
+    "or press Ctrl+C here."
+)
+
+
+def print_studio_stop_hint() -> None:
+    """startup_banner's stop hint and closing divider, worded for Windows on win32. Shadows the import on
+    purpose: every banner in this module prints its hint through this name, and the block keeps the same
+    shape so the banner's last lines do not move."""
+    if sys.platform != "win32":
+        _default_stop_hint()
+        return
+    from startup_banner import stdout_supports_color
+
+    use_color = stdout_supports_color()
+    dim = "\033[38;5;245m" if use_color else ""
+    hint_style = "\033[38;5;215;1m" if use_color else ""
+    reset = "\033[0m" if use_color else ""
+    text = "\n".join(["", f"{hint_style}{_WINDOWS_STOP_HINT}{reset}", f"{dim}{'─' * 52}{reset}", ""])
+    try:
+        print(text, flush = True)
+    except UnicodeEncodeError:
+        # A legacy code page cannot draw the divider; the hint itself is ASCII.
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        try:
+            text = text.encode(encoding, errors = "replace").decode(encoding)
+        except LookupError:
+            text = text.encode("ascii", errors = "replace").decode("ascii")
+        print(text, flush = True)
+
+
 def _install_uvicorn_startup_log_rewrite(bind_host: str) -> None:
     """Rewrite Uvicorn's startup log line: swap a wildcard bind for the address this machine answers on, use
-    our Mac-aware stop hint, and rename the prefix to "Unsloth Studio running on". The line is a claim
+    our platform-aware stop hint, and rename the prefix to "Unsloth Studio running on". The line is a claim
     about where the server is reachable, so the address is _network_share_host_for_bind's, resolved here
     rather than passed in so no caller can hand it the internet-facing one (#8868)."""
     import logging
@@ -221,7 +275,10 @@ def _install_uvicorn_startup_log_rewrite(bind_host: str) -> None:
 
     display_host = _network_share_host_for_bind(bind_host)
     rewrite_host = is_wildcard_host(bind_host) and bool(display_host) and display_host != bind_host
-    new_suffix = "(To stop: press Ctrl+C -- on macOS, Control+C not Command+C)"
+    if sys.platform == "win32":
+        new_suffix = '(To stop: Shutdown in the app menu, "unsloth studio stop", or Ctrl+C)'
+    else:
+        new_suffix = "(To stop: press Ctrl+C -- on macOS, Control+C not Command+C)"
     old_suffix_re = re.compile(r"\(Press CTRL\+C to quit\)")
     old_prefix = "Uvicorn running on "
     new_prefix = "Unsloth Studio running on "
@@ -348,11 +405,13 @@ def _print_localhost_ipv6_mismatch_warning(local_url: str, port: int) -> None:
     )
 
 
-def _verify_global_reachability(display_host: str, port: int) -> None:
+def _verify_global_reachability(display_host: str, port: int, lan_host: str = "") -> None:
     """Probe check-host.net to confirm display_host:port is reachable from the public internet. Synchronous so
     output lands between the banner URLs and the stop hint. Bounded at ~15s; failures swallowed (verifier
-    failing is not Unsloth failing). Only meaningful for a wildcard bind, and skipped entirely by
-    UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK."""
+    failing is not Unsloth failing). Only meaningful for a wildcard bind, skipped entirely by
+    UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK, and skipped by default on a desktop OS (public_check_skipped).
+    ``lan_host`` is the LAN address the caller already resolved for the banner, named in the one line a
+    desktop gets instead of the probe; nothing here looks it up."""
     global _public_reachable
     # Reset to "unknown" each run; set True/False only when the probe decides.
     _public_reachable = None
@@ -394,6 +453,20 @@ def _verify_global_reachability(display_host: str, port: int) -> None:
     # The probe hands display_host:port to a third party and asks it to connect.
     if public_check_disabled():
         logger.debug("Skipping the check-host.net probe (%s).", DISABLE_PUBLIC_CHECK_ENV)
+        return
+    if public_check_skipped():
+        # A desktop OS. _public_reachable stays None: nothing was verified, and the Cloudflare line says so.
+        logger.debug(
+            "Skipping the check-host.net probe on %s (%s=1 runs it).",
+            sys.platform,
+            FORCE_PUBLIC_CHECK_ENV,
+        )
+        if lan_host and not is_wildcard_host(lan_host) and lan_host not in ("127.0.0.1", "localhost", "::1"):
+            print(
+                f"{dim}  On your network: http://{_url_host(lan_host)}:{port}/ (public internet check "
+                f"skipped on this OS; {FORCE_PUBLIC_CHECK_ENV}=1 runs it){reset}",
+                flush = True,
+            )
         return
 
     try:
@@ -615,20 +688,21 @@ def _emit_startup_output(
         return
     wildcard_bind = is_wildcard_host(host)
     localhost_mismatch_url = _localhost_ipv6_mismatch_url(host, port)
+    # The "from another device on your network" line needs the LAN address,
+    # not display_host's possibly-public one (#8868).
+    network_host = _network_share_host_for_bind(host)
     print_studio_access_banner(
         port = port,
         bind_host = host,
         display_host = display_host,
-        # The "from another device on your network" line needs the LAN address,
-        # not display_host's possibly-public one (#8868).
-        network_host = _network_share_host_for_bind(host),
+        network_host = network_host,
         include_stop_hint = False,
         lan_addresses = lan_addresses,
     )
     if localhost_mismatch_url:
         _print_localhost_ipv6_mismatch_warning(localhost_mismatch_url, port)
     elif wildcard_bind:
-        _verify_global_reachability(display_host, port)
+        _verify_global_reachability(display_host, port, lan_host = network_host)
         _print_cloudflare_line(loopback_host = _loopback_bind_host_for(host))
     _emit_tool_policy_notice(lan_addresses[0] if lan_addresses else host, False, enable_tools)
     print_studio_stop_hint()
@@ -1096,8 +1170,13 @@ def _remove_startup_marker() -> None:
     import time
 
     remaining = []
-    while _OWN_STARTUP_MARKERS:
-        path = _OWN_STARTUP_MARKERS.pop()
+    while True:
+        # Popped rather than checked and then popped: the console-close handler calls this from its own thread,
+        # possibly while the server thread's exit path is emptying the same list.
+        try:
+            path = _OWN_STARTUP_MARKERS.pop()
+        except IndexError:
+            break
         for attempt in range(_MARKER_REMOVAL_ATTEMPTS):
             try:
                 path.unlink(missing_ok = True)
@@ -1379,13 +1458,27 @@ def _run_console_shutdown(shutdown) -> None:
         logger.warning("Console-close cleanup failed: %s", error)
 
 
+# The ctypes callback Windows was handed, kept referenced for the life of the process (a collected one leaves
+# Windows calling into freed memory), and the shutdown it runs, read when the event arrives.
+_WINDOWS_CONSOLE_HANDLER = None
+_console_shutdown_target = None
+
+
 def _install_windows_console_handler(shutdown) -> bool:
     """Run the graceful shutdown when the console window is closed. Closing the window raises
     CTRL_CLOSE_EVENT, which Python never turns into a signal, so neither a signal handler nor atexit runs.
     ``shutdown`` takes no arguments and must not touch signal.signal: Windows runs this on a thread it
-    creates for the event and kills the process about five seconds later, so the work is bounded to fit."""
+    creates for the event and kills the process about five seconds later, so the work is bounded to fit.
+    Registers once per process; a later call only replaces ``shutdown``."""
+    global _WINDOWS_CONSOLE_HANDLER, _console_shutdown_target
     if sys.platform != "win32":
         return False
+    _console_shutdown_target = shutdown
+    if _WINDOWS_CONSOLE_HANDLER is not None:
+        # Not a second registration. Windows offers each event to every registered handler until one returns TRUE,
+        # so both would stay live, and replacing the one reference this module keeps would free the older callback
+        # while Ctrl+C, which each passes on, can still reach it.
+        return True
     try:
         import ctypes
         from ctypes import wintypes
@@ -1397,7 +1490,9 @@ def _install_windows_console_handler(shutdown) -> bool:
         def _on_console_event(event: int) -> bool:
             if _console_event_is_shutdown(event):
                 worker = threading.Thread(
-                    target = _run_console_shutdown, args = (shutdown,), daemon = True
+                    target = _run_console_shutdown,
+                    args = (_console_shutdown_target,),
+                    daemon = True,
                 )
                 worker.start()
                 worker.join(timeout = _CONSOLE_SHUTDOWN_BUDGET)
@@ -1418,8 +1513,9 @@ def _install_windows_console_handler(shutdown) -> bool:
             )
             return False
         # Hold a reference: a collected callback leaves Windows calling into freed memory.
-        globals()["_WINDOWS_CONSOLE_HANDLER"] = callback
-        logger.info("Console-close handler installed")
+        _WINDOWS_CONSOLE_HANDLER = callback
+        # No success line here: launchers install this before run_server() has configured logging, when it would
+        # land on the console ahead of the banner rather than in the session log. run_server() reports it instead.
         return True
     except Exception as error:
         logger.warning("Could not install the console-close handler: %s", error)
@@ -1535,6 +1631,53 @@ def _graceful_shutdown(server = None):
     # `stop` or a new launch unable to find it.
     _remove_pid_file()
     logger.info("All subprocesses cleaned up")
+
+
+# What _graceful_shutdown may spend of the console-close budget before the records go regardless. The second
+# left over covers _remove_startup_marker's retries, so a slow subprocess teardown cannot cost the records.
+_CONSOLE_TEARDOWN_BUDGET = _CONSOLE_SHUTDOWN_BUDGET - 1.0
+
+
+def _console_close_shutdown() -> None:
+    """The console-close cleanup every standalone launcher installs: `python run.py` and the in-process
+    `unsloth studio` and `unsloth studio run`. Windows ends the process a few seconds after the event
+    whatever this does, and nothing can count on atexit or the server thread's own exit path getting there
+    first, so unlike Ctrl+C this takes studio.pid, the per-port record and the startup marker back itself,
+    on time even when the subprocess teardown overruns.
+
+    It can also arrive before run_server() has built the server, during the minute of imports. The main
+    thread then holds the import locks of the very modules _graceful_shutdown reaches for, so calling it
+    would block past the deadline; nothing it stops exists yet, and the Job object takes any child the
+    startup spawned, so only the records go."""
+    import threading
+
+    server = _server
+    if server is not None:
+        teardown = threading.Thread(
+            target = _run_console_shutdown,
+            args = (lambda: _graceful_shutdown(server),),
+            daemon = True,
+        )
+        teardown.start()
+        teardown.join(timeout = _CONSOLE_TEARDOWN_BUDGET)
+    # Both even when _graceful_shutdown finished: it leaves the marker to the server thread's exit, which need not
+    # come before Windows ends the process. _remove_pid_file's reason for keeping it, a request still in flight
+    # importing from the cache, does not hold for a process about to be ended either way.
+    _remove_pid_file()
+    _remove_startup_marker()
+    # Last: this lets the main thread run off the end and the interpreter finalize, which can stop this thread
+    # before the records above are gone.
+    event = _shutdown_event
+    if event is not None:
+        event.set()
+
+
+def install_console_close_cleanup() -> bool:
+    """Run _console_close_shutdown when the console window is closed, or on logoff or system shutdown. For
+    standalone launchers, like the signal handlers run_server() leaves to its caller, and meant to be called
+    before run_server() so a window closed during the imports is covered too. False off Windows, and safe
+    to call again."""
+    return _install_windows_console_handler(_console_close_shutdown)
 
 
 # Bound the join so a stuck uvicorn shutdown cannot hang the terminal.
@@ -2425,6 +2568,10 @@ def run_server(
     )
 
     logger.info("run_server startup begin api_only=%s host=%s port=%s", api_only, host, port)
+    if sys.platform == "win32":
+        # Installed by the launcher before this, while logging was not set up yet; an embedder that never
+        # installs it shows up here as False.
+        logger.info("Console-close handler installed: %s", _WINDOWS_CONSOLE_HANDLER is not None)
     cloudflare_intent = _consume_cloudflare_intent(cloudflare, secure)
 
     # Reap every child if the parent dies abnormally (terminal close, Task Manager kill, SIGKILL); must
@@ -3125,6 +3272,11 @@ if __name__ == "__main__":
     if args.frontend is not None:
         kwargs["frontend_path"] = Path(args.frontend)
 
+    # Before run_server(), unlike the signal handlers below, which need the server and event it builds: a window
+    # closed during the imports already has a startup marker to take back. Not _signal_handler either, since
+    # Windows runs this on a thread it creates and signal.signal() off the main thread raises.
+    install_console_close_cleanup()
+
     try:
         run_server(**kwargs)
     except Exception:
@@ -3153,14 +3305,6 @@ if __name__ == "__main__":
     # On Windows, some terminals send SIGBREAK for Ctrl+C / Ctrl+Break.
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _signal_handler)
-
-    # NOT _signal_handler: Windows runs this on a thread it creates, and signal.signal() off the main thread
-    # raises, which would leave the window close doing no cleanup at all.
-    def _console_shutdown():
-        _graceful_shutdown(_server)
-        _shutdown_event.set()
-
-    _install_windows_console_handler(_console_shutdown)
 
     # Keep running until shutdown signal. Event.wait() without a timeout blocks at the C level on Linux,
     # preventing SIGINT delivery; a short timeout in a loop lets the interpreter process pending signals.

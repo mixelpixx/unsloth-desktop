@@ -13,16 +13,25 @@ import {
   COMPOSER_INPUT_SELECTOR,
   isSurfaceBackgrounded,
   useShortcut,
+  useShortcutLabel,
 } from "@/features/settings";
 import type {
   ToolCallMessagePartComponent,
   ToolCallMessagePartStatus,
 } from "@assistant-ui/react";
 import { useCallback, useEffect, useState } from "react";
-import { useChatActive, useChatNavigationStore } from "@/features/chat";
+import {
+  formatMcpToolName,
+  useChatActive,
+  useChatNavigationStore,
+} from "@/features/chat";
+import { toolArgText } from "./tool-arg-text";
+
+const KEY_HINT_CLASS =
+  "rounded-sm border border-current px-1 py-px font-sans text-ui-10 leading-none opacity-60";
 
 /**
- * Allow / Always allow / Deny controls for a tool call paused awaiting the
+ * Allow / Allow for this chat / Deny controls for a tool call paused awaiting the
  * user's confirmation. Rendered alongside every tool card (built-in and
  * MCP) so the gate works for all tools, not just the ones using the
  * fallback renderer.
@@ -114,7 +123,7 @@ export function ToolConfirmationControls({
     ],
   );
 
-  // Tools the user marked "Always allow" (this session) approve themselves.
+  // Tools the user marked "Allow for this chat" approve themselves.
   useEffect(() => {
     if (showControls && autoAllowed && pending === null && !failed) {
       void resolve("allow");
@@ -175,27 +184,45 @@ export function ToolConfirmationControls({
       textFieldException: COMPOSER_INPUT_SELECTOR,
     },
   );
+  // The keys as bound now (rebindable in Settings), shown only while they answer this card.
+  const approveKey = useShortcutLabel("approveToolRequest");
+  const declineKey = useShortcutLabel("declineToolRequest");
 
   if (!showControls) return null;
   // Auto-approved tools resolve silently unless the post fails.
   if (autoAllowed && !failed) return null;
 
+  const showKeyHints = keyboardReady && failure !== "gone";
+  const name = toolArgText(toolName);
+  const displayName = formatMcpToolName(name) ?? name;
+
   return (
-    <div className="flex flex-wrap items-center gap-2 pt-1">
+    <div
+      role="group"
+      aria-label={`Approve ${displayName}?`}
+      className="flex flex-wrap items-center gap-2 pt-1"
+    >
+      <span className="text-xs text-muted-foreground">Run this tool?</span>
       <Button
         size="xs"
         disabled={pending !== null || failure === "gone"}
         onClick={() => void resolve("allow")}
       >
         Allow
+        {showKeyHints && approveKey ? (
+          <kbd aria-hidden={true} className={KEY_HINT_CLASS}>
+            {approveKey}
+          </kbd>
+        ) : null}
       </Button>
       <Button
         size="xs"
         variant="outline"
         disabled={pending !== null || failure === "gone"}
         onClick={() => void resolve("allow", true)}
+        title="Stop asking about this tool in this chat, until Studio reloads"
       >
-        Always allow
+        Allow for this chat
       </Button>
       <Button
         size="xs"
@@ -204,6 +231,11 @@ export function ToolConfirmationControls({
         onClick={() => void resolve("deny")}
       >
         Deny
+        {showKeyHints && declineKey ? (
+          <kbd aria-hidden={true} className={KEY_HINT_CLASS}>
+            {declineKey}
+          </kbd>
+        ) : null}
       </Button>
       {failure !== null ? (
         <span className="text-xs text-destructive">

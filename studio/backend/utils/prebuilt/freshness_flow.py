@@ -382,15 +382,21 @@ def check_freshness(
 
 
 def format_stale_warning(info: dict, *, component: str) -> str:
-    """Human-readable one-liner for stale prebuilt info."""
+    """Human-readable one-liner for stale prebuilt info.
+
+    ``age_days`` is how long ago the installed build was set up (``installed_at_utc``), not
+    how far its release trails the latest one, so it is said as such: "N days behind" read as
+    a release gap and misstated it.
+    """
     age = info.get("age_days")
     installed = info.get("installed_tag") or "unknown"
     latest = info.get("latest_tag") or "unknown"
-    age_str = f"{age} day{'s' if age != 1 else ''}" if age is not None else "some time"
+    installed_when = (
+        f", installed {age} day{'s' if age != 1 else ''} ago" if age is not None else ""
+    )
     return (
-        f"{component} prebuilt is {age_str} behind: installed "
-        f"{installed}, latest {latest}. Run `unsloth studio update` "
-        f"to refresh."
+        f"A newer {component} prebuilt is available (installed build {installed}"
+        f"{installed_when}; latest {latest}). Run `unsloth studio update` to refresh."
     )
 
 

@@ -2721,6 +2721,11 @@ export function AppSidebar() {
     .map((item) => item.id);
   // More needs two or more rows to be worth a click; with exactly one unpinned, the menu and that row are both dropped.
   const overflowNavIds = unpinnedNavIds.length > 1 ? unpinnedNavIds : [];
+  // More never takes the active pill, so a dot on it says the current page, or a row with work
+  // running, is tucked behind it.
+  const overflowNeedsDot = overflowNavIds.some(
+    (id) => navRows[id].active || navRows[id].spinner,
+  );
   const inlineNavIds = sidebarNav
     .filter((item) => navRowPinned(item))
     .map((item) => item.id);
@@ -5284,6 +5289,13 @@ export function AppSidebar() {
                             <span className="text-ui-14p5 leading-ui-19 tracking-nav">
                               {t("shell.navigation.more")}
                             </span>
+                            {overflowNeedsDot && (
+                              // Centred in the trailing column a row's spinner takes.
+                              <span
+                                aria-hidden="true"
+                                className="ml-auto mr-2.5 size-1.5 shrink-0 rounded-full bg-primary"
+                              />
+                            )}
                           </SidebarMenuButton>
                         </DropdownMenuTrigger>
                       </TooltipPrimitive.Trigger>
@@ -5349,6 +5361,14 @@ export function AppSidebar() {
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
+                  {overflowNeedsDot && (
+                    // Collapsed (icon-only) rail: the button hides its spans, so the dot sits over
+                    // the icon corner like a row's spinner badge.
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute right-1 top-1 hidden size-1.5 rounded-full bg-primary group-data-[collapsible=icon]:block"
+                    />
+                  )}
                 </SidebarMenuItem>
               )}
             </SidebarMenu>

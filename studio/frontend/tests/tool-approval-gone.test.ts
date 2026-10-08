@@ -67,6 +67,11 @@ function harness(response: ReturnType<typeof jsonResponse>) {
       "@/features/hub/lib/network": { isHuggingFaceOffline: () => false },
       "@/features/native-intents/api": { consumeNativePathToken: () => undefined },
       "@/lib/model-lifecycle-events": {},
+      // chat-api's loadModel imports; nothing here loads a model.
+      "@/lib/load-verdict": { memoryOvercommitVerdict: () => null },
+      "../memory-overcommit-consent": {
+        requestMemoryOvercommitConsent: async () => "cancel",
+      },
     },
   );
   return { module, requests };

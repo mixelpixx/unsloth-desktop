@@ -6,10 +6,12 @@ from __future__ import annotations
 import asyncio
 import atexit
 import concurrent.futures
+import contextvars
 import hashlib
 import importlib
 import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -21,8 +23,11 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from collections import deque
+from contextlib import asynccontextmanager, contextmanager, nullcontext
+from datetime import datetime
 from functools import wraps
+from pathlib import Path
 from typing import Any, Optional, get_type_hints
 from urllib.parse import urlsplit, urlunsplit
 from weakref import WeakKeyDictionary
@@ -34,6 +39,7 @@ from utils.account_context import (
     current_account_id,
     is_owner_context,
 )
+from utils.log_redaction import redact_log_text
 
 from core.inference import mcp_images
 
@@ -291,7 +297,29 @@ def stdio_mcp_disabled_reason() -> str:
     if _managed_mcp_restricted():
         return "Only the installation owner may register local-command MCP servers."
     from state.tool_policy import get_tool_policy
-    from utils.host_policy import loopback_default_active, remote_connector_active
+    from utils.host_policy import (
+        loopback_default_active,
+        remote_connector_active,
+        stdio_mcp_withheld_reason,
+    )
+
+    # Name the bind as the cause: a bare "set the env var" reads like a bug to someone who followed the
+    # README's `-H 0.0.0.0` LAN example and then tried to add an .exe server.
+    withheld = stdio_mcp_withheld_reason()
+    if withheld == "network":
+        return (
+            "Local commands (an .exe, npx, uvx or other local program) are turned off because Unsloth "
+            "is listening on your network (started with -H 0.0.0.0 or another non-local address), "
+            "and a local program runs with your account's full access. To use them, restart with "
+            "`unsloth studio -H 127.0.0.1` to keep Unsloth on this computer, or set "
+            "UNSLOTH_STUDIO_ALLOW_STDIO_MCP=1 before starting to allow them on the network anyway. "
+            "Remote http:// and https:// servers still work."
+        )
+    if withheld == "colab":
+        return (
+            "Local commands (stdio MCP servers) are turned off on Colab. "
+            "Use an http:// or https:// MCP server URL instead."
+        )
 
     if os.environ.get("UNSLOTH_STUDIO_ALLOW_STDIO_MCP") == "1" and loopback_default_active():
         if remote_connector_active():
@@ -307,8 +335,8 @@ def stdio_mcp_disabled_reason() -> str:
                 "https:// URL instead."
             )
     return (
-        "Local commands aren't enabled on this server. To allow them, set "
-        "UNSLOTH_STUDIO_ALLOW_STDIO_MCP=1 and restart Unsloth, or use an "
+        "Local commands (an .exe, npx, uvx or other local program) aren't enabled on this server. "
+        "To allow them, set UNSLOTH_STUDIO_ALLOW_STDIO_MCP=1 and restart Unsloth, or use an "
         "http:// or https:// URL instead."
     )
 
@@ -502,6 +530,69 @@ def _stdio_env(headers: Optional[dict], command: Optional[str] = None) -> Option
     return env or None
 
 
+# The SDK hands a stdio child only get_default_environment() (12 names on Windows) under the server's own vars. Real
+# programs need more: ProgramFiles/ProgramData to find their own installs (Playwright locating Chrome), ComSpec and
+# windir for wrapper scripts, TMP for temp files, and the proxy/CA variables without which every outbound request
+# fails behind a corporate proxy or TLS inspection. An allowlist rather than the whole environment, so none of
+# Studio's own secrets (HF_TOKEN, provider keys, the UNSLOTH_* settings) reach a third-party program.
+_INHERITED_WINDOWS_ENV = (
+    "ALLUSERSPROFILE",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "COMPUTERNAME",
+    "ComSpec",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "PUBLIC",
+    "TMP",
+    "USERDOMAIN",
+    "windir",
+)
+_INHERITED_NETWORK_ENV = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+)
+# POSIX names are case-sensitive and curl, wget and most libraries read the lowercase spelling first.
+_INHERITED_POSIX_PROXY_ENV = ("http_proxy", "https_proxy", "no_proxy", "all_proxy")
+
+
+def _inherited_stdio_env(env: Optional[dict]) -> Optional[dict]:
+    """The spawn env: the allowlisted host variables underneath ``env`` (the result of _stdio_env).
+    Never PATH: _stdio_argv treats a PATH in the env as the user's explicit, authoritative choice, and
+    the SDK's default env already carries the host's. Names the user configured win, compared without
+    case even on POSIX, so a configured HTTPS_PROXY is not overridden by an inherited https_proxy
+    that curl would read first. Only the spawn sees the result: sessions stay keyed on the
+    configured env alone."""
+    names = _INHERITED_NETWORK_ENV + (
+        _INHERITED_WINDOWS_ENV if _IS_WINDOWS else _INHERITED_POSIX_PROXY_ENV
+    )
+    configured = {key.upper() for key in (env or {})}
+    inherited = {}
+    for name in names:
+        value = os.environ.get(name)
+        if value and name.upper() not in configured:
+            inherited[name] = value
+    if not inherited:
+        return env
+    return {**inherited, **(env or {})}
+
+
 def _stdio_argv(parts: list, env: Optional[dict]) -> list:
     """argv with argv[0] resolved against the child's PATH. Windows resolves the command against the
     parent environment before ``env`` applies, so a managed-only ``npx`` has to be handed over as
@@ -556,6 +647,801 @@ def _stdio_argv(parts: list, env: Optional[dict]) -> list:
     return [executable, *parts[1:]]
 
 
+def _looks_like_path(token: str) -> bool:
+    return bool(os.path.dirname(token)) or re.match(r"^[A-Za-z]:", token) is not None
+
+
+def unquoted_spaced_program(parts: list[str]) -> Optional[str]:
+    """The program a command meant when it is a spaced path typed without quotes. ``C:\\My
+    Tools\\server.exe --x`` splits into ``C:\\My`` + ``Tools\\server.exe``; when argv[0] is not a
+    file but argv[0..k] joined with spaces names one, return that joined path. argv[0] counts only
+    as an exact file: CreateProcess-style extension guessing would resolve ``C:\\My`` to a planted
+    ``C:\\My.exe``, which is exactly the ambiguity this exists to refuse."""
+    if len(parts) < 2 or not _looks_like_path(parts[0]):
+        return None
+    try:
+        if os.path.isfile(parts[0]):
+            return None
+        for end in range(2, len(parts) + 1):
+            candidate = " ".join(parts[:end])
+            if os.path.isfile(candidate) or (
+                _looks_like_path(candidate) and shutil.which(candidate) is not None
+            ):
+                return candidate
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Local-program (stdio) start-up diagnostics
+#
+# Without these, every way a local program fails to start reached the user as one of three opaque strings: a missing
+# EXE as "[WinError 2] The system cannot find the file specified" (no file name), a crash or missing env var as
+# "Connection closed", a hang as "An internal error occurred" (a timeout carries no message). Its stderr went to the
+# backend's raw stderr, outside the session log. Each spawn now writes stderr to a per-command log, and a failed start
+# is described from the exception plus the tail of what that spawn printed.
+# ---------------------------------------------------------------------------------------------------------------------
+
+_STDIO_LOG_MAX_BYTES = 2 * 1024 * 1024
+_STDIO_TAIL_CHARS = 800
+# Read at most this much of a spawn's stderr back: the tail is all that is shown, and a chatty server can write
+# megabytes before it fails.
+_STDIO_TAIL_READ_BYTES = 64 * 1024
+# Shorter values ("1", "true", "dev") are too likely to appear in ordinary output to be worth masking.
+_REDACT_MIN_CHARS = 4
+_SECRET_MASK = "***"
+# Argument and query names whose value is a credential. Broader than log_redaction's key list on purpose: there a
+# false positive blanks ordinary log text, here it only adds one configured value to the list masked by exact match.
+_SECRET_ARG_NAME = re.compile(
+    r"(?i)token|secret|passw|api[-_]?key|apikey|auth|credential|private[-_]?key|access[-_]?key|"
+    r"session|cookie|signature"
+)
+_AUTH_SCHEMES = ("bearer", "basic", "digest", "token", "apikey")
+# The pump that masks a stdio server's stderr on its way to disk (_MaskedStderrPump).
+_PUMP_READ_BYTES = 64 * 1024
+# A line with no newline is held for masking until it ends; past this it is written in pieces, cut at a space or
+# carriage return where there is one (a progress bar redraws with \r and may never print \n).
+_PUMP_MAX_LINE_CHARS = 64 * 1024
+# How long a failed start waits for the child's last output to reach the file before quoting it. Short: the
+# wait runs on whichever event loop is starting the server, and usually ends at EOF or idle within ~50 ms.
+_PUMP_SETTLE_SECONDS = 0.5
+# A reader that has sat in an empty read this long has everything written so far: a pipe read returns as soon
+# as any byte is there.
+_PUMP_IDLE_SECONDS = 0.05
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+_CONNECTION_CLOSED_CODE = -32000  # mcp.types.CONNECTION_CLOSED
+# Windows CreateFile access and disposition values for _open_append_only.
+_FILE_APPEND_DATA = 0x0004
+_FILE_READ_ATTRIBUTES = 0x0080
+_SYNCHRONIZE = 0x00100000
+_FILE_SHARE_ALL = 0x0007
+_OPEN_ALWAYS = 4
+_FILE_ATTRIBUTE_NORMAL = 0x0080
+
+
+class McpStdioServerError(RuntimeError):
+    """A local MCP program failed in a way Studio could explain. The message is written for the person
+    who configured the server: it names the program by its file name only and may quote the tail of
+    its output, with configured env values masked. Every line after the first is that quoted output,
+    so log the summary and show the whole message."""
+
+    @property
+    def summary(self) -> str:
+        return (str(self).splitlines() or [""])[0]
+
+
+def _open_append_only(path: Path):
+    """Open ``path`` so every write lands at the current end of the file, including writes by the
+    child processes that inherit the handle as their stderr. Two chats using one server run two
+    copies of the same command, which share this log. POSIX O_APPEND already appends atomically, but
+    Windows only emulates append in the C runtime: a child writes at its handle's own position, so
+    the second process overwrites the first one's output (and a truncation leaves the other writing
+    past a hole). A handle opened with FILE_APPEND_DATA and no FILE_WRITE_DATA makes the kernel do
+    the appending for every holder."""
+    if _IS_WINDOWS:
+        try:
+            import _winapi
+            import msvcrt
+
+            handle = _winapi.CreateFile(
+                str(path),
+                _FILE_APPEND_DATA | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE,
+                _FILE_SHARE_ALL,
+                _winapi.NULL,
+                _OPEN_ALWAYS,
+                _FILE_ATTRIBUTE_NORMAL,
+                _winapi.NULL,
+            )
+            try:
+                fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_APPEND)
+            except BaseException:
+                _winapi.CloseHandle(handle)
+                raise
+            try:
+                return open(fd, "a", encoding = "utf-8", errors = "replace")
+            except BaseException:
+                os.close(fd)
+                raise
+        except (ImportError, AttributeError, OSError) as exc:
+            logger.debug("Append-only MCP log handle unavailable, using a plain one: %s", exc)
+    return open(path, "a", encoding = "utf-8", errors = "replace")
+
+
+def _program_label(argv0: str) -> str:
+    """argv[0] by file name only: messages may reach a model or a shared log, and a full path names
+    the user's home directory."""
+    return os.path.basename(argv0.rstrip("\\/")) or argv0
+
+
+def _is_secret_name(name: str) -> bool:
+    bare = name.lstrip("-").lower()
+    return bool(_SECRET_ARG_NAME.search(bare)) or bare in ("key", "pat")
+
+
+def _url_secrets(token: str) -> list[str]:
+    """Credentials inside one URL: the password of ``user:pass@`` (or the user part alone, the shape
+    of ``https://<token>@host``) and the value of every secret-named query parameter."""
+    from urllib.parse import parse_qsl
+
+    # --db=postgres://user:pw@host: the URL starts after the flag.
+    head = token.partition("://")[0]
+    if "=" in head:
+        token = token[head.index("=") + 1 :]
+    try:
+        parts = urlsplit(token)
+        found = []
+        if parts.password:
+            found.append(parts.password)
+        elif parts.username:
+            found.append(parts.username)
+        found.extend(
+            value
+            for name, value in parse_qsl(parts.query, keep_blank_values = True)
+            if _is_secret_name(name)
+        )
+        return found
+    except ValueError:
+        return []
+
+
+def mcp_secret_values(url: str, headers: Optional[dict]) -> list[str]:
+    """Every configured value that must not appear in what Studio writes or shows about this server,
+    longest first so a value that contains another is masked whole. The one notion of "secret" shared
+    by the start-up error tail, the per-command stderr log on disk and the log viewer:
+
+    - every env var or header value (a local program's env rides the headers field). By value, not
+      name: Studio cannot tell GITHUB_TOKEN from MY_SERVICE_ID, and a masked id costs less than a
+      missed key;
+    - the credential behind an auth scheme, so ``Bearer abc...`` also masks a bare ``abc...``;
+    - URL credentials and secret-named query values, in the address or in any argument;
+    - the value after a secret-named flag (``--token X``, ``--api-key=X``) or in ``NAME=value``.
+
+    Values shorter than _REDACT_MIN_CHARS are left out: "1" or "dev" would blank ordinary output."""
+    values: list[str] = [
+        value for value in (headers or {}).values() if isinstance(value, str)
+    ]
+    try:
+        tokens = parse_stdio_command(url) if is_stdio(url) else [url]
+    except ValueError:
+        tokens = []
+    for index, token in enumerate(tokens):
+        if "://" in token:
+            values.extend(_url_secrets(token))
+            continue
+        name, sep, value = token.partition("=")
+        if sep and _is_secret_name(name):
+            values.append(value)
+        elif (
+            token.startswith("-")
+            and _is_secret_name(token)
+            and index + 1 < len(tokens)
+            and not tokens[index + 1].startswith("-")
+        ):
+            values.append(tokens[index + 1])
+    for value in list(values):
+        scheme, sep, credential = value.strip().partition(" ")
+        if sep and scheme.lower() in _AUTH_SCHEMES:
+            values.append(credential.strip())
+    unique = {value for value in values if len(value) >= _REDACT_MIN_CHARS}
+    return sorted(unique, key = len, reverse = True)
+
+
+def mask_secret_values(text: str, secrets) -> str:
+    for secret in secrets:
+        text = text.replace(secret, _SECRET_MASK)
+    return text
+
+
+def stdio_log_owners() -> dict[str, tuple[str, list[str]]]:
+    """Per-command stderr log file name -> (the server's display name, its secret values), for every
+    saved local-program server of the current account. The log viewer names a file by the server
+    that wrote it and masks that server's values on read, which also covers a file written before
+    stderr was masked on its way to disk. A command edited since keeps its old file under a digest
+    nothing maps any more; that file falls back to its program name and the shape-based redaction."""
+    from storage import mcp_servers_db
+
+    owners: dict[str, tuple[str, list[str]]] = {}
+    for row in mcp_servers_db.list_servers():
+        url = row.get("url") or ""
+        if not is_stdio(url):
+            continue
+        try:
+            parts = parse_stdio_command(url)
+            headers = json.loads(row.get("headers_json") or "null")
+        except (ValueError, TypeError):
+            continue
+        if not parts:
+            continue
+        name = str(row.get("display_name") or "").strip() or _program_label(parts[0])
+        owners[_stdio_log_name(url, parts[0])] = (
+            name,
+            mcp_secret_values(url, headers if isinstance(headers, dict) else None),
+        )
+    return owners
+
+
+def _stdio_log_name(url: str, argv0: str) -> str:
+    """``<program>-<digest>.log``. The digest is _session_log_id's, so a backend log line naming
+    ``server.exe#3f2a...`` leads straight to its file, and two commands that share a program
+    (``npx a`` / ``npx b``) keep separate logs."""
+    stem = os.path.basename(argv0.rstrip("\\/"))
+    if stem.lower().endswith(_WINDOWS_LAUNCHER_SUFFIXES):
+        stem = os.path.splitext(stem)[0]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")[:60] or "server"
+    return f"{stem}-{hashlib.sha256(url.encode()).hexdigest()[:12]}.log"
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """exc, its causes/contexts, and the members of any exception group on the way (anyio task groups
+    raise those), so a FileNotFoundError wrapped as "Client failed to connect: ..." is still found."""
+    seen: list[BaseException] = []
+    pending = [exc]
+    while pending and len(seen) < 32:
+        current = pending.pop()
+        if current is None or any(current is s for s in seen):
+            continue
+        seen.append(current)
+        pending.extend(getattr(current, "exceptions", None) or ())
+        pending.append(current.__cause__)
+        pending.append(current.__context__)
+    return seen
+
+
+def _is_connection_closed(chain: list[BaseException]) -> bool:
+    """The child's stdout ended before the handshake did, which in practice means it exited."""
+    import anyio
+
+    for exc in chain:
+        error = getattr(exc, "error", None)
+        if (
+            getattr(error, "code", None) == _CONNECTION_CLOSED_CODE
+            and "closed" in str(getattr(error, "message", "")).lower()
+        ):
+            return True
+        if isinstance(
+            exc,
+            (
+                anyio.ClosedResourceError,
+                anyio.BrokenResourceError,
+                anyio.EndOfStream,
+                BrokenPipeError,
+                ConnectionResetError,
+            ),
+        ):
+            return True
+        if isinstance(exc, RuntimeError) and "closed unexpectedly" in str(exc):
+            return True
+    return False
+
+
+class _StdioProcessLog:
+    """Per-spawn state that the SDK's stdout reader can reach. The reader runs in a task created
+    (indirectly) by the task that entered the client, so it inherits the context variable set around
+    that entry; nothing here has to thread through fastmcp or the SDK."""
+
+    def __init__(self, label: str, redact):
+        self.label = label
+        self.redact = redact
+        self.non_json_lines = 0
+        self.recent_non_json: deque[str] = deque(maxlen = 5)
+
+
+_stdio_process_log: contextvars.ContextVar[Optional[_StdioProcessLog]] = contextvars.ContextVar(
+    "unsloth_mcp_stdio_process_log", default = None
+)
+
+
+class _MaskedStderrPump:
+    """Stands between a local program's stderr and its log file, so what reaches the disk is masked.
+
+    fastmcp hands ``log_file`` to the SDK, which passes it to the spawn as ``stderr=``: handed the file
+    itself, the child wrote to it directly and Studio never saw the bytes, so a server echoing its
+    env or request headers (plenty do with --debug) put its API key on disk in the clear, for the log
+    viewer and the log export to read later. The child now gets the write end of a pipe; this thread
+    reads the other end, masks every line (the configured values first, then the log viewer's
+    credential shapes) and appends it to the file.
+
+    Lines, not reads: a read can end in the middle of a secret. An unterminated line is held until
+    its newline, EOF or _PUMP_MAX_LINE_CHARS, and offered to the error tail masked, so a program
+    stopped at a prompt that printed no newline still shows it.
+
+    The loop never stops reading before EOF, whatever fails: a child whose stderr pipe fills (4 KiB
+    on Windows) blocks, and an MCP server blocked on stderr hangs every call. EOF arrives when the
+    last holder of the write end exits, which is the server plus any child it started with inherited
+    stderr (npx -> node), so the thread and the file handle live exactly as long as that output can."""
+
+    def __init__(self, read_fd: int, sink, mask) -> None:
+        self._fd = read_fd
+        self._sink = sink
+        self._mask = mask
+        self._lock = threading.Lock()
+        self._pending = ""
+        # When the reader entered the read it is blocked in, None while it is processing a chunk.
+        self._blocked_since: Optional[float] = None
+        self._thread = threading.Thread(
+            target = self._run, name = "mcp-stderr-log", daemon = True
+        )
+        self._thread.start()
+
+    def _clean(self, line: str) -> str:
+        line = line.rstrip("\r")
+        if "\x00" in line:
+            # UTF-16 output (a PowerShell host) arrives with a NUL between ASCII characters, and no
+            # mask can match through those. Dropping them leaves the same text.
+            line = line.replace("\x00", "")
+        return redact_log_text(self._mask(line))
+
+    def _feed(self, text: str, final: bool = False) -> None:
+        with self._lock:
+            *lines, pending = (self._pending + text).split("\n")
+            if final and pending:
+                lines.append(pending)
+                pending = ""
+            while len(pending) > _PUMP_MAX_LINE_CHARS:
+                cut = max(
+                    pending.rfind(" ", 0, _PUMP_MAX_LINE_CHARS),
+                    pending.rfind("\r", 0, _PUMP_MAX_LINE_CHARS),
+                )
+                if cut <= 0:
+                    cut = _PUMP_MAX_LINE_CHARS
+                lines.append(pending[:cut])
+                pending = pending[cut:]
+            self._pending = pending
+            if not lines:
+                return
+            # Under the lock, so the file plus the held line is always everything read so far.
+            try:
+                self._sink.write("".join(self._clean(line) + "\n" for line in lines))
+                self._sink.flush()
+            except (OSError, ValueError):
+                pass  # a full disk loses log lines, never the server: keep draining
+
+    def _run(self) -> None:
+        import codecs
+
+        decoder = codecs.getincrementaldecoder("utf-8")(errors = "replace")
+        try:
+            while True:
+                self._blocked_since = time.monotonic()
+                try:
+                    chunk = os.read(self._fd, _PUMP_READ_BYTES)
+                except OSError:
+                    chunk = b""
+                self._blocked_since = None
+                if not chunk:
+                    break
+                try:
+                    self._feed(decoder.decode(chunk))
+                except Exception:  # noqa: BLE001
+                    pass  # see the class docstring: whatever fails, keep reading
+            self._feed(decoder.decode(b"", final = True), final = True)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            for close in (lambda: os.close(self._fd), self._sink.close):
+                try:
+                    close()
+                except (OSError, ValueError):
+                    pass
+
+    @contextmanager
+    def held_line(self):
+        """Pause the pump between lines and yield the unterminated line read so far, masked like the
+        file. Read the file inside it: outside, a line finishing between the two reads shows twice
+        or not at all."""
+        with self._lock:
+            yield self._clean(self._pending) if self._pending else ""
+
+    def settle(self, timeout: float = _PUMP_SETTLE_SECONDS) -> None:
+        """Wait, briefly, until what the child has written so far is in the file: EOF, or the
+        reader idle in an empty read. Sleeps first, so a reader the child's last write just woke gets
+        the GIL before this looks: after a crash the output is in the pipe but maybe not yet read."""
+        deadline = time.monotonic() + timeout
+        while self._thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.02)
+            blocked = self._blocked_since
+            if blocked is not None and time.monotonic() - blocked >= _PUMP_IDLE_SECONDS:
+                return
+
+    def join(self, timeout: float = _PUMP_SETTLE_SECONDS) -> None:
+        self._thread.join(timeout)
+
+
+class _StdioLaunch:
+    """Everything a failed start needs to explain itself, built with the client and attached to its
+    transport: the program's file name, where this spawn's stderr goes, and which configured values
+    (mcp_secret_values) to mask in that log and in anything quoted back."""
+
+    def __init__(self, url: str, parts: list[str], env: Optional[dict]):
+        self.url = url
+        self.parts = list(parts)
+        self.program = _program_label(parts[0])
+        self.label = _session_log_id(url)
+        self.secrets = mcp_secret_values(url, env)
+        self.log_name = _stdio_log_name(url, parts[0])
+        self.log_path: Optional[Path] = None
+        self.log_offset = 0
+        self._log_created = False
+        self._log_handle = None
+        self._pump: Optional[_MaskedStderrPump] = None
+        self.process_log = _StdioProcessLog(self.label, self.redact)
+        self.handshake_done = False
+
+    def redact(self, text: str) -> str:
+        return mask_secret_values(text, self.secrets)
+
+    def open_log(self):
+        """Open the per-command stderr log for this spawn and return the handle for the transport: the
+        write end of a pipe whose output _MaskedStderrPump masks into the file. None falls back to the
+        backend's own stderr (the old behaviour) when either cannot be opened. Bounded by truncating
+        at spawn once past _STDIO_LOG_MAX_BYTES: the newest start-up is the one worth keeping, and
+        rotating files under processes that still hold them gains nothing."""
+        from utils.paths.storage_roots import ensure_dir, studio_root
+
+        try:
+            path = ensure_dir(Path(studio_root()) / "logs" / "mcp") / self.log_name
+            created = False
+            try:
+                if path.stat().st_size > _STDIO_LOG_MAX_BYTES:
+                    with open(path, "r+b") as oversized:
+                        oversized.truncate(0)
+            except FileNotFoundError:
+                created = True
+            handle = _open_append_only(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not open the stderr log for MCP server %s: %s", self.label, exc)
+            return None
+        try:
+            # The label, never the command: argv and env can carry credentials.
+            handle.write(
+                f"\n===== {datetime.now().isoformat(timespec = 'seconds')} start {self.label} =====\n"
+            )
+            handle.flush()
+            self.log_offset = os.fstat(handle.fileno()).st_size
+        except OSError:
+            self.log_offset = 0
+        try:
+            read_fd, write_fd = os.pipe()
+        except OSError as exc:
+            handle.close()
+            logger.warning("Could not open the stderr pipe for MCP server %s: %s", self.label, exc)
+            return None
+        try:
+            writer = open(write_fd, "w", encoding = "utf-8", errors = "replace")
+        except Exception:  # noqa: BLE001
+            os.close(write_fd)
+            os.close(read_fd)
+            handle.close()
+            return None
+        self.log_path = path
+        self._log_created = created
+        self._log_handle = writer
+        self._pump = _MaskedStderrPump(read_fd, handle, self.redact)
+        return writer
+
+    def close_log(self) -> None:
+        """Drop Studio's copy of the pipe's write end once the spawn has happened (or failed): the
+        child keeps its own inherited one for as long as it runs, and the pump reads until the last
+        copy closes."""
+        handle, self._log_handle = self._log_handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    def discard_unused_log(self) -> None:
+        """After a failed start: remove the log this spawn created if nothing but its header reached it,
+        so every mistyped path tried in the dialog does not leave an empty file behind."""
+        path = self.log_path
+        if path is None or not self._log_created:
+            return
+        if self._pump is not None:
+            # No child holds the pipe after a failed spawn, so this is EOF at once; it closes the file,
+            # which Windows will not unlink while a plain (non-sharing) handle has it open.
+            self._pump.join()
+        try:
+            if path.stat().st_size == self.log_offset:
+                path.unlink()
+                self.log_path = None
+        except OSError:
+            pass
+
+    def stderr_tail(self) -> str:
+        """What this spawn printed to stderr, last _STDIO_TAIL_CHARS characters, cleaned for display:
+        decoded leniently, ANSI colour and cursor codes removed, configured values masked (again: the
+        file already is, unless an older build wrote it). Masked before it is cut, so a secret
+        straddling the cut cannot leave half of itself behind. Includes the line the pump still holds,
+        so a prompt printed with no newline is quoted."""
+        if self.log_path is None:
+            return ""
+        pump = self._pump
+        if pump is not None:
+            pump.settle()
+        try:
+            with pump.held_line() if pump is not None else nullcontext("") as held:
+                with open(self.log_path, "rb") as log:
+                    size = log.seek(0, os.SEEK_END)
+                    start = max(self.log_offset, size - _STDIO_TAIL_READ_BYTES)
+                    raw = b""
+                    if start < size:
+                        log.seek(start)
+                        raw = log.read(size - start)
+        except OSError:
+            return ""
+        if not raw and not held:
+            return ""
+        text = _ANSI_ESCAPE.sub("", raw.decode("utf-8", errors = "replace") + held)
+        text = self.redact(text.replace("\r\n", "\n").replace("\r", "\n"))
+        text = "\n".join(line.rstrip() for line in text.split("\n")).strip()
+        if len(text) > _STDIO_TAIL_CHARS:
+            text = "…" + text[-_STDIO_TAIL_CHARS:].lstrip()
+        return text
+
+    def output_section(self) -> str:
+        tail = self.stderr_tail()
+        if tail:
+            return (
+                f"\nLast output on stderr:\n{tail}"
+                f"\n(Full log: logs/mcp/{self.log_name} in the Unsloth Studio folder.)"
+            )
+        if self.process_log.recent_non_json:
+            # Plenty of CLI tools print their usage or error text to stdout, which a stdio server must
+            # reserve for MCP messages; the reader saw those lines even though stderr is empty.
+            return "\nIt printed this on stdout instead of MCP messages:\n" + "\n".join(
+                self.process_log.recent_non_json
+            )
+        return ""
+
+    def _not_found_message(self) -> str:
+        if os.path.dirname(self.parts[0]):
+            message = f"Program not found: {self.program}. Check the program path."
+        else:
+            message = (
+                f"Program not found: {self.program}. Check that it is installed and on PATH, "
+                "or enter its full path."
+            )
+        spaced = unquoted_spaced_program(self.parts)
+        if spaced is not None:
+            message += f' The path contains spaces — wrap it in double quotes: "{spaced}"'
+        elif (
+            len(self.parts) > 1
+            and _looks_like_path(self.parts[0])
+            and not self.url.lstrip().startswith(('"', "'"))
+        ):
+            message += " If the program's path contains spaces, wrap it in double quotes."
+        return message
+
+    def startup_error(self, exc: BaseException) -> Optional[McpStdioServerError]:
+        """The explained form of a failed start, or None to let ``exc`` through unchanged (nothing to
+        add: no recognisable cause and no output)."""
+        chain = _exception_chain(exc)
+        if any(isinstance(item, McpStdioServerError) for item in chain):
+            return None
+        if any(isinstance(item, FileNotFoundError) for item in chain):
+            return McpStdioServerError(self._not_found_message())
+        for item in chain:
+            if isinstance(item, OSError) and getattr(item, "winerror", None) == 193:
+                return McpStdioServerError(
+                    f"{self.program} is not a program Windows can run directly (ERROR_BAD_EXE_FORMAT). "
+                    "A script needs its interpreter as the program, for example node or python."
+                )
+            if isinstance(item, PermissionError):
+                return McpStdioServerError(f"Permission denied starting {self.program}.")
+        if _is_connection_closed(chain):
+            section = self.output_section()
+            if not section:
+                return McpStdioServerError(
+                    "The server exited during startup without printing an error."
+                )
+            return McpStdioServerError(f"The server exited during startup.{section}")
+        section = self.output_section()
+        if section:
+            return McpStdioServerError(f"{str(exc).strip() or type(exc).__name__}{section}")
+        return None
+
+    def timeout_error(self, seconds: Optional[float]) -> McpStdioServerError:
+        within = f" within {seconds:g}s" if seconds is not None else ""
+        if self.handshake_done:
+            head = f"The server started but did not list its tools{within}."
+        else:
+            head = (
+                f"No MCP handshake{within} — the program may be waiting for input, downloading on "
+                "first run, or not an MCP stdio server."
+            )
+        return McpStdioServerError(head + self.output_section())
+
+
+def _stdio_launch_of(client) -> Optional[_StdioLaunch]:
+    launch = getattr(getattr(client, "transport", None), "unsloth_stdio_launch", None)
+    return launch if isinstance(launch, _StdioLaunch) else None
+
+
+async def _start_stdio_client(client, launch: _StdioLaunch):
+    """client.__aenter__() for a local program: open this spawn's stderr log just before the spawn
+    (building a client must stay free of side effects; plenty are built and never entered), expose
+    the per-spawn log state to the SDK's reader, and turn a failed start into an explained one."""
+    # fastmcp reads log_file when it spawns, not when the transport is built.
+    client.transport.log_file = launch.open_log()
+    token = _stdio_process_log.set(launch.process_log)
+    try:
+        entered = await client.__aenter__()
+    except Exception as exc:
+        launch.close_log()
+        explained = launch.startup_error(exc)
+        launch.discard_unused_log()
+        if explained is None:
+            raise
+        raise explained from exc
+    finally:
+        _stdio_process_log.reset(token)
+        launch.close_log()
+    launch.handshake_done = True
+    return entered
+
+
+@asynccontextmanager
+async def _connected(client):
+    """``async with client`` with the stdio start-up diagnostics when the client is a local program."""
+    launch = _stdio_launch_of(client)
+    if launch is None:
+        async with client as entered:
+            yield entered
+        return
+    entered = await _start_stdio_client(client, launch)
+    try:
+        yield entered
+    finally:
+        await client.__aexit__(None, None, None)
+
+
+class _CollapseNonJsonStdout(logging.Filter):
+    """The SDK logs a full ERROR traceback for every stdout line that is not JSON-RPC (a start-up
+    banner, progress text, a debug print), so one test of a chatty program buried the log under
+    dozens of identical tracebacks. Keep the first one per server process as a one-line warning
+    naming the server and quoting the line, and drop the rest. Anything else the SDK logs, including
+    its other errors, passes untouched. Outside a Studio spawn (no per-process state) it rate-limits
+    instead."""
+
+    _MESSAGE = "Failed to parse JSONRPC message"
+    _UNSCOPED_INTERVAL = 60.0
+    unsloth_collapses_non_json = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._unscoped_next = 0.0
+
+    @staticmethod
+    def _offending_line(record: logging.LogRecord) -> Optional[str]:
+        exc = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
+        errors = getattr(exc, "errors", None)
+        if not callable(errors):
+            return None
+        try:
+            value = errors()[0].get("input")
+        except Exception:  # noqa: BLE001
+            return None
+        if value is None:
+            return None
+        text = _ANSI_ESCAPE.sub("", value if isinstance(value, str) else str(value)).strip()
+        return text[:200] + ("…" if len(text) > 200 else "")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if not (isinstance(record.msg, str) and record.msg.startswith(self._MESSAGE)):
+                return True
+            state = _stdio_process_log.get()
+            if state is not None:
+                line = self._offending_line(record)
+                if line:
+                    state.recent_non_json.append(state.redact(line))
+                state.non_json_lines += 1
+                if state.non_json_lines > 1:
+                    return False
+                record.msg = (
+                    "MCP server %s wrote a line that is not JSON-RPC to stdout; it was skipped. "
+                    "Further such lines from this process are not logged. Line: %s"
+                )
+                record.args = (state.label, state.redact(line) if line else "<unreadable>")
+            else:
+                now = time.monotonic()
+                if now < self._unscoped_next:
+                    return False
+                self._unscoped_next = now + self._UNSCOPED_INTERVAL
+                record.msg = (
+                    "An MCP stdio server wrote a line that is not JSON-RPC to stdout; it was skipped. "
+                    "Repeats are logged at most once a minute."
+                )
+                record.args = ()
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+            return True
+        except Exception:  # noqa: BLE001
+            return True
+
+
+def _install_stdio_log_filter() -> None:
+    sdk_logger = logging.getLogger("mcp.client.stdio")
+    if not any(getattr(f, "unsloth_collapses_non_json", False) for f in sdk_logger.filters):
+        sdk_logger.addFilter(_CollapseNonJsonStdout())
+
+
+def _install_lenient_stdio_decoding() -> None:
+    """The SDK decodes a stdio server's stdout strictly (anyio's TextReceiveStream, errors="strict").
+    One byte that is not UTF-8 -- a cp1252 "é" from a Windows program printing through the ANSI code
+    page -- raises inside the reader task and ends it, and every pending request then waits out its
+    full timeout with nothing logged. A UTF-8 BOM, which .NET Framework and PowerShell hosts emit
+    with UTF-8 console output, glues itself to the first line, so ``initialize`` never parses and the
+    handshake hangs the same way.
+
+    fastmcp builds StdioServerParameters itself and never exposes its encoding_error_handler, so
+    replace the class the SDK's reader looks up by name when it runs: invalid bytes become U+FFFD
+    (inside a JSON string that keeps the message; anywhere else it fails that one line, which the
+    reader already skips) and a leading BOM is dropped. Installed once, and only over the exact class
+    expected, so an SDK that restructures its reader keeps its own behaviour instead of breaking
+    this import."""
+    try:
+        import mcp.client.stdio as sdk_stdio
+        from anyio.streams.text import TextReceiveStream
+    except Exception:  # noqa: BLE001
+        return
+    current = getattr(sdk_stdio, "TextReceiveStream", None)
+    if getattr(current, "unsloth_lenient", False):
+        return
+    if current is not TextReceiveStream:
+        logger.warning(
+            "mcp.client.stdio no longer reads stdout through anyio's TextReceiveStream; stdio MCP "
+            "servers that print invalid UTF-8 or a BOM may hang until their timeout"
+        )
+        return
+
+    class _LenientTextReceiveStream(TextReceiveStream):
+        unsloth_lenient = True
+
+        def __post_init__(self, encoding: str, errors: str) -> None:
+            super().__post_init__(encoding, "replace" if errors == "strict" else errors)
+            self._bom_pending = True
+
+        async def receive(self) -> str:
+            while True:
+                text = await super().receive()
+                if self._bom_pending:
+                    self._bom_pending = False
+                    text = text[1:] if text.startswith("\ufeff") else text
+                if text:
+                    return text
+
+    sdk_stdio.TextReceiveStream = _LenientTextReceiveStream
+
+
+_install_stdio_log_filter()
+_install_lenient_stdio_decoding()
+
+
 def is_studio_decisions(url: str) -> bool:
     from routes.systemone import MCP_PATH
     from utils.host_policy import is_loopback_host
@@ -572,6 +1458,7 @@ def _client(
     url: str,
     headers: Optional[dict],
     use_oauth: bool = False,
+    cwd: Optional[str] = None,
 ):
     validate_mcp_address(url)
     from fastmcp import Client
@@ -589,18 +1476,28 @@ def _client(
         parts = parse_stdio_command(url)
         if not parts:
             raise ValueError(f"Empty stdio command: {url!r}")
-        # env vars ride the headers field (merged over the SDK default env). keep_alive=False tears the subprocess
-        # down so a one-shot call leaves no orphan.
+        # Validated when saved, but a folder can be deleted later; without this the spawn fails as "file not
+        # found" and blames the program.
+        if cwd is not None and not os.path.isdir(cwd):
+            raise McpStdioServerError(
+                f"Working directory not found: {_program_label(cwd)}. "
+                "Check the server's Working directory setting."
+            )
+        # env vars ride the headers field (merged over the SDK default env and the inherited allowlist).
+        # keep_alive=False tears the subprocess down so a one-shot call leaves no orphan. No cwd means the
+        # backend's own, as before.
         env = _stdio_env(headers, parts[0])
         argv = _stdio_argv(parts, env)
-        return Client(
-            StdioTransport(
-                command = argv[0],
-                args = argv[1:],
-                env = env,
-                keep_alive = False,
-            )
+        transport = StdioTransport(
+            command = argv[0],
+            args = argv[1:],
+            env = _inherited_stdio_env(env),
+            cwd = cwd,
+            keep_alive = False,
         )
+        # On the transport it describes, so whichever path enters the client can explain a failed start.
+        transport.unsloth_stdio_launch = _StdioLaunch(url, parts, headers)
+        return Client(transport)
 
     from fastmcp.client.transports import SSETransport, StreamableHttpTransport
     from fastmcp.mcp_config import infer_transport_type_from_url
@@ -661,11 +1558,13 @@ def _connect_window(url: str, timeout: Optional[float]) -> Optional[float]:
 
 class _ConnectTimeout(asyncio.TimeoutError):
     """Ran out of time before the transport was up. Carries the window that actually expired, which
-    is not the caller's timeout when stdio's cold-start cap is the tighter bound."""
+    is not the caller's timeout when stdio's cold-start cap is the tighter bound, and for a local
+    program that was spawned, the explained form (see _StdioLaunch.timeout_error)."""
 
-    def __init__(self, window: Optional[float]):
+    def __init__(self, window: Optional[float], detail: Optional[str] = None):
         super().__init__()
         self.window = window
+        self.detail = detail
 
 
 def _is_tool_error(exc: BaseException) -> bool:
@@ -808,12 +1707,21 @@ def _abort_future(future) -> None:
         pass
 
 
+def _new_client(url: str, headers: Optional[dict], use_oauth: bool = False, cwd: Optional[str] = None):
+    # cwd is passed only when there is one: an HTTP server never has one, and most local programs don't either, so
+    # every existing stand-in for _client (the session test doubles) keeps fitting.
+    if cwd is None:
+        return _client(url, headers, use_oauth)
+    return _client(url, headers, use_oauth, cwd = cwd)
+
+
 class _McpSession:
     def __init__(
         self,
         url: str,
         headers: Optional[dict],
         use_oauth: bool = False,
+        cwd: Optional[str] = None,
     ):
         # A cached session is built by _client(url, headers) with no auth, so an OAuth server must never reach here.
         # call_tool_sync already routes it to the one-shot path; this makes a future routing slip fail loudly rather
@@ -823,7 +1731,10 @@ class _McpSession:
         self.url = url
         self.account_id = current_account_id()
         self.headers = headers
+        self.cwd = cwd
         self.client = None
+        # Set by connect() for a local program, so a connect timeout can say what the program printed.
+        self.launch: Optional[_StdioLaunch] = None
         self.closed = threading.Event()
         self.defunct = False  # discarded; close once in_flight drains (see _retire)
         self.dirty = False  # a call was abandoned on it; ping before reuse
@@ -857,8 +1768,13 @@ class _McpSession:
 
     def connect(self, timeout: Optional[float], cancel_event) -> None:
         async def _open():
-            client = _client(self.url, self.headers)
-            await client.__aenter__()
+            client = _new_client(self.url, self.headers, cwd = self.cwd)
+            launch = _stdio_launch_of(client)
+            self.launch = launch
+            if launch is None:
+                await client.__aenter__()
+            else:
+                await _start_stdio_client(client, launch)
             # Publish on the loop thread with no await in between: if an abort races a just-completed connect, close()
             # still sees the client and __aexit__s it instead of orphaning the subprocess.
             self.client = client
@@ -881,7 +1797,9 @@ class _McpSession:
                     raise  # the connect itself failed fast; don't wait out the window
                 if deadline is not None and time.monotonic() >= deadline:
                     _abort_future(future)
-                    raise _ConnectTimeout(window)
+                    launch = self.launch
+                    detail = None if launch is None else str(launch.timeout_error(window))
+                    raise _ConnectTimeout(window, detail)
 
     def is_connected(self) -> bool:
         client = self.client
@@ -996,9 +1914,11 @@ _mcp_close_all_gen = 0
 _mcp_account_close_gen: dict[str, int] = {}
 _mcp_url_close_gen: dict[str | tuple[str, str], int] = {}
 _mcp_cfg_close_gen: dict[str | tuple[str, str], int] = {}
+_mcp_cwd_close_gen: dict[str | tuple[str, str], int] = {}
 _mcp_connects_in_flight = 0
 
 _ANY_HEADERS = object()
+_ANY_CWD = object()
 
 
 def _headers_key(headers: Optional[dict]) -> tuple:
@@ -1016,16 +1936,33 @@ def _cfg_close_key(url: str, headers: Optional[dict]) -> str | tuple[str, str]:
     return _account_key(hashlib.sha256(repr((url, _headers_key(headers))).encode()).hexdigest())
 
 
-def _mcp_close_generation(url: str, headers: Optional[dict]) -> tuple[tuple[int, int], int, int]:
+def _cwd_close_key(url: str, headers: Optional[dict], cwd: Optional[str]) -> str | tuple[str, str]:
+    return _account_key(
+        hashlib.sha256(repr((url, _headers_key(headers), cwd or "")).encode()).hexdigest()
+    )
+
+
+def _mcp_close_generation(
+    url: str, headers: Optional[dict], cwd: Optional[str] = None
+) -> tuple[tuple[int, int], int, int, int]:
     return (
         (_mcp_close_all_gen, _mcp_account_close_gen.get(current_account_id(), 0)),
         _mcp_url_close_gen.get(_url_close_key(url), 0),
         _mcp_cfg_close_gen.get(_cfg_close_key(url, headers), 0),
+        _mcp_cwd_close_gen.get(_cwd_close_key(url, headers, cwd), 0),
     )
 
 
-def _session_key(url: str, headers: Optional[dict], scope: Optional[str]) -> tuple:
-    return (url, _headers_key(headers), scope or "", current_account_id())
+def _session_key(
+    url: str, headers: Optional[dict], scope: Optional[str], cwd: Optional[str] = None
+) -> tuple:
+    # The working directory is part of what the subprocess is, like its env: two rows running the same command from
+    # different folders must not share one process.
+    return (url, _headers_key(headers), scope or "", current_account_id(), cwd or "")
+
+
+def _session_cwd(key: tuple) -> str:
+    return key[4] if len(key) > 4 else ""
 
 
 def _checkout_session(key: tuple) -> tuple[Optional[_McpSession], float]:
@@ -1063,10 +2000,10 @@ def _return_key_lock(key: tuple, key_lock: _McpKeyLock) -> None:
 
 
 @contextmanager
-def _connect_slot(url: str, headers: Optional[dict]):
+def _connect_slot(url: str, headers: Optional[dict], cwd: Optional[str] = None):
     global _mcp_connects_in_flight
     with _mcp_sessions_lock:
-        generation = _mcp_close_generation(url, headers)
+        generation = _mcp_close_generation(url, headers, cwd)
         _mcp_connects_in_flight += 1
     try:
         yield generation
@@ -1083,13 +2020,14 @@ def _get_session(
     cancel_event,
     config_check,
     use_oauth: bool = False,
+    cwd: Optional[str] = None,
 ) -> tuple[_McpSession, float]:
     """``deadline`` is the caller's absolute monotonic budget (None = no limit): the key-lock wait
     and the connect share it, so a slow startup can't stack full timeout windows (see
     _call_session_tool). Returns the session and this borrower's idle gap (negative when we
     connected it ourselves), which only the borrower may act on -- see _checkout_session."""
     global _mcp_reaper_started
-    key = _session_key(url, headers, scope)
+    key = _session_key(url, headers, scope, cwd)
     with _mcp_sessions_lock:
         session, idle_for = _checkout_session(key)
         if session is not None:
@@ -1118,8 +2056,8 @@ def _get_session(
                     stale = _mcp_sessions.pop(key)
             if stale is not None:
                 _retire_session(stale)
-            with _connect_slot(url, headers) as generation:
-                session = _McpSession(url, headers, use_oauth)
+            with _connect_slot(url, headers, cwd) as generation:
+                session = _McpSession(url, headers, use_oauth, cwd)
                 try:
                     session.connect(
                         None if deadline is None else max(0.0, deadline - time.monotonic()),
@@ -1138,7 +2076,7 @@ def _get_session(
                         raise RuntimeError("MCP server was updated or removed while connecting")
                 evicted: list = []
                 with _mcp_sessions_lock:
-                    closed_while_connecting = _mcp_close_generation(url, headers) != generation
+                    closed_while_connecting = _mcp_close_generation(url, headers, cwd) != generation
                     if not closed_while_connecting:
                         session.in_flight = 1
                         evicted = _evict_lru_locked()  # bound the cache (LRU idle)
@@ -1252,10 +2190,16 @@ def close_mcp_sessions(
     url: Optional[str] = None,
     headers = _ANY_HEADERS,
     *,
+    cwd = _ANY_CWD,
     all_accounts: bool = False,
 ) -> None:
+    """Close cached sessions: all of them, one URL/command's, or (with ``headers``, and optionally
+    ``cwd``) exactly one server row's configuration, so another row sharing the command but not its
+    env or working directory keeps its live processes. ``cwd`` only narrows a call that also names
+    ``headers``."""
     global _mcp_close_all_gen
     hk = None if headers is _ANY_HEADERS else _headers_key(headers)
+    any_cwd = cwd is _ANY_CWD or hk is None
     account_id = current_account_id()
     with _mcp_sessions_lock:
         keys = [
@@ -1263,6 +2207,7 @@ def close_mcp_sessions(
             for k in _mcp_sessions
             if (url is None or k[0] == url)
             and (hk is None or k[1] == hk)
+            and (any_cwd or _session_cwd(k) == (cwd or ""))
             and (all_accounts or (k[3] if len(k) > 3 else OWNER_ACCOUNT_ID) == account_id)
         ]
         sessions = [_mcp_sessions.pop(k) for k in keys]
@@ -1279,9 +2224,12 @@ def close_mcp_sessions(
             elif hk is None:
                 uk = _url_close_key(url)
                 _mcp_url_close_gen[uk] = _mcp_url_close_gen.get(uk, 0) + 1
-            else:
+            elif any_cwd:
                 cfg = _cfg_close_key(url, headers)
                 _mcp_cfg_close_gen[cfg] = _mcp_cfg_close_gen.get(cfg, 0) + 1
+            else:
+                cfg = _cwd_close_key(url, headers, cwd)
+                _mcp_cwd_close_gen[cfg] = _mcp_cwd_close_gen.get(cfg, 0) + 1
     pending, worker = _drain_cleanup_queue()
     _close_all(sessions + pending)
     if worker is not None and worker is not threading.current_thread():
@@ -1457,13 +2405,25 @@ async def list_tools_async(
     headers: Optional[dict] = None,
     timeout: float = 5.0,
     use_oauth: bool = False,
+    cwd: Optional[str] = None,
 ) -> list[dict]:
+    """Connect, list the server's tools, disconnect. A local program that fails to start raises
+    McpStdioServerError saying why (missing program, exited, no handshake) with the tail of its
+    stderr, instead of a bare "Connection closed" or an empty timeout."""
+    client = _new_client(url, headers, use_oauth, cwd)
+    launch = _stdio_launch_of(client)
+
     async def _fetch() -> list[dict]:
-        async with _client(url, headers, use_oauth) as client:
-            tools = await client.list_tools()
+        async with _connected(client) as connected:
+            tools = await connected.list_tools()
         return [t.model_dump(exclude_none = True) for t in tools]
 
-    return await asyncio.wait_for(_fetch(), timeout = timeout)
+    try:
+        return await asyncio.wait_for(_fetch(), timeout = timeout)
+    except asyncio.TimeoutError as exc:
+        if launch is None:
+            raise
+        raise launch.timeout_error(timeout) from exc
 
 
 # Discovered-tool cache, keyed by MCP server id. get_enabled_mcp_tools() probes a server only
@@ -1500,9 +2460,10 @@ def serialize_mcp_server_mutation(handler):
 
 
 # MCP server fields whose change invalidates a server's discovered tools: the endpoint/auth used to probe it (url,
-# headers, oauth) or whether it's used at all (is_enabled). A rename does not. The update route's eviction and
-# get_enabled_mcp_tools' mid-probe guard both key off this so they can't drift.
-TOOL_CACHE_INVALIDATING_FIELDS = frozenset({"url", "headers_json", "use_oauth", "is_enabled"})
+# headers, oauth), where a local program runs (cwd: a server can expose different tools per project folder), or
+# whether it's used at all (is_enabled). A rename does not. The update route's eviction and get_enabled_mcp_tools'
+# mid-probe guard both key off this so they can't drift.
+TOOL_CACHE_INVALIDATING_FIELDS = frozenset({"url", "headers_json", "use_oauth", "is_enabled", "cwd"})
 
 
 def get_cached_tools(server_id: str) -> Optional[list[dict]]:
@@ -1838,6 +2799,7 @@ def _call_session_tool(
     scope: Optional[str],
     config_check,
     use_oauth: bool = False,
+    cwd: Optional[str] = None,
 ) -> Any:
     if cancel_event is not None and cancel_event.is_set():
         raise _MCPCancelled
@@ -1862,12 +2824,12 @@ def _call_session_tool(
     ephemeral = not scope
     if ephemeral:
         scope = f"request-{uuid.uuid4().hex}"
-    key = _session_key(url, headers, scope)
+    key = _session_key(url, headers, scope, cwd)
     # attempt 0 may find the cached session stale/dead *before* dispatch and reconnect once (safe); attempt 1 is a
     # freshly connected session.
     for attempt in (0, 1):
         session, idle_for = _get_session(
-            url, headers, scope, deadline, cancel_event, config_check, use_oauth
+            url, headers, scope, deadline, cancel_event, config_check, use_oauth, cwd
         )
         locked = False
         try:
@@ -2001,6 +2963,7 @@ def call_tool_sync(
     cancel_event = None,
     scope: Optional[str] = None,
     config_check = None,
+    cwd: Optional[str] = None,
 ) -> str:
     """Call one MCP tool and return its flattened text/image result. Never raises: every failure comes
     back as an "Error: ..." string for the model.
@@ -2015,7 +2978,8 @@ def call_tool_sync(
 
     ``timeout`` is one budget covering connect and call together. ``cancel_event`` aborts an
     in-flight call. ``config_check`` re-reads the server row so a call that raced an edit or delete
-    cannot dispatch on the stale configuration.
+    cannot dispatch on the stale configuration. ``cwd`` is a local program's working directory
+    (None: the backend's own).
     """
 
     async def _one_shot() -> Any:
@@ -2028,13 +2992,15 @@ def call_tool_sync(
     try:
         if is_stdio(url) or (scope and not use_oauth):
             result = _call_session_tool(
-                url, headers, name, args, timeout, cancel_event, scope, config_check, use_oauth
+                url, headers, name, args, timeout, cancel_event, scope, config_check, use_oauth, cwd
             )
         else:
             result = asyncio.run(_race_tool_call(_one_shot(), timeout, cancel_event))
     except _MCPCancelled:
         return f"Error: MCP tool '{name}' cancelled"
     except _ConnectTimeout as exc:
+        if exc.detail:
+            return f"Error: MCP tool '{name}' could not start its server: {exc.detail}"
         # Report the window that actually expired: for stdio that is the cold-start cap, not the (larger) caller
         # timeout.
         suffix = f" after {round(exc.window, 1):g}s" if exc.window is not None else ""
@@ -2042,6 +3008,11 @@ def call_tool_sync(
     except asyncio.TimeoutError:
         suffix = f" after {timeout:g}s" if timeout is not None else ""
         return f"Error: MCP tool '{name}' timed out{suffix}"
+    except McpStdioServerError as exc:
+        # An explained start-up failure, not a bug: one line, no traceback. The quoted output stays out of the
+        # backend log; the server's own log file has it.
+        logger.warning("MCP tool %s: %s: %s", name, _session_log_id(url), exc.summary)
+        return f"Error: MCP tool '{name}' could not start its server: {exc}"
     except Exception as exc:
         logger.exception("MCP call_tool failed for %s: %s", name, exc)
         return f"Error: MCP tool '{name}' failed: {exc}"
