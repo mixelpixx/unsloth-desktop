@@ -260,22 +260,21 @@ def test_launcher_waits_long_enough_for_a_cold_start():
     assert match is not None
     assert int(match.group(1)) >= 120
     # The user-facing message reads the variable, so it cannot drift from the real budget.
-    assert "within `$timeoutSec seconds" in tpl
+    assert "did not answer within ' + `$timeoutSec + ' seconds" in tpl
 
 
 def test_launcher_opens_studio_in_its_own_app_window():
     # A desktop app, not a browser tab: an Edge/Chrome app window (no tabs or address bar) on its own
-    # profile, so its sign-in is its own and the browser process lives exactly as long as the window.
+    # profile, so its sign-in is its own and its processes are the app's windows.
     tpl = _launcher_template()
-    assert '"--app=`$url"' in tpl
+    assert "('--app=' + `$url)" in tpl
     assert "('--user-data-dir=\"' + `$appProfileDir + '\"')" in tpl
-    assert "`$appProfileDir = '`$_appProfileSq'" not in tpl  # baked at install time, not at launch
-    assert "`$appProfileDir = '$_appProfileSq'" in tpl
+    assert "`$appProfileDir = '$_appProfileSq'" in tpl  # baked at install time
     # No Edge or Chrome: the default browser, as before.
     assert re.search(r"if \(-not `\$browser\) \{\s*Start-Process `\$url", tpl)
     # Every path that used to open a tab now opens the window.
     assert 'Start-Process "http://localhost:' not in tpl
-    assert tpl.count("Open-StudioWindow -Port") == 3
+    assert tpl.count("Open-StudioWindow -Port") >= 3
 
 
 def test_launcher_runs_the_server_without_a_console_window():
@@ -287,14 +286,31 @@ def test_launcher_runs_the_server_without_a_console_window():
     assert "'RemoteSigned'" in launch and "Bypass" not in launch
 
 
-def test_closing_the_window_asks_before_stopping_only_what_this_launcher_started():
+def test_the_launcher_signs_the_window_in_with_the_desktop_secret():
     tpl = _launcher_template()
-    tail = tpl[tpl.index("`$window = Open-StudioWindow -Port `$healthyPort") :]
-    assert "`$window.WaitForExit()" in tail
-    assert "'YesNo' 'Question'" in tail
-    assert "Stop-StudioBackend" in tail
-    # Opening a second window on a running server hands off and exits: only the starter asks.
+    handoff = tpl[tpl.index("function Get-StudioLaunchHash") : tpl.index("function Find-AppBrowser")]
+    assert "/api/auth/desktop-login" in handoff
+    assert "#unsloth-launch-session=" in handoff  # frontend: features/auth/launcher-handoff
+    assert "`$desktopSecretFile = '$_desktopSecretSq'" in tpl
+    # Minted only when missing: a new secret replaces the stored hash and signs out the desktop app.
+    assert re.search(
+        r"if \(-not \(Test-Path -LiteralPath `\$desktopSecretFile -PathType Leaf\)\) \{\s*"
+        r"Invoke-StudioCli 'studio provision-desktop-auth'",
+        tpl,
+    )
+
+
+def test_the_launcher_that_started_the_server_keeps_a_tray_icon_and_asks_before_stopping():
+    tpl = _launcher_template()
+    tray = tpl[tpl.index("`$tray = New-Object System.Windows.Forms.NotifyIcon") :]
+    for item in ("'Open Unsloth Studio'", "'Open logs folder'", "'Shut down Unsloth Studio'"):
+        assert item in tray
+    assert "[System.Windows.Forms.Application]::Run()" in tray
+    # The last window closing asks; No keeps it running in the tray, anything else stops it.
+    assert "'YesNo' 'Question'" in tray and "Stop-StudioFromTray" in tray
+    # Shut down from inside the app (or a crash) ends the tray too.
+    assert re.search(r"if \(`\$serverProc\.HasExited\) \{\s*Exit-StudioTray", tray)
+    # A launch onto a running server only opens a window; the tray belongs to the starter.
     existing = tpl[tpl.index("`$existingPort = Find-HealthyStudioPort") : tpl.index("`$launchMutex =")]
-    assert "Open-StudioWindow -Port `$existingPort | Out-Null" in existing and "exit 0" in existing
-    stop = tpl[tpl.index("function Stop-StudioBackend") : tpl.index("`$existingPort = Find-HealthyStudioPort")]
-    assert "' studio stop\"" in stop
+    assert "Open-StudioWindow -Port `$existingPort" in existing and "exit 0" in existing
+    assert "' studio stop'" in tpl or "Invoke-StudioCli 'studio stop'" in tpl

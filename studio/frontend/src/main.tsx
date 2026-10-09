@@ -12,6 +12,7 @@ import {
 } from "./components/assistant-ui/math-block-containment";
 import { fetchDeviceType } from "./config/env";
 import { refreshSession } from "./features/auth/api";
+import { consumeLaunchSession } from "./features/auth/launcher-handoff";
 import {
   applyInterfaceScaleBeforeFirstPaint,
   useInterfaceScaleStore,
@@ -94,10 +95,14 @@ const localeInitialization = initializeLocale();
 const interfaceScaleInitialization = applyInterfaceScaleBeforeFirstPaint(
   useInterfaceScaleStore.getState().scale,
 );
-if (typeof localeInitialization !== "string" || isTauri) {
-  Promise.all([localeInitialization, interfaceScaleInitialization]).then(
-    renderApp,
-  );
+// Null unless the local launcher passed a one-shot sign-in token in the URL hash; never rejects.
+const launchSession = consumeLaunchSession();
+if (launchSession || typeof localeInitialization !== "string" || isTauri) {
+  Promise.all([
+    localeInitialization,
+    interfaceScaleInitialization,
+    launchSession,
+  ]).then(renderApp);
 } else {
   renderApp();
 }

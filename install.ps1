@@ -5383,6 +5383,9 @@ function Install-UnslothStudio {
             # The app window's own browser profile and the server log folder, baked like the port file.
             $_appProfileSq = (Join-Path $appDir 'app-window') -replace "'", "''"
             $_serverLogSq = (Join-Path $StudioHome 'logs\server') -replace "'", "''"
+            # The desktop secret the passwordless sign-in exchanges, and the tray icon the installer copies in.
+            $_desktopSecretSq = (Join-Path $StudioHome 'auth\.desktop_secret') -replace "'", "''"
+            $_trayIconSq = (Join-Path $appDir 'unsloth.ico') -replace "'", "''"
 
             $launcherContent = @"
 $studioHomeExport`$ErrorActionPreference = 'Stop'
@@ -5516,9 +5519,11 @@ function Find-FreeLaunchPort {
 `$studioPython = '$SingleQuotedPythonPath'
 `$studioEntry = '$SingleQuotedTrampoline'
 # Its own browser profile: the app window keeps its sign-in apart from everyday browsing, and the
-# browser process it starts lives exactly as long as the Studio window does.
+# browser processes it starts are the app's windows.
 `$appProfileDir = '$_appProfileSq'
 `$serverLogDir = '$_serverLogSq'
+`$desktopSecretFile = '$_desktopSecretSq'
+`$trayIconFile = '$_trayIconSq'
 `$nl = [Environment]::NewLine
 
 function Show-StudioMessage {
@@ -5531,72 +5536,108 @@ function Show-StudioMessage {
     }
 }
 
+# Runs an unsloth CLI subcommand through the managed interpreter, quoted exactly as the server launch is.
+function Invoke-StudioCli {
+    param([Parameter(Mandatory = `$true)][string]`$Arguments, [int]`$TimeoutMs = 60000)
+    `$command = "& '" + (`$studioPython -replace "'", "''") + "' -X utf8 -c '" +
+        (`$studioEntry -replace "'", "''") + "' " + `$Arguments
+    `$powershellExe = Join-Path `$env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    try {
+        `$child = Start-Process -FilePath `$powershellExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-Command', `$command) -WindowStyle Hidden -PassThru
+        `$child.WaitForExit(`$TimeoutMs) | Out-Null
+    } catch {}
+}
+
+function Stop-StudioBackend {
+    Invoke-StudioCli 'studio stop'
+}
+
+# Passwordless sign-in. Exchanges this machine's desktop secret (the file the desktop app uses) for a
+# single-use refresh token that the app window consumes from the URL hash on load
+# (frontend: features/auth/launcher-handoff). The token is dead after that first load, and any failure
+# here returns `$null so the ordinary sign-in page simply shows.
+function Get-StudioLaunchHash {
+    param([Parameter(Mandatory = `$true)][int]`$Port)
+    try {
+        if (-not (Test-Path -LiteralPath `$desktopSecretFile -PathType Leaf)) { return `$null }
+        `$secret = ([System.IO.File]::ReadAllText(`$desktopSecretFile)).Trim()
+        if (`$secret -cnotmatch '^desktop-[A-Za-z0-9_-]{64}`$') { return `$null }
+        `$body = @{ secret = `$secret } | ConvertTo-Json -Compress
+        `$resp = Invoke-RestMethod -Uri ('http://127.0.0.1:' + `$Port + '/api/auth/desktop-login') -Method Post -ContentType 'application/json' -Body `$body -TimeoutSec 15
+        `$token = [string]`$resp.refresh_token
+        if (`$token -cmatch '^[A-Za-z0-9_-]{32,200}`$') { return ('#unsloth-launch-session=' + `$token) }
+    } catch {}
+    return `$null
+}
+
 function Find-AppBrowser {
     # Edge first: it ships with Windows 11 and is the engine the desktop app's WebView2 uses.
     foreach (`$exe in @('msedge.exe', 'chrome.exe')) {
         foreach (`$hive in @('HKCU', 'HKLM')) {
             try {
-                `$path = (Get-ItemProperty -LiteralPath "`${hive}:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\`$exe" -ErrorAction Stop).'(default)'
+                `$path = (Get-ItemProperty -LiteralPath (`$hive + ':\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\' + `$exe) -ErrorAction Stop).'(default)'
                 if (`$path -and (Test-Path -LiteralPath `$path)) { return `$path }
             } catch {}
         }
     }
     foreach (`$path in @(
-        "`${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
-        "`$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
-        "`$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-        "`$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+        (Join-Path `${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path `$env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe'),
+        (Join-Path `$env:ProgramFiles 'Google\Chrome\Application\chrome.exe'),
+        (Join-Path `$env:LOCALAPPDATA 'Google\Chrome\Application\chrome.exe')
     )) {
         if (`$path -and (Test-Path -LiteralPath `$path)) { return `$path }
     }
     return `$null
 }
 
-# Opens Studio in an app window (no tabs or address bar). Returns the browser process when this call
-# started it, so the caller can wait for the window to close; `$null when it handed off to a window
-# that was already open, or fell back to the default browser.
+# The browser processes showing Studio windows: every process started on the app profile.
+function Get-StudioWindowProcesses {
+    try {
+        return @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" -ErrorAction Stop |
+            Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains(`$appProfileDir) })
+    } catch {
+        return @()
+    }
+}
+
+# Opens Studio in an app window (no tabs or address bar), signed in when the desktop secret allows.
+# Falls back to the default browser when neither Edge nor Chrome is installed.
 function Open-StudioWindow {
     param([Parameter(Mandatory = `$true)][int]`$Port)
-    `$url = "http://127.0.0.1:`$Port/"
+    `$url = 'http://127.0.0.1:' + `$Port + '/'
+    `$handoff = Get-StudioLaunchHash -Port `$Port
+    if (`$handoff) { `$url += `$handoff }
     `$browser = Find-AppBrowser
     if (-not `$browser) {
         Start-Process `$url
-        return `$null
+        return
     }
-    `$alreadyOpen = `$false
-    try {
-        `$alreadyOpen = [bool](Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" -ErrorAction Stop |
-            Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains(`$appProfileDir) })
-    } catch {}
     `$browserArgs = @(
-        "--app=`$url",
+        ('--app=' + `$url),
         ('--user-data-dir="' + `$appProfileDir + '"'),
         '--no-first-run',
         '--no-default-browser-check',
         '--disable-background-mode',
         '--window-size=1440,960'
     )
-    `$proc = Start-Process -FilePath `$browser -ArgumentList `$browserArgs -PassThru
-    if (`$alreadyOpen) { return `$null }
-    return `$proc
+    Start-Process -FilePath `$browser -ArgumentList `$browserArgs | Out-Null
 }
 
-function Stop-StudioBackend {
-    # Quoted exactly as the launch command is, through a child -Command.
-    `$stopCommand = "& '" + (`$studioPython -replace "'", "''") + "' -X utf8 -c '" +
-        (`$studioEntry -replace "'", "''") + "' studio stop"
-    `$powershellExe = Join-Path `$env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    try {
-        `$stop = Start-Process -FilePath `$powershellExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-Command', `$stopCommand) -WindowStyle Hidden -PassThru
-        `$stop.WaitForExit(60000) | Out-Null
-    } catch {}
+function Close-StudioWindows {
+    foreach (`$proc in (Get-StudioWindowProcesses)) {
+        try {
+            `$p = Get-Process -Id `$proc.ProcessId -ErrorAction Stop
+            if (`$p.MainWindowHandle -ne [IntPtr]::Zero) { `$p.CloseMainWindow() | Out-Null }
+        } catch {}
+    }
 }
 
 # If Unsloth is already healthy on any expected port, just open a window on it and exit: the
-# launcher that started it is the one that asks about shutting down.
+# launcher that started it owns the tray icon and the question of when it stops.
 `$existingPort = Find-HealthyStudioPort
 if (`$existingPort) {
-    Open-StudioWindow -Port `$existingPort | Out-Null
+    Open-StudioWindow -Port `$existingPort
     exit 0
 }
 
@@ -5615,16 +5656,22 @@ try {
         `$deadline = (Get-Date).AddSeconds(`$timeoutSec)
         while ((Get-Date) -lt `$deadline) {
             `$port = Find-HealthyStudioPort
-            if (`$port) { Open-StudioWindow -Port `$port | Out-Null; exit 0 }
+            if (`$port) { Open-StudioWindow -Port `$port; exit 0 }
             Start-Sleep -Milliseconds `$pollIntervalMs
         }
         exit 0
     }
 
+    # First run: create the desktop secret the passwordless sign-in uses. Only when missing, since
+    # minting a new one replaces the stored hash and would sign out a desktop app that holds the old one.
+    if (-not (Test-Path -LiteralPath `$desktopSecretFile -PathType Leaf)) {
+        Invoke-StudioCli 'studio provision-desktop-auth'
+    }
+
     `$powershellExe = Join-Path `$env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     `$launchPort = Find-FreeLaunchPort
     if (-not `$launchPort) {
-        Show-StudioMessage "No free port found in range `$basePort-`$(`$basePort + `$maxPortOffset)" | Out-Null
+        Show-StudioMessage ('No free port found in range ' + `$basePort + '-' + (`$basePort + `$maxPortOffset)) | Out-Null
         exit 1
     }
     # Single-quote the path in the child -Command so `$ / backtick in custom
@@ -5654,8 +5701,7 @@ try {
         if (Test-StudioHealth -Port `$launchPort) {
             if (`$portFile) {
                 try {
-                    [System.IO.File]::WriteAllText(`$portFile, "`$launchPort
-")
+                    [System.IO.File]::WriteAllText(`$portFile, ([string]`$launchPort + `$nl))
                 } catch {}
             }
             `$healthyPort = `$launchPort
@@ -5666,9 +5712,9 @@ try {
     }
     if (-not `$healthyPort) {
         if (`$serverProc.HasExited) {
-            `$msg = "Unsloth Studio stopped before it finished starting. The log in `$serverLogDir says why."
+            `$msg = 'Unsloth Studio stopped before it finished starting. The log in ' + `$serverLogDir + ' says why.'
         } else {
-            `$msg = "Unsloth Studio is still starting but did not answer within `$timeoutSec seconds. Try the shortcut again in a minute; the log is in `$serverLogDir."
+            `$msg = 'Unsloth Studio is still starting but did not answer within ' + `$timeoutSec + ' seconds. Try the shortcut again in a minute; the log is in ' + `$serverLogDir + '.'
         }
         Show-StudioMessage `$msg 'OK' 'Warning' | Out-Null
         exit 1
@@ -5678,19 +5724,85 @@ try {
     `$launchMutex.Dispose()
 }
 
-# This launcher started the server, so it owns the question of when it stops. Closing the window is
-# quitting the app, but a loaded model or a training run is worth a question rather than a surprise.
-`$window = Open-StudioWindow -Port `$healthyPort
-if (-not `$window) { exit 0 }
-`$window.WaitForExit()
-if (`$serverProc.HasExited) { exit 0 }
-`$answer = Show-StudioMessage ('Shut down Unsloth Studio?' + `$nl + `$nl +
-    'Yes: shut it down. Any loaded model frees its GPU memory, and a training run saves a checkpoint and stops.' + `$nl + `$nl +
-    'No: keep it running in the background. Reopen it from the Unsloth Studio shortcut.') 'YesNo' 'Question'
-if ("`$answer" -ne 'No') {
-    Stop-StudioBackend
+Open-StudioWindow -Port `$healthyPort
+
+# This launcher started the server, so it lives as long as the server does: a tray icon to reopen or
+# shut down Studio, and a question when the last window closes, since a loaded model or a training
+# run is worth asking about rather than stopping by surprise or leaving forgotten on the GPU.
+try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+} catch {
+    exit 0
 }
-exit 0
+`$tray = New-Object System.Windows.Forms.NotifyIcon
+try {
+    `$tray.Icon = if (Test-Path -LiteralPath `$trayIconFile) { New-Object System.Drawing.Icon(`$trayIconFile) } else { [System.Drawing.SystemIcons]::Application }
+} catch {
+    `$tray.Icon = [System.Drawing.SystemIcons]::Application
+}
+`$tray.Text = 'Unsloth Studio'
+`$menu = New-Object System.Windows.Forms.ContextMenuStrip
+`$openItem = `$menu.Items.Add('Open Unsloth Studio')
+`$logsItem = `$menu.Items.Add('Open logs folder')
+[void]`$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+`$stopItem = `$menu.Items.Add('Shut down Unsloth Studio')
+`$tray.ContextMenuStrip = `$menu
+`$tray.Visible = `$true
+
+`$script:windowSeen = `$false
+`$script:quitting = `$false
+`$timer = New-Object System.Windows.Forms.Timer
+`$timer.Interval = 2000
+
+function Exit-StudioTray {
+    `$script:quitting = `$true
+    `$timer.Stop()
+    `$tray.Visible = `$false
+    `$tray.Dispose()
+    [System.Windows.Forms.Application]::ExitThread()
+}
+
+function Stop-StudioFromTray {
+    `$timer.Stop()
+    `$tray.Text = 'Unsloth Studio (shutting down)'
+    Close-StudioWindows
+    Stop-StudioBackend
+    Exit-StudioTray
+}
+
+`$openItem.add_Click({ Open-StudioWindow -Port `$healthyPort })
+`$tray.add_DoubleClick({ Open-StudioWindow -Port `$healthyPort })
+`$logsItem.add_Click({ if (Test-Path -LiteralPath `$serverLogDir) { Start-Process explorer.exe `$serverLogDir } })
+`$stopItem.add_Click({ Stop-StudioFromTray })
+
+`$timer.add_Tick({
+    if (`$script:quitting) { return }
+    # Shut down from inside the app, or it crashed: nothing left for the tray to manage.
+    if (`$serverProc.HasExited) {
+        Exit-StudioTray
+        return
+    }
+    `$open = (Get-StudioWindowProcesses).Count -gt 0
+    if (`$open) {
+        `$script:windowSeen = `$true
+        return
+    }
+    if (-not `$script:windowSeen) { return }
+    `$script:windowSeen = `$false
+    `$timer.Stop()
+    `$answer = Show-StudioMessage ('Shut down Unsloth Studio?' + `$nl + `$nl +
+        'Yes: shut it down. Any loaded model frees its GPU memory, and a training run saves a checkpoint and stops.' + `$nl + `$nl +
+        'No: keep it running in the background. Reopen it from the tray icon or the Unsloth Studio shortcut.') 'YesNo' 'Question'
+    if ("`$answer" -eq 'No') {
+        `$tray.ShowBalloonTip(4000, 'Unsloth Studio', 'Still running in the background. Right-click the tray icon to reopen or shut it down.', [System.Windows.Forms.ToolTipIcon]::Info)
+        `$timer.Start()
+    } else {
+        Stop-StudioFromTray
+    }
+})
+`$timer.Start()
+[System.Windows.Forms.Application]::Run()
 "@
 
             # Write UTF-8 with BOM for reliable decoding by Windows PowerShell 5.1,
