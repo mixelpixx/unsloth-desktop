@@ -128,23 +128,21 @@ test("the marker key belongs to nothing else in the app", async () => {
       }
     }
   }
-  await walk(new URL("../src/", import.meta.url));
+  const srcRoot = new URL("../src/", import.meta.url);
+  await walk(srcRoot);
 
   const owners: string[] = [];
   for (const file of files) {
     if ((await readFile(file, "utf8")).includes(`"${USER_STOPPED_KEY}"`)) {
-      // pathname, not fileURLToPath: it is "/" separated on every platform, which is what
-      // the assertion below slices on.
-      owners.push(file.pathname);
+      // Relative to the app's src/, as a URL: "/" separated on every platform, and not
+      // fooled by a checkout that itself sits under a src folder (D:\dev\src\...).
+      owners.push(`/src/${file.href.slice(srcRoot.href.length)}`);
     }
   }
 
   // One declaration and no second reader: a key two features write would let an unrelated
   // preference reset put the desktop server on the stopped screen.
-  assert.deepEqual(
-    owners.map((f) => f.slice(f.indexOf("/src/"))),
-    ["/src/hooks/server-stop-intent.ts"],
-  );
+  assert.deepEqual(owners, ["/src/hooks/server-stop-intent.ts"]);
 });
 
 test("the hook reaches storage only through the guarded helpers", async () => {

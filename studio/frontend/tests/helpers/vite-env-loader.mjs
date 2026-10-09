@@ -4,9 +4,14 @@
 // vite replaces `import.meta.env` at build time; bare node leaves it undefined, so a src
 // module that reads it throws on import. Seed it instead, so a test can drive the real
 // module rather than assert on its source. Register before importing any such module.
+// Only the app's own src/: matching "/src/" anywhere also caught node_modules when the
+// checkout itself sits under a src folder (D:\dev\src\...), and a CommonJS module there
+// has a null source.
+const APP_SRC = new URL("../../src/", import.meta.url).href;
+
 export async function load(url, context, next) {
   const result = await next(url, context);
-  if (!url.includes("/src/") || result.source === undefined) return result;
+  if (!url.startsWith(APP_SRC) || result.source == null) return result;
   const source =
     typeof result.source === "string"
       ? result.source

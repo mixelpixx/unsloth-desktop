@@ -345,13 +345,15 @@ test("the notice is mounted in the app shell, not on one route", () => {
 
   // Exactly one mount in the whole app, or the toast arrives twice on the route
   // that also mounts it.
-  const callers = sourceFiles(new URL("../src/", import.meta.url)).filter(
+  const srcRoot = new URL("../src/", import.meta.url);
+  const callers = sourceFiles(srcRoot).filter(
     // The declaration itself reads "function useLowDiskNotice(): void".
     (file) =>
       /(?<!function )useLowDiskNotice\(\)/.test(readFileSync(file, "utf8")),
   );
+  // Relative to the app's src/: splitting on "/src/" broke on a checkout under D:\dev\src\.
   assert.deepEqual(
-    callers.map((file) => file.pathname.split("/src/")[1]),
+    callers.map((file) => file.href.slice(srcRoot.href.length)),
     ["app/routes/__root.tsx"],
   );
 
