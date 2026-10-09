@@ -135,6 +135,55 @@ class McpServerImportResult(BaseModel):
     errors: list[str] = Field(default_factory = list)
 
 
+class McpImportSourceServer(BaseModel):
+    """One server another app has configured. Never a value from its env or headers: those are read
+    and stored on the server, and the dialog gets their names only."""
+
+    name: str
+    transport: Literal["stdio", "http"]
+    # The command line or URL as the app wrote it, credentials masked.
+    target: str
+    env_keys: list[str] = Field(default_factory = list)
+    header_keys: list[str] = Field(default_factory = list)
+    # Studio already has a server with this command line or URL.
+    already_added: bool = False
+    importable: bool = True
+    # Why it can't be imported, or why it will arrive switched off.
+    note: Optional[str] = None
+
+
+class McpImportSource(BaseModel):
+    id: str
+    app: str
+    label: Optional[str] = None
+    # The config file, for the installation owner's own UI session only.
+    path: Optional[str] = None
+    # The file exists but couldn't be read; servers is then empty.
+    error: Optional[str] = None
+    servers: list[McpImportSourceServer] = Field(default_factory = list)
+
+
+class McpImportSourcesResponse(BaseModel):
+    sources: list[McpImportSource] = Field(default_factory = list)
+
+
+class McpImportSourceApplyRequest(BaseModel):
+    source_id: StrictStr = Field(min_length = 1, max_length = 256)
+    server_names: list[StrictStr] = Field(min_length = 1, max_length = 500)
+
+
+class McpImportServerOutcome(BaseModel):
+    name: str
+    # added_disabled: created switched off, detail says why. duplicate: Studio already has it.
+    status: Literal["added", "added_disabled", "duplicate", "error"]
+    detail: Optional[str] = None
+    server_id: Optional[str] = None
+
+
+class McpImportSourceApplyResult(BaseModel):
+    results: list[McpImportServerOutcome] = Field(default_factory = list)
+
+
 class McpUiResourceResponse(BaseModel):
     uri: str
     mime_type: str

@@ -7,7 +7,7 @@ import {
   PlusSignIcon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { UploadIcon } from "lucide-react";
+import { ImportIcon, UploadIcon } from "lucide-react";
 import {
   type ChangeEvent,
   useCallback,
@@ -62,6 +62,7 @@ import {
   resolveMcpStdioUrl,
 } from "./mcp-server-form";
 import { McpImageMappings } from "./mcp-image-mappings";
+import { McpImportFromApps } from "./mcp-import-from-apps";
 import { parseMcpConfigFile } from "./utils/mcp-config-file";
 import { RefreshGlyph } from "@/lib/refresh-icon";
 
@@ -442,6 +443,9 @@ export function ChatMcpServersDialog({
   const [decodingCommand, setDecodingCommand] = useState(false);
   const [codecError, setCodecError] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  // "Import from another app": the panel, and whether its batch is still running.
+  const [appImportOpen, setAppImportOpen] = useState(false);
+  const [appImporting, setAppImporting] = useState(false);
   const [capabilities, setCapabilities] = useState<McpCapabilities | null>(
     null,
   );
@@ -557,6 +561,7 @@ export function ChatMcpServersDialog({
       setImportReport(null);
       setImporting(importingRef.current);
       setConfirmingDelete(null);
+      setAppImportOpen(false);
       setRefreshingIds(new Set(refreshingIdsRef.current));
       setTogglingIds(new Set(togglingIdsRef.current));
       setBusyIds(new Set(busyIdsRef.current));
@@ -1393,12 +1398,22 @@ export function ChatMcpServersDialog({
           </div>
         ) : (
           <div className="flex min-w-0 flex-col gap-3">
-            <div className="flex justify-end gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
               <Button
                 size="sm"
-                variant="outline"
+                variant={appImportOpen ? "secondary" : "outline"}
+                onClick={() => setAppImportOpen((current) => !current)}
+                aria-expanded={appImportOpen}
+                title="Bring over the MCP servers Claude Desktop, Claude Code, Cursor, VS Code or Windsurf already use on this computer"
+              >
+                <ImportIcon className="size-3.5" />
+                Import from app
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={importing}
+                disabled={importing || appImporting}
                 title="Import servers from a mcpServers JSON config (Claude Desktop, Cursor, VS Code…)"
               >
                 {importing ? <Spinner /> : <UploadIcon className="size-3.5" />}
@@ -1409,6 +1424,13 @@ export function ChatMcpServersDialog({
                 Add server
               </Button>
             </div>
+            {appImportOpen && (
+              <McpImportFromApps
+                onClose={() => setAppImportOpen(false)}
+                disabled={importing}
+                onBusyChange={setAppImporting}
+              />
+            )}
             {importReport && (
               <Alert
                 variant={importReport.errors.length ? "destructive" : "default"}
@@ -1471,8 +1493,8 @@ export function ChatMcpServersDialog({
             ) : servers.filter((server) => !server.builtin_id).length === 0 ? (
               <div className="rounded-md border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
                 No MCP servers yet. Use <strong>Add server</strong> for a URL or
-                a local program, or <strong>Import config</strong> to bring
-                over servers from Claude Desktop, Cursor or VS Code.
+                a local program, or <strong>Import from app</strong> to bring
+                over the servers Claude Desktop, Cursor or VS Code already use.
               </div>
             ) : (
               <ul className="flex flex-col divide-y rounded-md border">

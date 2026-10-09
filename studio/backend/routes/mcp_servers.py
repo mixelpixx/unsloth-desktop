@@ -47,11 +47,18 @@ from core.inference.mcp_client import (
     tool_visible_to,
     unquoted_spaced_program,
 )
+from core.inference import mcp_import_sources
 from core.inference.mcp_config_import import parse_mcp_config
 from core.inference.mcp_image import image_input_mappings, image_mapping
 from models.mcp_servers import (
     BlenderTest,
     McpCapabilities,
+    McpImportServerOutcome,
+    McpImportSource,
+    McpImportSourceApplyRequest,
+    McpImportSourceApplyResult,
+    McpImportSourceServer,
+    McpImportSourcesResponse,
     McpServerCreate,
     McpServerImportRequest,
     McpServerImportResult,
@@ -67,6 +74,7 @@ from models.mcp_servers import (
     McpUiToolCallResult,
 )
 from storage import mcp_servers_db
+from utils.account_context import is_owner_context
 from utils.utils import safe_curated_detail, log_and_http_error
 
 logger = structlog.get_logger(__name__)
@@ -750,6 +758,213 @@ async def import_mcp_servers(
         created.append(_row_to_response(mcp_servers_db.get_server(server_id)))
 
     return McpServerImportResult(created = created, skipped = skipped, errors = errors)
+
+
+def _require_import_source_access(via_api_key: bool, no_credential: bool) -> None:
+    """Import from another app reads this computer's config files and the API keys in them. Only the
+    installation owner, from a signed-in Studio window: an API key could otherwise import a server
+    and read its stored headers straight back, and a managed account would receive the owner's
+    credentials."""
+    if not is_owner_context():
+        raise HTTPException(
+            status_code = 403,
+            detail = "Only the installation owner can import servers from other apps on this computer.",
+        )
+    if via_api_key or no_credential:
+        raise HTTPException(
+            status_code = 403,
+            detail = "Importing from other apps reads this computer's config files, so it is only "
+            "available from a signed-in Unsloth Studio window.",
+        )
+
+
+def _existing_server_identities() -> set:
+    identities = set()
+    for row in mcp_servers_db.list_servers():
+        if row.get("builtin_id") or not row.get("url"):
+            continue
+        identity = mcp_import_sources.server_identity(row["url"])
+        if identity is not None:
+            identities.add(identity)
+    return identities
+
+
+def _switched_off_reasons(
+    prepared: mcp_import_sources.PreparedServer, url: str, app: str
+) -> list[str]:
+    """Why an importable server should arrive switched off: off in the app it came from, a
+    ``${...}`` nothing here fills in, or a program that isn't on this machine. Each is something the
+    user fixes in the editor before turning it on, rather than a first chat that fails."""
+    entry = prepared.entry
+    reasons: list[str] = []
+    if entry is not None and not entry.is_enabled:
+        reasons.append(f"It is switched off in {app}.")
+    if prepared.unresolved:
+        names = ", ".join(prepared.unresolved)
+        reasons.append(
+            f"{names} {'is' if len(prepared.unresolved) == 1 else 'are'} not set in Studio's "
+            "environment; edit the server to fill in the value."
+        )
+    if entry is not None and is_stdio(url):
+        try:
+            program = parse_stdio_command(url)[0]
+        except (ValueError, IndexError):
+            program = ""
+        if program and mcp_import_sources.find_program(program, entry.headers, entry.cwd) is None:
+            reasons.append(f"Program not found: {program}")
+    return reasons
+
+
+def _import_source_preview(
+    prepared: mcp_import_sources.PreparedServer,
+    app: str,
+    existing: set,
+    stdio_disabled_reason: Optional[str],
+) -> McpImportSourceServer:
+    entry = prepared.entry
+    note = prepared.error
+    importable = entry is not None
+    if entry is not None and entry.is_stdio and stdio_disabled_reason:
+        importable = False
+        note = stdio_disabled_reason
+    elif entry is not None:
+        reasons = _switched_off_reasons(prepared, entry.url, app)
+        note = f"Will be added switched off. {' '.join(reasons)}" if reasons else None
+    identity = mcp_import_sources.server_identity(entry.url) if entry is not None else None
+    return McpImportSourceServer(
+        name = prepared.name,
+        transport = prepared.transport,
+        target = prepared.target,
+        env_keys = prepared.env_keys,
+        header_keys = prepared.header_keys,
+        already_added = identity is not None and identity in existing,
+        importable = importable,
+        note = note,
+    )
+
+
+@router.get("/import-sources", response_model = McpImportSourcesResponse)
+def list_import_sources(
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+    no_credential: WithoutCredential = False,
+):
+    """The MCP configs of other apps on this computer (Claude Desktop, Claude Code, Cursor, VS Code,
+    Windsurf) and the servers in them, masked: names, transports, commands and URLs with credentials
+    hidden, and env/header names without values."""
+    _require_import_source_access(via_api_key, no_credential)
+    stdio_disabled_reason = None if stdio_mcp_enabled() else stdio_mcp_disabled_reason()
+    existing = _existing_server_identities()
+    sources = []
+    for source in mcp_import_sources.discover_sources():
+        servers = [
+            _import_source_preview(
+                mcp_import_sources.prepare_server(server),
+                source.app,
+                existing,
+                stdio_disabled_reason,
+            )
+            for server in source.servers
+        ]
+        sources.append(
+            McpImportSource(
+                id = source.source_id,
+                app = source.app,
+                label = source.label,
+                path = source.path if is_owner_context() else None,
+                error = source.error,
+                servers = servers,
+            )
+        )
+    return McpImportSourcesResponse(sources = sources)
+
+
+def _import_from_source(
+    server: mcp_import_sources.SourceServer, app: str, existing: set, via_api_key: bool
+) -> McpImportServerOutcome:
+    prepared = mcp_import_sources.prepare_server(server)
+    entry = prepared.entry
+    if entry is None:
+        return McpImportServerOutcome(name = server.name, status = "error", detail = prepared.error)
+    # Named here: _validate_url can't tell a bare program name ("konnect") from a scheme-less URL.
+    if entry.is_stdio and not stdio_mcp_enabled():
+        return McpImportServerOutcome(
+            name = server.name, status = "error", detail = stdio_mcp_disabled_reason()
+        )
+    try:
+        url = _validate_url(entry.url)
+        if is_stdio(url):
+            require_ui_session_for_local_commands(via_api_key)
+        cwd = _validate_cwd(entry.cwd, url)
+        headers = _normalize_headers(entry.headers)
+    except HTTPException as exc:
+        return McpImportServerOutcome(name = server.name, status = "error", detail = str(exc.detail))
+    identity = mcp_import_sources.server_identity(url)
+    if identity is not None and identity in existing:
+        return McpImportServerOutcome(
+            name = server.name,
+            status = "duplicate",
+            detail = "Studio already has a server with this "
+            + ("command." if is_stdio(url) else "address."),
+        )
+    reasons = _switched_off_reasons(prepared, url, app)
+    server_id = uuid.uuid4().hex[:16]
+    mcp_servers_db.create_server(
+        id = server_id,
+        display_name = entry.display_name,
+        url = url,
+        headers_json = json.dumps(headers) if headers else None,
+        is_enabled = not reasons,
+        use_oauth = entry.use_oauth and not is_stdio(url),
+        cwd = cwd,
+    )
+    if identity is not None:
+        existing.add(identity)
+    return McpImportServerOutcome(
+        name = server.name,
+        status = "added_disabled" if reasons else "added",
+        detail = " ".join(reasons) or None,
+        server_id = server_id,
+    )
+
+
+@router.post("/import-sources/apply", response_model = McpImportSourceApplyResult)
+@serialize_mcp_server_mutation
+async def apply_import_source(
+    payload: McpImportSourceApplyRequest,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+    no_credential: WithoutCredential = False,
+):
+    """Import the chosen servers of one discovered app config. The file is re-read here by source
+    id, so neither a path nor a secret ever comes from the browser. A server arrives switched on only
+    when it can run as written; duplicates are skipped and every server gets its own outcome."""
+    _require_import_source_access(via_api_key, no_credential)
+    sources = await asyncio.to_thread(mcp_import_sources.discover_sources)
+    source = next((item for item in sources if item.source_id == payload.source_id), None)
+    if source is None:
+        raise HTTPException(
+            status_code = 404,
+            detail = "That app's config file is no longer there. Reopen the list and try again.",
+        )
+    if source.error:
+        raise HTTPException(status_code = 400, detail = source.error)
+    by_name = {server.name: server for server in source.servers}
+    existing = _existing_server_identities()
+    results: list[McpImportServerOutcome] = []
+    for name in dict.fromkeys(payload.server_names):
+        server = by_name.get(name)
+        if server is None:
+            results.append(
+                McpImportServerOutcome(
+                    name = name,
+                    status = "error",
+                    detail = f"{source.app} no longer lists this server.",
+                )
+            )
+            continue
+        results.append(_import_from_source(server, source.app, existing, via_api_key))
+    return McpImportSourceApplyResult(results = results)
 
 
 @router.post("/test", response_model = McpServerProbeResult)

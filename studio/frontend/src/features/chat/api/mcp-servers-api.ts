@@ -327,6 +327,58 @@ export function importMcpServers(
   );
 }
 
+// A server another app on this computer has configured. The backend reads the app's file itself, so
+// env and header values never reach the browser: only their names, and the command or URL masked.
+export interface McpImportSourceServer {
+  name: string;
+  transport: "stdio" | "http";
+  target: string;
+  env_keys: string[];
+  header_keys: string[];
+  already_added: boolean;
+  importable: boolean;
+  note: string | null;
+}
+
+export interface McpImportSource {
+  id: string;
+  app: string;
+  label: string | null;
+  path: string | null;
+  error: string | null;
+  servers: McpImportSourceServer[];
+}
+
+export type McpImportOutcomeStatus =
+  "added" | "added_disabled" | "duplicate" | "error";
+
+export interface McpImportServerOutcome {
+  name: string;
+  status: McpImportOutcomeStatus;
+  detail: string | null;
+  server_id: string | null;
+}
+
+export function listMcpImportSources(): Promise<{
+  sources: McpImportSource[];
+}> {
+  return mcpRequest("/import-sources");
+}
+
+// Import the chosen servers of one discovered app config, by source id: the backend re-reads the
+// file, so no path or secret is sent from here.
+export function importFromMcpSource(
+  sourceId: string,
+  serverNames: string[],
+): Promise<{ results: McpImportServerOutcome[] }> {
+  return trackMcpServerMutation(
+    mcpRequest("/import-sources/apply", {
+      method: "POST",
+      body: { source_id: sourceId, server_names: serverNames },
+    }),
+  );
+}
+
 export type McpUiCspField =
   "connectDomains" | "resourceDomains" | "frameDomains" | "baseUriDomains";
 

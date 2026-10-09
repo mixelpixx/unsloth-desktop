@@ -63,13 +63,15 @@ def _enabled_from_spec(label: str, spec: dict) -> tuple[Optional[bool], Optional
     return not disabled, None
 
 
-def _parse_entry(name: str, spec: object) -> tuple[Optional[ParsedMcpEntry], Optional[str]]:
+def _parse_entry(
+    name: str, spec: object, *, allow_variable_references: bool = False
+) -> tuple[Optional[ParsedMcpEntry], Optional[str]]:
     label = str(name).strip()
     if not label:
         return None, "Server entry has an empty name."
     if not isinstance(spec, dict):
         return None, f"{label}: entry must be an object."
-    if _has_variable_reference(spec):
+    if not allow_variable_references and _has_variable_reference(spec):
         return None, f"{label}: VS Code variable references are not supported by import."
 
     is_enabled, error = _enabled_from_spec(label, spec)
@@ -158,6 +160,15 @@ def _parse_entry(name: str, spec: object) -> tuple[Optional[ParsedMcpEntry], Opt
         is_enabled = is_enabled,
         use_oauth = oauth_raw is not None,
     ), None
+
+
+def parse_mcp_entry(
+    name: str, spec: object, *, allow_variable_references: bool = False
+) -> tuple[Optional[ParsedMcpEntry], Optional[str]]:
+    """One server entry, read as parse_mcp_config reads it. Import from another app resolves
+    ``${...}`` references itself first, so the ones it could not fill in reach here on purpose: that
+    server is added switched off with the reference in place instead of refused."""
+    return _parse_entry(name, spec, allow_variable_references = allow_variable_references)
 
 
 def parse_mcp_config(config: object) -> tuple[list[ParsedMcpEntry], list[str]]:
