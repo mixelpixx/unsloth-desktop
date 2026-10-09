@@ -5,7 +5,11 @@ import { isAccountOwner } from "@/features/auth/account-session";
 import { translate } from "@/i18n";
 import { useSettingsDialogStore } from "../stores/settings-dialog-store";
 
-export type FailureLogFamily = "llama-server" | "diffusion-server" | "server";
+export type FailureLogFamily =
+  | "llama-server"
+  | "diffusion-server"
+  | "server"
+  | "mcp";
 
 export function loadFailureLogFamily(
   isGguf: boolean | undefined,

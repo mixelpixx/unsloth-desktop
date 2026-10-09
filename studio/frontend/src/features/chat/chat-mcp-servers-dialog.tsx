@@ -54,7 +54,7 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { isAccountOwner } from "@/features/auth";
-import { useSettingsDialogStore } from "@/features/settings";
+import { useSettingsDialogStore, viewLogsAction } from "@/features/settings";
 import { subscribeToMcpServerMutationSettlements } from "./api/mcp-server-mutation-tracker";
 import {
   type McpCapabilities,
@@ -1268,8 +1268,12 @@ export function ChatMcpServersDialog({
         return;
       setStatuses((current) => ({ ...current, [server.id]: status }));
       if (action === "restart" && status.state === "failed") {
+        // View logs when the program got far enough to write one (a missing program never does).
         toast.error(`"${server.display_name}" did not start`, {
           description: status.last_error ?? undefined,
+          action: status.log_path
+            ? viewLogsAction("mcp", status.log_path)
+            : undefined,
         });
       }
     } catch (err) {

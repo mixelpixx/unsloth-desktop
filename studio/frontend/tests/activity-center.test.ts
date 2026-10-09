@@ -453,6 +453,20 @@ test("an error toast is recorded with its description and its View logs target",
   store.dismissActivity(nodeOnly.id);
 });
 
+test("an MCP server that did not start keeps a View logs on its own log", () => {
+  const target = { family: "mcp", sourcePath: "D:/home/logs/mcp/ssh-connect-1.log" };
+  assert.deepEqual(store.toastLogTarget({ logTarget: target }), target);
+  const dialog = readSrc("features/chat/chat-mcp-servers-dialog.tsx");
+  assert.match(
+    dialog,
+    /did not start`, \{[\s\S]{0,400}?action: status\.log_path\s*\?\s*viewLogsAction\("mcp", status\.log_path\)/,
+  );
+  assert.match(
+    readSrc("features/settings/lib/view-logs-action.ts"),
+    /\| "mcp";/,
+  );
+});
+
 test("unseen errors light the bell until they are looked at", () => {
   const entry = store.recordActivityError({ title: "boom" }, 100_000);
   const state = () => useActivityStore.getState();

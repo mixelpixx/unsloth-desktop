@@ -29,6 +29,7 @@ export const ACTIVITY_LOG_FAMILIES = [
   "server",
   "llama-server",
   "diffusion-server",
+  "mcp",
 ] as const;
 
 export type ActivityLogFamily = (typeof ACTIVITY_LOG_FAMILIES)[number];
