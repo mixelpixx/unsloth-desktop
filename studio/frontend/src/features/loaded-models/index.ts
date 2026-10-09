@@ -19,6 +19,9 @@ export {
   useShowLoadedModels,
 } from "./show-loaded-models-pref";
 export { LoadedModelsIndicator } from "./loaded-models-indicator";
+// The sidebar's resources panel ejects through the same guarded path as the card's rows.
+export { ejectLoadedModel } from "./loaded-models-api";
+export type { EjectOutcome } from "./loaded-models-api";
 export type {
   LoadedModelEntry,
   LoadedModelKind,

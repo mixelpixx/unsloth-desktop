@@ -3,6 +3,10 @@
 
 import { useEffect, useRef } from "react";
 import { Switch } from "@/components/ui/switch";
+import {
+  setShowResourcesStrip,
+  useShowResourcesStrip,
+} from "@/features/gpu-resources";
 import { useSidebarPin } from "@/hooks/use-sidebar-pin";
 import { useT } from "@/i18n";
 import {
@@ -36,6 +40,7 @@ const FONT_SELECT_CLASS = "w-auto min-w-0 flex-1";
 export function AppearanceTab() {
   const t = useT();
   const { pinned, setPinned } = useSidebarPin();
+  const showResourcesStrip = useShowResourcesStrip();
   // The sidebar's "Customize sidebar" entry lands mid-page, so scroll its section into view.
   const sidebarNavSectionRef = useRef<HTMLDivElement | null>(null);
   const scrollTarget = useSettingsDialogStore((s) => s.scrollTarget);
@@ -169,6 +174,16 @@ export function AppearanceTab() {
           )}
         >
           <Switch checked={pinned} onCheckedChange={setPinned} />
+        </SettingsRow>
+        <SettingsRow
+          label={t("resources.settings.showStrip")}
+          description={t("resources.settings.showStripDescription")}
+        >
+          <Switch
+            checked={showResourcesStrip}
+            onCheckedChange={setShowResourcesStrip}
+            aria-label={t("resources.settings.showStrip")}
+          />
         </SettingsRow>
       </SettingsSection>
 

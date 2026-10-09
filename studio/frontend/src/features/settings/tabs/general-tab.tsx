@@ -22,6 +22,8 @@ import {
   setShowLoadedModels,
   useShowLoadedModels,
 } from "@/features/loaded-models";
+// Read at module scope below; the barrel exports the preference module first for that reason.
+import { RESOURCES_STRIP_PREFERENCE_KEY } from "@/features/gpu-resources";
 
 import { useHfTokenStore } from "@/features/hub";
 import {
@@ -174,6 +176,8 @@ const PREFS_KEYS: string[] = [
   LOADED_MODELS_PREFERENCE_KEYS.collapsed,
   LOADED_MODELS_PREFERENCE_KEYS.position,
   LOADED_MODELS_PREFERENCE_KEYS.dismissed,
+  // The sidebar's GPU memory strip (Appearance).
+  RESOURCES_STRIP_PREFERENCE_KEY,
   // Voice settings
   "unsloth_voice_settings",
   // Retired keys. The onboarding wizard is gone, but installs that ran it still

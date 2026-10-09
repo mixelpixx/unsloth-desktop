@@ -295,6 +295,7 @@ import { ShutdownDialog } from "@/components/shutdown-dialog";
 import { buildChatItemMarkdown } from "@/features/chat/prompt-storage/prompt-storage-dialog";
 import { useActiveChatMenuStore } from "@/features/chat/stores/active-chat-menu-store";
 import { type PinnedPage, PinnedPageRow, usePinnedPages } from "@/features/browser";
+import { ResourcesStrip } from "@/features/gpu-resources";
 import { translate, useT, type TranslationKey } from "@/i18n";
 
 const RECENT_SLOT_NUMBERS = [1, 2, 3, 4, 5, 6] as const;
@@ -5992,6 +5993,8 @@ export function AppSidebar() {
             "opacity-0 data-[visible=true]:opacity-100",
           )}
         />
+        {/* GPU memory per card, always on screen; renders nothing on a host without a GPU. */}
+        <ResourcesStrip />
         {/* Collapsed: cog sits one nav-row step above the avatar. */}
         <SidebarMenu className="gap-3 group-data-[collapsible=icon]:gap-1">
           {/* Update affordance — shows only when a newer version is available. */}

@@ -133,6 +133,9 @@ function generalTab(initialToken: string) {
       setShowLoadedModels: noop,
       useShowLoadedModels: () => false,
     },
+    "@/features/gpu-resources": {
+      RESOURCES_STRIP_PREFERENCE_KEY: "unsloth_show_resources_strip",
+    },
     "@/features/hub": {
       TRANSPORT_MODE_STORAGE_KEY: "transport",
       useHfTokenStore: Object.assign(
