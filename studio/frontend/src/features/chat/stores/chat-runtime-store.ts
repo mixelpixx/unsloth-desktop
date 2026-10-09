@@ -1874,6 +1874,30 @@ function savePermissionMode(mode: PermissionMode): void {
 
 const INITIAL_PERMISSION_MODE: PermissionMode = loadPermissionMode();
 
+/** The tool pills as the user last left them: what a fresh page starts with, and what unloading
+ *  a model returns to. Unloading used to switch them all off with nothing to switch them back on,
+ *  so after an eject, a backend restart or a llama.cpp update the next model ran without the
+ *  user's MCP servers or web search until the page was reloaded. A model that cannot use a pill
+ *  still has it clamped off by the model-selection pass. */
+function persistedToolPills(): Pick<
+  ChatRuntimeStore,
+  | "toolsEnabled"
+  | "codeToolsEnabled"
+  | "imageToolsEnabled"
+  | "deepResearchEnabled"
+  | "mcpEnabledForChat"
+  | "webFetchToolsEnabled"
+> {
+  return {
+    toolsEnabled: loadBool(CHAT_TOOLS_ENABLED_KEY, false),
+    codeToolsEnabled: loadBool(CHAT_CODE_TOOLS_ENABLED_KEY, false),
+    imageToolsEnabled: loadBool(CHAT_IMAGE_TOOLS_ENABLED_KEY, false),
+    deepResearchEnabled: loadBool(CHAT_DEEP_RESEARCH_ENABLED_KEY, false),
+    mcpEnabledForChat: loadBool(CHAT_MCP_ENABLED_KEY, false),
+    webFetchToolsEnabled: loadBool(CHAT_WEB_FETCH_TOOLS_ENABLED_KEY, false),
+  };
+}
+
 /** Re-picking the level already in force is not a fresh grant, so a manual Code-off stands. */
 function codeDeclinedOnEnteringFullAccess(state: ChatRuntimeStore): boolean {
   return state.permissionMode === "full"
@@ -5139,12 +5163,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       supportsBuiltinCodeExecution: false,
       supportsBuiltinImageGeneration: false,
       supportsBuiltinWebFetch: false,
-      toolsEnabled: false,
-      codeToolsEnabled: false,
-      imageToolsEnabled: false,
-      deepResearchEnabled: false,
-      mcpEnabledForChat: false,
-      webFetchToolsEnabled: false,
+      ...persistedToolPills(),
       // Only the per-session enable pill resets; source/mode/top_k persist.
       ragEnabled: false,
       toolStatusByThreadId: {},
