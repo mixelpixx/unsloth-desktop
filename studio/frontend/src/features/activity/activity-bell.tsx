@@ -499,7 +499,12 @@ function ActivityPanel({
 
 export function ActivityBell({
   className,
-}: { className?: string }): ReactElement {
+  side = "bottom",
+}: {
+  className?: string;
+  /** Where the tooltip and panel open: below the expanded header, right of the icon rail. */
+  side?: "bottom" | "right";
+}): ReactElement {
   const t = useT();
   const activeCount = useActivityStore((state) =>
     countActiveEntries(state.entries),
@@ -561,17 +566,17 @@ export function ActivityBell({
           </PopoverTrigger>
         </TooltipPrimitive.Trigger>
         <TooltipContent
-          side="bottom"
-          sideOffset={6}
+          side={side}
+          sideOffset={side === "right" ? 8 : 6}
           className="tooltip-compact"
         >
           {t("activity.title")}
         </TooltipContent>
       </Tooltip>
       <PopoverContent
-        side="bottom"
+        side={side}
         align="start"
-        sideOffset={6}
+        sideOffset={side === "right" ? 8 : 6}
         aria-label={t("activity.title")}
         className="menu-soft-surface w-[calc(360px*var(--ui-space-scale,1))] gap-2 rounded-[20px] p-3"
       >

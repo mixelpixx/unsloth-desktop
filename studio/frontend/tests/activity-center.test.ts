@@ -347,6 +347,72 @@ test("identical errors inside the dedupe window are one row with a count", () =>
   assert.equal(later.entries.length, 2);
 });
 
+test("a failed load's error toast becomes that row's reason, not a second error", () => {
+  const { ACTIVITY_LOAD_ERROR_MERGE_MS, absorbIntoFailedLoad } = store;
+  const load = finished("model-load:chat:1", 20_000, {
+    kind: "model-load",
+    title: "Qwen3-8B",
+    state: "failed",
+  });
+  const logs = { family: "llama-server" as const, sourcePath: "D:/logs/llama.log" };
+  const merged = absorbIntoFailedLoad(
+    [load],
+    { title: "Couldn't load Qwen3-8B", detail: "Out of GPU memory", logs },
+    20_000 + 50,
+  );
+  assert.ok(merged);
+  assert.equal(merged.entries.length, 1);
+  assert.equal(merged.entry.id, load.id);
+  assert.equal(merged.entry.detail, "Out of GPU memory");
+  assert.deepEqual(merged.entry.logs, logs);
+  assert.ok(merged.entry.actions.includes("logs"));
+  // Without a description, the toast's own line is the reason.
+  assert.equal(
+    absorbIntoFailedLoad([load], { title: "Load failed" }, 20_100)?.entry.detail,
+    "Load failed",
+  );
+
+  // Only a load that just failed and has not been explained yet.
+  const late = 20_000 + ACTIVITY_LOAD_ERROR_MERGE_MS + 1;
+  assert.equal(absorbIntoFailedLoad([load], { title: "x" }, late), null);
+  assert.equal(
+    absorbIntoFailedLoad([{ ...load, detail: "already said" }], { title: "x" }, 20_100),
+    null,
+  );
+  assert.equal(
+    absorbIntoFailedLoad([{ ...load, state: "cancelled" }], { title: "x" }, 20_100),
+    null,
+  );
+  assert.equal(
+    absorbIntoFailedLoad([{ ...load, kind: "download" }], { title: "x" }, 20_100),
+    null,
+  );
+});
+
+test("recording an error right after a load fails adds no row", () => {
+  const before = useActivityStore.getState().entries;
+  const at = Date.now();
+  useActivityStore.setState({
+    entries: [
+      ...before,
+      finished("model-load:chat:merge", at, {
+        kind: "model-load",
+        title: "Llama-3.2-3B",
+        state: "failed",
+      }),
+    ],
+  });
+  const count = useActivityStore.getState().entries.length;
+  const entry = store.recordToastError("Couldn't load the model", "Not enough memory", undefined, at + 10);
+  assert.equal(entry.id, "model-load:chat:merge");
+  assert.equal(useActivityStore.getState().entries.length, count);
+  assert.equal(
+    useActivityStore.getState().entries.find((e) => e.id === entry.id)?.detail,
+    "Not enough memory",
+  );
+  useActivityStore.setState({ entries: before });
+});
+
 test("an error toast is recorded with its description and its View logs target", () => {
   const entry = store.recordToastError(
     "Failed to load model",
@@ -839,7 +905,8 @@ test("the bell sits in the sidebar header, and its feeds are mounted once from t
     sidebar,
     /import \{ ActivityBell, useActivityFeeds \} from "@\/features\/activity";/,
   );
-  assert.equal(sidebar.split("<ActivityBell").length - 1, 1);
+  // Two buttons, one per sidebar state; the feeds behind them are mounted once.
+  assert.equal(sidebar.split("<ActivityBell").length - 1, 2);
   assert.equal(sidebar.split("useActivityFeeds();").length - 1, 1);
   const header = sidebar.slice(
     sidebar.indexOf("<SidebarHeader"),
@@ -851,6 +918,25 @@ test("the bell sits in the sidebar header, and its feeds are mounted once from t
       header.indexOf("useChatSearchStore.getState().open()"),
     "next to search, in the header's button group",
   );
+});
+
+test("the collapsed icon rail keeps the bell, opening to the right", () => {
+  const sidebar = readSrc("components/app-sidebar.tsx");
+  const header = sidebar.slice(
+    sidebar.indexOf("<SidebarHeader"),
+    sidebar.indexOf("</SidebarHeader>"),
+  );
+  const rail = header.slice(header.lastIndexOf("group-data-[collapsible=icon]:flex"));
+  assert.match(rail, /<ActivityBell side="right"/);
+  // The expanded header's bell lives in the row the rail hides.
+  const expandedRow = header.slice(0, header.indexOf("<ActivityBell />"));
+  assert.ok(
+    expandedRow.lastIndexOf("group-data-[collapsible=icon]:hidden") >
+      expandedRow.lastIndexOf("group-data-[collapsible=icon]:flex"),
+  );
+  const bell = readSrc("features/activity/activity-bell.tsx");
+  assert.match(bell, /side = "bottom"/);
+  assert.match(bell, /<PopoverContent\s+side=\{side\}/);
 });
 
 test("the bell names its counts, and its rows are labelled", () => {

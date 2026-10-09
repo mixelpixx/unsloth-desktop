@@ -404,6 +404,48 @@ export function addErrorEntry(
   return { entries: [...entries, entry], entry, deduped: false };
 }
 
+/** How soon after a model load fails its error toast still belongs to that row. */
+export const ACTIVITY_LOAD_ERROR_MERGE_MS = 5_000;
+
+/**
+ * A failed model load settles its row, then the caller shows why in an error toast: one failure,
+ * which would read as two under Errors. The toast's reason becomes the row's detail (and its View
+ * logs target) instead of a row of its own. Null when no load just failed with nothing said yet.
+ */
+export function absorbIntoFailedLoad(
+  entries: readonly ActivityEntry[],
+  input: ActivityErrorInput,
+  now: number,
+): { entries: ActivityEntry[]; entry: ActivityEntry } | null {
+  let index = -1;
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i];
+    if (
+      entry.kind === "model-load" &&
+      entry.state === "failed" &&
+      entry.detail === null &&
+      entry.finishedAt !== null &&
+      now - entry.finishedAt >= 0 &&
+      now - entry.finishedAt <= ACTIVITY_LOAD_ERROR_MERGE_MS &&
+      (index === -1 || entry.finishedAt > (entries[index].finishedAt ?? 0))
+    ) {
+      index = i;
+    }
+  }
+  if (index === -1) return null;
+  const current = entries[index];
+  const reason = input.detail ?? (input.title || null);
+  const entry: ActivityEntry = {
+    ...current,
+    detail: reason,
+    logs: input.logs ?? current.logs,
+  };
+  entry.actions = actionsFor(entry);
+  const next = entries.slice();
+  next[index] = entry;
+  return { entries: next, entry };
+}
+
 function lastTouched(entry: ActivityEntry): number {
   return entry.finishedAt ?? entry.startedAt;
 }
@@ -746,6 +788,16 @@ export function recordActivityError(
   input: ActivityErrorInput,
   now: number = Date.now(),
 ): ActivityEntry {
+  const absorbed = absorbIntoFailedLoad(
+    useActivityStore.getState().entries,
+    input,
+    now,
+  );
+  if (absorbed) {
+    useActivityStore.setState({ entries: absorbed.entries });
+    persistSoon();
+    return absorbed.entry;
+  }
   errorSequence += 1;
   const result = addErrorEntry(
     useActivityStore.getState().entries,

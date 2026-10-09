@@ -5422,6 +5422,13 @@ export function AppSidebar() {
                 </Tooltip>
               </div>
             )}
+            {!isMobile && (
+              // The icon rail keeps the bell: running jobs and new errors stay visible with the
+              // sidebar collapsed. The expanded header's bell is hidden by the same group class.
+              <div className="relative z-10 hidden group-data-[collapsible=icon]:flex w-full justify-center pt-[calc(2px*var(--ui-space-scale,1))]">
+                <ActivityBell side="right" className="top-0 size-[calc(28px*var(--ui-space-scale,1))] rounded-full" />
+              </div>
+            )}
           </>
         )}
       </SidebarHeader>
