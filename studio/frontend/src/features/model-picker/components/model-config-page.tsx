@@ -1676,9 +1676,14 @@ function GgufAdvancedSettings({
         <div className={ROW_CLASS}>
           <div className="flex min-w-0 items-center gap-1.5">
             <span className={LABEL_CLASS}>Tensor Parallelism</span>
+            {/* Measured, not assumed: two RTX 3090 over PCIe, 27B dense, llama.cpp b11443. Tensor ran
+                prompts at 453 tok/s against 1265-1507 for one card or a layer split, and generated at
+                28-30 tok/s against 27-39. Layer split (the default here) is the way to use both. */}
             <InfoHint>
-              Speeds up dense models across multiple GPUs. No effect on a single
-              GPU, and MoE models don't benefit.
+              Splits every layer across GPUs. Over PCIe (no NVLink) it is usually
+              slower: on two RTX 3090s it read prompts about 3x slower and
+              generated at best 8% faster. Off uses whole layers per GPU, which
+              is faster there. No effect on a single GPU.
             </InfoHint>
           </div>
           <Switch
