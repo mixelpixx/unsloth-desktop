@@ -5380,6 +5380,10 @@ function Install-UnslothStudio {
                 "`$portFile = `$null`n`$mutexName = 'Local\UnslothStudioLauncher'`n"
             }
 
+            # The app window's own browser profile and the server log folder, baked like the port file.
+            $_appProfileSq = (Join-Path $appDir 'app-window') -replace "'", "''"
+            $_serverLogSq = (Join-Path $StudioHome 'logs\server') -replace "'", "''"
+
             $launcherContent = @"
 $studioHomeExport`$ErrorActionPreference = 'Stop'
 `$basePort = 8888
@@ -5509,15 +5513,97 @@ function Find-FreeLaunchPort {
     return `$null
 }
 
-# If Unsloth is already healthy on any expected port, just open it and exit.
+`$studioPython = '$SingleQuotedPythonPath'
+`$studioEntry = '$SingleQuotedTrampoline'
+# Its own browser profile: the app window keeps its sign-in apart from everyday browsing, and the
+# browser process it starts lives exactly as long as the Studio window does.
+`$appProfileDir = '$_appProfileSq'
+`$serverLogDir = '$_serverLogSq'
+`$nl = [Environment]::NewLine
+
+function Show-StudioMessage {
+    param([string]`$Text, [string]`$Buttons = 'OK', [string]`$Icon = 'Information')
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        return [System.Windows.Forms.MessageBox]::Show(`$Text, 'Unsloth Studio', `$Buttons, `$Icon)
+    } catch {
+        return `$null
+    }
+}
+
+function Find-AppBrowser {
+    # Edge first: it ships with Windows 11 and is the engine the desktop app's WebView2 uses.
+    foreach (`$exe in @('msedge.exe', 'chrome.exe')) {
+        foreach (`$hive in @('HKCU', 'HKLM')) {
+            try {
+                `$path = (Get-ItemProperty -LiteralPath "`${hive}:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\`$exe" -ErrorAction Stop).'(default)'
+                if (`$path -and (Test-Path -LiteralPath `$path)) { return `$path }
+            } catch {}
+        }
+    }
+    foreach (`$path in @(
+        "`${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+        "`$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "`$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "`$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+    )) {
+        if (`$path -and (Test-Path -LiteralPath `$path)) { return `$path }
+    }
+    return `$null
+}
+
+# Opens Studio in an app window (no tabs or address bar). Returns the browser process when this call
+# started it, so the caller can wait for the window to close; `$null when it handed off to a window
+# that was already open, or fell back to the default browser.
+function Open-StudioWindow {
+    param([Parameter(Mandatory = `$true)][int]`$Port)
+    `$url = "http://127.0.0.1:`$Port/"
+    `$browser = Find-AppBrowser
+    if (-not `$browser) {
+        Start-Process `$url
+        return `$null
+    }
+    `$alreadyOpen = `$false
+    try {
+        `$alreadyOpen = [bool](Get-CimInstance Win32_Process -Filter "Name='msedge.exe' OR Name='chrome.exe'" -ErrorAction Stop |
+            Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains(`$appProfileDir) })
+    } catch {}
+    `$browserArgs = @(
+        "--app=`$url",
+        ('--user-data-dir="' + `$appProfileDir + '"'),
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-background-mode',
+        '--window-size=1440,960'
+    )
+    `$proc = Start-Process -FilePath `$browser -ArgumentList `$browserArgs -PassThru
+    if (`$alreadyOpen) { return `$null }
+    return `$proc
+}
+
+function Stop-StudioBackend {
+    # Quoted exactly as the launch command is, through a child -Command.
+    `$stopCommand = "& '" + (`$studioPython -replace "'", "''") + "' -X utf8 -c '" +
+        (`$studioEntry -replace "'", "''") + "' studio stop"
+    `$powershellExe = Join-Path `$env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    try {
+        `$stop = Start-Process -FilePath `$powershellExe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-Command', `$stopCommand) -WindowStyle Hidden -PassThru
+        `$stop.WaitForExit(60000) | Out-Null
+    } catch {}
+}
+
+# If Unsloth is already healthy on any expected port, just open a window on it and exit: the
+# launcher that started it is the one that asks about shutting down.
 `$existingPort = Find-HealthyStudioPort
 if (`$existingPort) {
-    Start-Process "http://localhost:`$existingPort"
+    Open-StudioWindow -Port `$existingPort | Out-Null
     exit 0
 }
 
 `$launchMutex = [System.Threading.Mutex]::new(`$false, `$mutexName)
 `$haveMutex = `$false
+`$healthyPort = `$null
+`$serverProc = `$null
 try {
     try {
         `$haveMutex = `$launchMutex.WaitOne(0)
@@ -5525,41 +5611,30 @@ try {
         `$haveMutex = `$true
     }
     if (-not `$haveMutex) {
-        # Another launcher is already running; wait for it to bring Unsloth up
+        # Another launcher is already starting Unsloth; wait for it, then open a window on it.
         `$deadline = (Get-Date).AddSeconds(`$timeoutSec)
         while ((Get-Date) -lt `$deadline) {
             `$port = Find-HealthyStudioPort
-            if (`$port) { Start-Process "http://localhost:`$port"; exit 0 }
+            if (`$port) { Open-StudioWindow -Port `$port | Out-Null; exit 0 }
             Start-Sleep -Milliseconds `$pollIntervalMs
         }
         exit 0
     }
 
     `$powershellExe = Join-Path `$env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    # The managed interpreter, not the generated unsloth.exe console script: that one is
-    # unsigned and Application Control denies it on managed machines (#8490).
-    `$studioPython = '$SingleQuotedPythonPath'
-    `$studioEntry = '$SingleQuotedTrampoline'
     `$launchPort = Find-FreeLaunchPort
     if (-not `$launchPort) {
-        `$msg = "No free port found in range `$basePort-`$(`$basePort + `$maxPortOffset)"
-        try {
-            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-            [System.Windows.Forms.MessageBox]::Show(`$msg, 'Unsloth Studio') | Out-Null
-        } catch {}
+        Show-StudioMessage "No free port found in range `$basePort-`$(`$basePort + `$maxPortOffset)" | Out-Null
         exit 1
     }
-    # Single-quote the path in the child -Command so `$` / backtick in custom
+    # Single-quote the path in the child -Command so `$ / backtick in custom
     # roots don't get reparsed; double any apostrophes so 'O''Brien' survives.
     # The entry point is single-quoted for the same reason: it carries apostrophes
     # around 'unsloth', and unquoted they would end the string mid-expression.
     `$studioCommand = "& '" + (`$studioPython -replace "'", "''") + "' -X utf8 -c '" +
         (`$studioEntry -replace "'", "''") + "' studio -p " + `$launchPort
-    # RemoteSigned, not Bypass: the child runs an inline -Command against an executable, so no
-    # script file is loaded and the two behave identically here. No reason to spend a scored
-    # token on a launch that needs no policy relief.
+    # No console window: the server logs to logs\server, and the app window is the app.
     `$launchArgs = @(
-        '-NoExit',
         '-NoProfile',
         '-ExecutionPolicy',
         'RemoteSigned',
@@ -5568,46 +5643,52 @@ try {
     )
 
     try {
-        `$proc = Start-Process -FilePath `$powershellExe -ArgumentList `$launchArgs -WorkingDirectory `$env:USERPROFILE -PassThru
+        `$serverProc = Start-Process -FilePath `$powershellExe -ArgumentList `$launchArgs -WorkingDirectory `$env:USERPROFILE -WindowStyle Hidden -PassThru
     } catch {
-        `$msg = "Could not launch Unsloth Studio terminal.`n`nError: `$(`$_.Exception.Message)"
-        try {
-            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-            [System.Windows.Forms.MessageBox]::Show(`$msg, 'Unsloth Studio') | Out-Null
-        } catch {}
+        Show-StudioMessage ('Could not start Unsloth Studio.' + `$nl + `$nl + 'Error: ' + `$_.Exception.Message) 'OK' 'Error' | Out-Null
         exit 1
     }
 
-    `$browserOpened = `$false
     `$deadline = (Get-Date).AddSeconds(`$timeoutSec)
     while ((Get-Date) -lt `$deadline) {
         if (Test-StudioHealth -Port `$launchPort) {
             if (`$portFile) {
                 try {
-                    [System.IO.File]::WriteAllText(`$portFile, "`$launchPort`n")
+                    [System.IO.File]::WriteAllText(`$portFile, "`$launchPort
+")
                 } catch {}
             }
-            Start-Process "http://localhost:`$launchPort"
-            `$browserOpened = `$true
+            `$healthyPort = `$launchPort
             break
         }
-        if (`$proc.HasExited) { break }
+        if (`$serverProc.HasExited) { break }
         Start-Sleep -Milliseconds `$pollIntervalMs
     }
-    if (-not `$browserOpened) {
-        if (`$proc.HasExited) {
-            `$msg = "Unsloth Studio exited before becoming healthy. Check terminal output for errors."
+    if (-not `$healthyPort) {
+        if (`$serverProc.HasExited) {
+            `$msg = "Unsloth Studio stopped before it finished starting. The log in `$serverLogDir says why."
         } else {
-            `$msg = "Unsloth Studio is still starting but did not become healthy within `$timeoutSec seconds. Check the terminal window for the selected port and open it manually."
+            `$msg = "Unsloth Studio is still starting but did not answer within `$timeoutSec seconds. Try the shortcut again in a minute; the log is in `$serverLogDir."
         }
-        try {
-            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-            [System.Windows.Forms.MessageBox]::Show(`$msg, 'Unsloth Studio') | Out-Null
-        } catch {}
+        Show-StudioMessage `$msg 'OK' 'Warning' | Out-Null
+        exit 1
     }
 } finally {
     if (`$haveMutex) { `$launchMutex.ReleaseMutex() | Out-Null }
     `$launchMutex.Dispose()
+}
+
+# This launcher started the server, so it owns the question of when it stops. Closing the window is
+# quitting the app, but a loaded model or a training run is worth a question rather than a surprise.
+`$window = Open-StudioWindow -Port `$healthyPort
+if (-not `$window) { exit 0 }
+`$window.WaitForExit()
+if (`$serverProc.HasExited) { exit 0 }
+`$answer = Show-StudioMessage ('Shut down Unsloth Studio?' + `$nl + `$nl +
+    'Yes: shut it down. Any loaded model frees its GPU memory, and a training run saves a checkpoint and stops.' + `$nl + `$nl +
+    'No: keep it running in the background. Reopen it from the Unsloth Studio shortcut.') 'YesNo' 'Question'
+if ("`$answer" -ne 'No') {
+    Stop-StudioBackend
 }
 exit 0
 "@

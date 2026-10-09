@@ -260,4 +260,41 @@ def test_launcher_waits_long_enough_for_a_cold_start():
     assert match is not None
     assert int(match.group(1)) >= 120
     # The user-facing message reads the variable, so it cannot drift from the real budget.
-    assert "did not become healthy within `$timeoutSec seconds" in tpl
+    assert "within `$timeoutSec seconds" in tpl
+
+
+def test_launcher_opens_studio_in_its_own_app_window():
+    # A desktop app, not a browser tab: an Edge/Chrome app window (no tabs or address bar) on its own
+    # profile, so its sign-in is its own and the browser process lives exactly as long as the window.
+    tpl = _launcher_template()
+    assert '"--app=`$url"' in tpl
+    assert "('--user-data-dir=\"' + `$appProfileDir + '\"')" in tpl
+    assert "`$appProfileDir = '`$_appProfileSq'" not in tpl  # baked at install time, not at launch
+    assert "`$appProfileDir = '$_appProfileSq'" in tpl
+    # No Edge or Chrome: the default browser, as before.
+    assert re.search(r"if \(-not `\$browser\) \{\s*Start-Process `\$url", tpl)
+    # Every path that used to open a tab now opens the window.
+    assert 'Start-Process "http://localhost:' not in tpl
+    assert tpl.count("Open-StudioWindow -Port") == 3
+
+
+def test_launcher_runs_the_server_without_a_console_window():
+    tpl = _launcher_template()
+    launch = tpl[tpl.index("`$launchArgs = @(") : tpl.index("`$deadline = (Get-Date)", tpl.index("`$launchArgs = @("))]
+    assert "-NoExit" not in launch
+    assert "-WindowStyle Hidden" in launch
+    # RemoteSigned beside the hidden window, never Bypass (test_launch_studio_launcher pins why).
+    assert "'RemoteSigned'" in launch and "Bypass" not in launch
+
+
+def test_closing_the_window_asks_before_stopping_only_what_this_launcher_started():
+    tpl = _launcher_template()
+    tail = tpl[tpl.index("`$window = Open-StudioWindow -Port `$healthyPort") :]
+    assert "`$window.WaitForExit()" in tail
+    assert "'YesNo' 'Question'" in tail
+    assert "Stop-StudioBackend" in tail
+    # Opening a second window on a running server hands off and exits: only the starter asks.
+    existing = tpl[tpl.index("`$existingPort = Find-HealthyStudioPort") : tpl.index("`$launchMutex =")]
+    assert "Open-StudioWindow -Port `$existingPort | Out-Null" in existing and "exit 0" in existing
+    stop = tpl[tpl.index("function Stop-StudioBackend") : tpl.index("`$existingPort = Find-HealthyStudioPort")]
+    assert "' studio stop\"" in stop
