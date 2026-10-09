@@ -4734,10 +4734,17 @@ _DEBUG_LOG_EXPORT_LOCK = threading.Semaphore(1)
 
 @_owner_settings_router.get("/debug/logs/export")
 def export_debug_logs(
+    request: Request,
+    diagnostics: bool = False,
     current_subject: str = Depends(get_current_subject),
     _ui_session: None = Depends(_require_ui_session),
 ) -> StreamingResponse:
     """Every log the picker lists, redacted, as one ZIP.
+
+    ``diagnostics=true`` is Settings > Logs > Diagnostics' "Save diagnostics bundle": the same
+    archive with the environment report (``utils.diagnostics``, as JSON and Markdown) added under
+    ``diagnostics/``. One builder, one lock and one set of guards for both buttons. The desktop
+    "Download all logs" command strips query strings, so it can never ask for the report.
 
     Same two dependencies as the routes above: a bundle of logs and the paths
     they came from is UI-operator material, so an API-key or keyless caller is
@@ -4756,11 +4763,21 @@ def export_debug_logs(
             detail = "A log export is already running. Wait for it to finish and try again.",
         )
     try:
-        archive = debug_log_export.build_log_archive()
+        extra_members = None
+        if diagnostics:
+            from routes.diagnostics import frontend_build_path
+            from utils import diagnostics as diagnostics_report
+
+            report = diagnostics_report.collect_diagnostics(
+                frontend_build_path = frontend_build_path(request)
+            )
+            extra_members = diagnostics_report.bundle_members(report)
+        archive = debug_log_export.build_log_archive(extra_members = extra_members)
     finally:
         _DEBUG_LOG_EXPORT_LOCK.release()
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    archive_name = f"unsloth-{'diagnostics' if diagnostics else 'logs'}-{stamp}.zip"
 
     def _chunks():
         try:
@@ -4779,7 +4796,7 @@ def export_debug_logs(
             # Neither shipping caller reads this back: the browser names the Blob
             # itself and the desktop path names the file in Rust. It is here for
             # a curl or address-bar caller, so do not assume the button uses it.
-            "Content-Disposition": f'attachment; filename="unsloth-logs-{stamp}.zip"',
+            "Content-Disposition": f'attachment; filename="{archive_name}"',
             # A stable authenticated GET is otherwise cacheable: the archive could
             # outlive the download in the on-disk cache, and a second export could
             # be answered from it rather than from the logs as they are now.

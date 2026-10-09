@@ -393,6 +393,7 @@ from routes.prompts import router as prompts_router
 from routes.library import router as library_router
 from routes.profile_stats import router as profile_stats_router
 from routes.resources import router as resources_router
+from routes.diagnostics import router as diagnostics_router
 from auth import policy as auth_policy, storage
 from auth.authentication import authenticated_via_api_key, get_current_subject
 from hub.utils.host_paths import redact_inventory_host_paths
@@ -1803,6 +1804,7 @@ app.include_router(prompts_router, prefix = "/api/prompts", tags = ["prompts"])
 app.include_router(library_router, prefix = "/api/library", tags = ["library"])
 app.include_router(profile_stats_router, prefix = "/api/profile", tags = ["profile"])
 app.include_router(resources_router, prefix = "/api/resources", tags = ["resources"])
+app.include_router(diagnostics_router, prefix = "/api/diagnostics", tags = ["diagnostics"])
 app.include_router(datasets_router, prefix = "/api/datasets", tags = ["datasets"])
 app.include_router(data_recipe_router, prefix = "/api/data-recipe", tags = ["data-recipe"])
 app.include_router(llama_router, prefix = "/api/llama", tags = ["llama"])
@@ -3274,4 +3276,6 @@ def setup_frontend(
     # The catch-all above is what 404s a GET probe. The lifespan reads this to decide whether the engine
     # paths still need their own GET denial.
     app.state.frontend_mounted = True
+    # Settings > Logs > Diagnostics reports when this build was made.
+    app.state.frontend_build_path = build_path
     return True

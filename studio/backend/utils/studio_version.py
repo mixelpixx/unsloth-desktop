@@ -105,6 +105,57 @@ def _git_branch(repo_root: Path) -> str | None:
     return branch
 
 
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_GIT_STATUS_TIMEOUT_SECONDS = 3.0
+
+
+def _git_stdout(repo_root: Path, args: list[str], timeout: float) -> str | None:
+    try:
+        from utils.subprocess_compat import windows_hidden_subprocess_kwargs
+
+        hidden = windows_hidden_subprocess_kwargs()
+    except Exception:
+        hidden = {}
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd = repo_root,
+            check = False,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.DEVNULL,
+            text = True,
+            encoding = "utf-8",
+            errors = "replace",
+            timeout = timeout,
+            **hidden,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def get_source_checkout_info(repo_root: Path | None = None) -> dict[str, object] | None:
+    """Branch, short commit and whether tracked files are modified, for a source checkout.
+
+    None when Unsloth is not running from a Git checkout. For diagnostics only: local git
+    calls with short timeouts, never a fetch. ``dirty`` is None when git could not say in time.
+    """
+    resolved_repo_root = repo_root or _repo_root()
+    if not _is_source_checkout(resolved_repo_root):
+        return None
+    commit = (_git_stdout(resolved_repo_root, ["rev-parse", "--short=10", "HEAD"], _GIT_TIMEOUT_SECONDS) or "").strip()
+    status = _git_stdout(
+        resolved_repo_root,
+        ["status", "--porcelain", "--untracked-files=no"],
+        _GIT_STATUS_TIMEOUT_SECONDS,
+    )
+    return {
+        "branch": _git_branch(resolved_repo_root),
+        "commit": commit if _GIT_COMMIT_RE.fullmatch(commit) else None,
+        "dirty": None if status is None else bool(status.strip()),
+    }
+
+
 def get_studio_version(repo_root: Path | None = None) -> str:
     """Return the installed Unsloth release tag for display, or ``dev``.
 

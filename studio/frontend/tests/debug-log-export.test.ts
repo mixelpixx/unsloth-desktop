@@ -212,6 +212,8 @@ function makeWorld(options: {
     "@hugeicons/core-free-icons": new Proxy({}, { get: () => ({}) }),
     "@hugeicons/react": { HugeiconsIcon: () => null },
     "../api/debug-logs": api,
+    // Its own test drives it (diagnostics-section.test.ts); here it only has to load.
+    "../components/diagnostics-section": { DiagnosticsSection: () => null },
     "../components/settings-row": {
       SettingsRow: (props: { label: string; children?: React.ReactNode }) =>
         React.createElement("div", null, props.label, props.children),

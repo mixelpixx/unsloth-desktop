@@ -322,6 +322,7 @@ export const SETTINGS_SEARCH_INDEX: Record<SettingsTab, TranslationKey[]> = {
     "settings.sandbox.terminal",
   ],
   debugging: [
+    "settings.diagnostics.title",
     "settings.debugging.logSection",
     "settings.debugging.source",
     "settings.debugging.path",

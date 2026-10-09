@@ -56,6 +56,7 @@ import {
   openLogsFolder,
   revealSavedArchive,
 } from "../api/debug-logs";
+import { DiagnosticsSection } from "../components/diagnostics-section";
 import { SettingsRow } from "../components/settings-row";
 import { SettingsSection } from "../components/settings-section";
 import {
@@ -599,6 +600,7 @@ export function DebuggingTab() {
 
   return (
     <div className="settings-page">
+      <DiagnosticsSection />
       <SettingsSection
         title={t("settings.debugging.logSection")}
         description={t("settings.debugging.sourceHint")}

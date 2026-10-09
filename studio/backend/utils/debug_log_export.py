@@ -20,7 +20,7 @@ import stat
 import tempfile
 import time
 import zipfile
-from typing import IO, Callable, Iterator, Optional
+from typing import IO, Callable, Iterator, Mapping, Optional
 
 from utils import debug_log_sources
 from utils.log_redaction import redact_log_text
@@ -347,15 +347,22 @@ def _warning_line(member: str, exc: BaseException) -> str:
     )
 
 
-def build_log_archive() -> tempfile.SpooledTemporaryFile:
+def build_log_archive(
+    extra_members: Optional[Mapping[str, bytes]] = None,
+) -> tempfile.SpooledTemporaryFile:
     """Every allowlisted log, redacted, as a ZIP rewound to its start.
+
+    ``extra_members`` are written first, ahead of every budget, under the names given: the
+    diagnostics report rides along this way (Settings > Logs > Diagnostics) instead of a second
+    archive builder. They are already sanitized by their producer; the names are reserved so no
+    log can take one.
 
     The caller owns the returned file and must close it.
     """
     output = tempfile.SpooledTemporaryFile(max_size = SPOOL_MAX_BYTES, mode = "w+b")
     try:
         warnings: list[str] = []
-        used: set[str] = set()
+        used: set[str] = {name.lower() for name in (extra_members or {})}
         remaining = MAX_TOTAL_SOURCE_BYTES
         deadline = time.monotonic() + MAX_BUILD_SECONDS
         sources = debug_log_sources.list_sources()
@@ -366,6 +373,9 @@ def build_log_archive() -> tempfile.SpooledTemporaryFile:
             else {}
         )
         with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, payload in (extra_members or {}).items():
+                # Bare ZipInfo for the same reason as the warnings member: no host clock.
+                archive.writestr(zipfile.ZipInfo(name), payload, compress_type = zipfile.ZIP_DEFLATED)
             for source in _newest_first_across_families(sources):
                 member = _member_name(source.family, source.label, used)
                 if remaining <= 0:
