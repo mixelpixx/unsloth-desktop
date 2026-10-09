@@ -86,6 +86,8 @@ from core.inference.mcp_client import (
     record_probe_failure,
     record_server_failure,
     refresh_session_tools_sync,
+    server_ask_tools,
+    server_disabled_tools,
     server_lifecycle,
     session_tool_overlay,
     shared_session_scope,
@@ -7276,6 +7278,9 @@ def is_potentially_unsafe_tool_call(name: str, arguments: dict) -> bool:
         tool_name = _mcp_raw_tool_name(name)
         if tool_name in _BLENDER_CLI_SUMMARY_TOOLS:
             return True
+        # The owner set this tool to ask first (MCP server settings), whatever its name suggests.
+        if mcp_tool_always_asks(name):
+            return True
         tool_name = _MCP_TERM_SEPARATOR_RE.sub("_", tool_name)
         # A mutating verb anywhere (get_or_create_issue, read_and_delete)
         # overrides a read-only prefix.
@@ -9394,6 +9399,10 @@ def is_high_risk_tool_call(name: str, arguments: dict) -> bool:
     if name.startswith(MCP_TOOL_PREFIX):
         tool_name = _mcp_raw_tool_name(name)
         if tool_name in _BLENDER_CLI_SUMMARY_TOOLS:
+            return True
+        # The owner set this tool to ask first (MCP server settings): "Approve for me" pauses it on every call,
+        # whatever its name suggests. "Run automatically" and Full access never ask, and still run it.
+        if mcp_tool_always_asks(name):
             return True
         # Reduce every separator the name uses to `_`, camelCase boundaries included, so the
         # term-boundary regexes below see one vocabulary.
@@ -13513,10 +13522,36 @@ def _mcp_tool_schema_text(display: str, tool: dict) -> str:
 
 
 def _mcp_cached_tool(server: dict, tool_name: str) -> dict | None:
+    """The cached tool as the model sees it; None when the server does not list it for the model, or its owner
+    turned it off, so its schema, image mapping and compaction help all go with it."""
+    if tool_name in server_disabled_tools(server):
+        return None
     for tool in get_cached_tools(server["id"]) or []:
         if tool.get("name") == tool_name and tool_visible_to(tool, "model"):
             return public_tool(server, tool)
     return None
+
+
+def _mcp_tool_turned_off(display: str, tool_name: str) -> str:
+    """What a model that calls a turned-off tool reads instead of a result (models call tools they were not offered:
+    an old turn, another server's name, a guess). Nothing ran, and it is not a fault to retry."""
+    return (
+        f"Error: MCP tool '{tool_name}' on '{display}' is turned off in Studio's MCP server settings, so it was not "
+        "run. Do not call it again; use one of the tools you were given, or tell the user it is turned off."
+    )
+
+
+def mcp_tool_always_asks(name) -> bool:
+    """Whether the owner set this MCP tool to ask before running. Read per call (a DB row, never a probe), so a
+    change applies to the next call; a row that cannot be read leaves the call to the ordinary classifier."""
+    if not isinstance(name, str) or not name.startswith(MCP_TOOL_PREFIX) or name.count("__") < 2:
+        return False
+    try:
+        server = mcp_servers_db.get_server_for_tool(name.split("__", 2)[1])
+    except Exception:  # noqa: BLE001 -- a classifier must answer; the risk rules below still apply
+        logger.debug("reading MCP ask-first tools failed", exc_info = True)
+        return False
+    return bool(server) and _mcp_raw_tool_name(name) in server_ask_tools(server)
 
 
 def _mcp_image_recipient(server: dict, mapping: dict) -> str:
@@ -13614,6 +13649,8 @@ def _mcp_tool_schema(name, offset = None) -> str:
     if not server:
         return f"Error: MCP server for tool '{tool_name}' not found"
     display = server.get("display_name") or server["id"]
+    if tool is None and tool_name in server_disabled_tools(server):
+        return _mcp_tool_turned_off(display, tool_name)
     if tool is None:
         return f"Error: MCP server '{display}' does not list a tool named '{tool_name}'"
     text = _mcp_tool_schema_text(display, tool)
@@ -13727,8 +13764,18 @@ def _mcp_raw_tool_name(name: str) -> str:
     return _MCP_TOOL_ALIASES.get(name) or name.split("__", 2)[-1]
 
 
-def _mcp_specs_for_server(server: dict, mcp_tools: list[dict]) -> list[dict]:
-    """Convert an MCP server's tool list into OpenAI function specs."""
+def _mcp_specs_for_server(
+    server: dict, mcp_tools: list[dict], *, include_disabled: bool = False
+) -> list[dict]:
+    """Convert an MCP server's tool list into OpenAI function specs.
+
+    Every listing a model is offered is built here -- a send's (get_enabled_mcp_tools, a chat's own re-listed process
+    included) and a count's (cached_mcp_tools) -- so the tools the owner turned off are dropped here, before they can
+    claim a name or cost a token. ``include_disabled`` keeps them, for pricing every tool in the settings dialog."""
+    if not include_disabled:
+        disabled = server_disabled_tools(server)
+        if disabled:
+            mcp_tools = [tool for tool in mcp_tools if tool.get("name") not in disabled]
     display = server.get("display_name") or server["id"]
     names_by_raw = {raw_name: name for name, raw_name in _mcp_tool_names(server, mcp_tools).items()}
     specs: list[dict] = []
@@ -13820,6 +13867,73 @@ def cached_mcp_tools() -> tuple[list[dict], bool]:
         payload = [public_tool(server, tool) for tool in payload]
         listed.append((server, payload, _mcp_specs_for_server(server, payload)))
     return _mcp_listing(listed), complete
+
+
+_MCP_CATALOG_DESCRIPTION_CHARS = 2000
+
+
+def mcp_tool_catalog(server: dict) -> dict:
+    """Every tool this server lists for a model, with whether it is on, whether it asks first, and what its schema
+    adds to each request: the MCP dialog's per-tool controls (models.mcp_servers.McpToolCatalog). Cache only, like the
+    count paths: never starts a server or probes one.
+
+    Priced as the listing prices itself (_mcp_listing): each tool's spec exactly as it ships, compact JSON, at the
+    rate the loaded model's tokenizer measures over the server's whole listing -- one count, not one per tool -- and
+    `_text_token_estimate` per tool when nothing can measure. Full specs: _mcp_listing compacts the largest only when
+    the enabled listing would take most of the window, which is what turning tools off here avoids."""
+    disabled = server_disabled_tools(server)
+    ask = server_ask_tools(server)
+    cached = get_cached_tools(server["id"])
+    result: dict = {
+        "server_id": server["id"],
+        "cached": cached is not None,
+        "stale": cached is not None and tools_cache_stale(server["id"]),
+        "tools": [],
+        "context_tokens": _loaded_context_tokens(),
+    }
+    if cached is None:
+        result["unlisted_disabled"] = sorted(disabled)
+        return result
+    payload = [public_tool(server, tool) for tool in cached if isinstance(tool, dict)]
+    specs = _mcp_specs_for_server(server, payload, include_disabled = True)
+    raw_by_name = _mcp_tool_names(server, payload)
+    by_raw = {tool.get("name"): tool for tool in payload}
+    texts = [json.dumps(spec, separators = (",", ":")) for spec in specs]
+    measured = None
+    if texts and result["context_tokens"]:
+        listing = "[" + ",".join(texts) + "]"
+        spent = _measured_text_tokens(listing, result["context_tokens"])
+        measured = spent / len(listing) if spent else None
+    listed: set[str] = set()
+    for spec, text in zip(specs, texts):
+        raw_name = raw_by_name.get(spec["function"]["name"])
+        tool = by_raw.get(raw_name)
+        if tool is None:
+            continue
+        listed.add(raw_name)
+        description = " ".join(str(tool.get("description") or "").split())
+        title = tool.get("title")
+        tokens = len(text) * measured if measured else _text_token_estimate(text)
+        result["tools"].append(
+            {
+                "name": raw_name,
+                "title": (title.strip() or None) if isinstance(title, str) else None,
+                "summary": _mcp_summary(description),
+                "description": description[:_MCP_CATALOG_DESCRIPTION_CHARS],
+                "enabled": raw_name not in disabled,
+                "ask": raw_name in ask,
+                "tokens": max(1, round(tokens)),
+            }
+        )
+    on = [tool for tool in result["tools"] if tool["enabled"]]
+    result.update(
+        enabled_count = len(on),
+        total_count = len(result["tools"]),
+        enabled_tokens = sum(tool["tokens"] for tool in on),
+        tokens_measured = measured is not None,
+        unlisted_disabled = sorted(disabled - listed),
+    )
+    return result
 
 
 # How long a chat send waits for a server's tool discovery before going ahead without that server's tools. The
@@ -14237,6 +14351,10 @@ def execute_tool(
             return f"Error: MCP server '{display}' is disabled"
         if is_stdio(server["url"]) and not stdio_mcp_enabled():
             return f"Error: stdio MCP server '{display}' is disabled on this host"
+        # Read off the row this call just fetched, so turning a tool off reaches a run already in progress: its tool
+        # list was built before the change, and a model can name a tool it was never offered.
+        if tool_name in server_disabled_tools(server):
+            return _mcp_tool_turned_off(display, tool_name)
         tool = _mcp_cached_tool(server, tool_name) if _mcp_listing_compacted(name) else None
         if tool is not None and isinstance(arguments, dict):
             missing = [
@@ -16890,26 +17008,36 @@ def _can_measure_tokens(ctx: int, text: str) -> bool:
 _MEASURABILITY_PROBE_CHARS = 64
 
 
-def _text_token_cost(text: str, ctx: int) -> float:
-    """What ``text`` really costs, measured when the serving model can measure it. The estimate is
-    the inverse of `_dense_prefix_chars`: ASCII at the English four characters per token,
-    everything else at one. Doubled when nothing can check it, for the same reason
-    `_UNMEASURED_ROOM_MARGIN` halves a room that cannot be measured."""
+def _text_token_estimate(text: str) -> float:
+    """The inverse of `_dense_prefix_chars`: ASCII at the English four characters per token,
+    everything else at one. Unmargined: `_text_token_cost` doubles it before a budget relies on it."""
+    ascii_chars = len(text.encode("ascii", "ignore"))
+    return ascii_chars * 0.25 + (len(text) - ascii_chars)
+
+
+def _measured_text_tokens(text: str, ctx: int | None) -> float | None:
+    """``text`` priced by the serving model's own tokenizer, or None when nothing can measure it."""
     counter = _loaded_token_counter(ctx) if ctx else None
-    measured = None
-    if counter is not None:
-        try:
-            spent = counter(text)
-            measured = None if spent is None else float(spent)
-        except Exception:
-            logger.debug("token count failed", exc_info = True)
+    if counter is None:
+        return None
+    try:
+        spent = counter(text)
+    except Exception:
+        logger.debug("token count failed", exc_info = True)
+        return None
+    return None if spent is None else float(spent)
+
+
+def _text_token_cost(text: str, ctx: int) -> float:
+    """What ``text`` really costs, measured when the serving model can measure it, else
+    `_text_token_estimate` doubled, for the same reason `_UNMEASURED_ROOM_MARGIN` halves a room
+    that cannot be measured."""
+    measured = _measured_text_tokens(text, ctx)
     if measured is not None:
         return measured
     # A counter that could not answer is a counter that is not there: taking its presence as proof the estimate is
     # safe is what leaves dense ASCII priced at the English rate.
-    ascii_chars = len(text.encode("ascii", "ignore"))
-    estimate = ascii_chars * 0.25 + (len(text) - ascii_chars)
-    return estimate / _UNMEASURED_ROOM_MARGIN
+    return _text_token_estimate(text) / _UNMEASURED_ROOM_MARGIN
 
 
 def _dense_char_limit(

@@ -56,6 +56,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
     if "idle_timeout_seconds" not in cols:
         conn.execute("ALTER TABLE mcp_servers ADD COLUMN idle_timeout_seconds INTEGER")
+    # Per-tool settings (core.inference.mcp_client: server_disabled_tools, server_ask_tools): JSON arrays of raw tool
+    # names, NULL = none. The tools turned OFF are stored, so an existing row, and a tool a server adds later, stay on.
+    for column in ("disabled_tools_json", "ask_tools_json"):
+        if column not in cols:
+            conn.execute(f"ALTER TABLE mcp_servers ADD COLUMN {column} TEXT")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS mcp_servers_builtin_id ON mcp_servers(builtin_id)"
     )

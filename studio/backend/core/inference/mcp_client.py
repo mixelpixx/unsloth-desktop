@@ -1610,6 +1610,47 @@ def shared_session_scope(server_id: str) -> str:
     return f"server={server_id}"
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Per-tool settings. A local model's tool calling degrades as its tool list grows, and every schema costs context on
+# every request, so the owner picks which of a server's tools the model is offered. Stored as the tools turned OFF
+# (disabled_tools_json), not the ones on: a row saved before the setting existed, and a tool a server adds later, are
+# then offered as every tool always was, and turning one tool off never has to know the server's whole list.
+# ask_tools_json names tools that always pause for approval under "Approve for me", whatever their name suggests.
+# Raw MCP tool names (as the server lists them), JSON arrays; NULL = none. Neither changes what the server lists, so
+# neither is in TOOL_CACHE_INVALIDATING_FIELDS: they filter the cached list when it is offered or called.
+# ---------------------------------------------------------------------------------------------------------------------
+
+MAX_TOOL_SETTING_NAMES = 2000
+
+
+def _tool_name_set(raw: Any) -> frozenset[str]:
+    if not raw:
+        return frozenset()
+    try:
+        names = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return frozenset()
+    if not isinstance(names, (list, tuple)):
+        return frozenset()
+    return frozenset(name for name in names if isinstance(name, str) and name)
+
+
+def server_disabled_tools(row: Optional[dict]) -> frozenset[str]:
+    """Raw names of the tools this server's owner turned off: never offered to a model, refused if called."""
+    return _tool_name_set((row or {}).get("disabled_tools_json"))
+
+
+def server_ask_tools(row: Optional[dict]) -> frozenset[str]:
+    """Raw names of the tools that always ask before running under "Approve for me"."""
+    return _tool_name_set((row or {}).get("ask_tools_json"))
+
+
+def tool_names_json(names) -> Optional[str]:
+    """The stored form of a tool-name set: a sorted JSON array, or None for an empty one."""
+    unique = sorted({name for name in names or () if isinstance(name, str) and name})
+    return json.dumps(unique) if unique else None
+
+
 class McpServerBusy(RuntimeError):
     """A shared local program is running another chat's call. Calls on its one stdio stream stay serialized, so this
     one would only wait; it reports instead of hanging silently."""

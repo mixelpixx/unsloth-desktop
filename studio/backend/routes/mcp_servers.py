@@ -56,7 +56,10 @@ from core.inference.mcp_client import (
     stdio_mcp_disabled_reason,
     stdio_mcp_enabled,
     retime_server_processes,
+    server_ask_tools,
+    server_disabled_tools,
     stop_server_processes,
+    tool_names_json,
     tool_visible_to,
     tools_cache_epoch,
     unquoted_spaced_program,
@@ -84,6 +87,7 @@ from models.mcp_servers import (
     McpStdioCommand,
     McpStdioDecodeRequest,
     McpStdioEncodeResponse,
+    McpToolCatalog,
     McpUiResourceResponse,
     McpUiToolCallRequest,
     McpUiToolCallResult,
@@ -267,8 +271,13 @@ def _image_mappings_active(row: dict) -> bool:
     if is_stdio(row["url"]) and not stdio_mcp_enabled():
         return False
     tools = get_cached_tools(row["id"])
+    # A tool turned off is never offered, so a mapping on it could never receive the image either.
+    disabled = server_disabled_tools(row)
     return tools is None or any(
-        image_mapping(row, tool) for tool in tools if tool_visible_to(tool, "model")
+        image_mapping(row, tool)
+        for tool in tools
+        if tool_visible_to(tool, "model")
+        and not (isinstance(tool, dict) and tool.get("name") in disabled)
     )
 
 
@@ -297,6 +306,8 @@ def _row_to_response(row: dict, *, include_headers: bool = True) -> McpServerRes
         image_mappings_active = _image_mappings_active(row),
         process_mode = server_process_mode(row),
         idle_timeout_seconds = server_idle_timeout(row),
+        disabled_tools = sorted(server_disabled_tools(row)),
+        ask_tools = sorted(server_ask_tools(row)),
         created_at = row["created_at"],
         updated_at = row["updated_at"],
     )
@@ -558,6 +569,12 @@ def _changes_from_payload(payload: McpServerUpdate) -> dict:
     if "idle_timeout_seconds" in sent:
         # null = back to the mode's default.
         changes["idle_timeout_seconds"] = payload.idle_timeout_seconds
+    # The whole set each time, null or [] = none. Names the server does not list (yet) are kept: they apply when it
+    # lists them, and a tool that vanishes and comes back stays off.
+    if "disabled_tools" in sent:
+        changes["disabled_tools_json"] = tool_names_json(payload.disabled_tools)
+    if "ask_tools" in sent:
+        changes["ask_tools_json"] = tool_names_json(payload.ask_tools)
     # stdio is OAuth-less: drop a stale OAuth flag when switching to a command.
     if "url" in changes and is_stdio(changes["url"]):
         changes["use_oauth"] = False
@@ -699,6 +716,26 @@ def list_mcp_server_tools(
         and isinstance(tool.get("name"), str)
         and tool_visible_to(tool, "model")
     ]
+
+
+@router.get("/{server_id}/tool-catalog", response_model = McpToolCatalog)
+def get_mcp_server_tool_catalog(
+    server_id: str,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+    no_credential: WithoutCredential = False,
+):
+    """The server's tools for the per-tool controls: on/off, ask first, and what each schema costs a request.
+    From the cache only (cached: false until a chat or Refresh discovers them), so opening it starts nothing. A local
+    program's row is the signed-in window's alone, as list_mcp_servers hides it from everyone else."""
+    from core.inference.tools import mcp_tool_catalog
+
+    server = mcp_servers_db.get_server(server_id)
+    if not server:
+        raise HTTPException(status_code = 404, detail = "MCP server not found")
+    if is_stdio(server["url"]):
+        require_ui_session_for_local_commands(via_api_key or no_credential)
+    return McpToolCatalog(**mcp_tool_catalog(server))
 
 
 @router.post("/{server_id}/refresh", response_model = McpServerProbeResult)
@@ -1366,6 +1403,12 @@ async def call_mcp_ui_tool(
     if not tool_visible_to(tool, "app"):
         raise HTTPException(
             status_code = 403, detail = f"Tool '{tool_name}' is not callable by an MCP app"
+        )
+    # Off means Studio never runs it, whoever asks: the model, or a widget the server drew.
+    if tool_name in server_disabled_tools(server):
+        raise HTTPException(
+            status_code = 403,
+            detail = f"Tool '{tool_name}' is turned off in this server's MCP settings",
         )
     arguments = payload.arguments or {}
     if _mcp_arguments_reference_studio_credential(arguments):

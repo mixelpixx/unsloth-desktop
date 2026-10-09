@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field, StrictStr
 
@@ -17,6 +17,10 @@ class McpImageInputMapping(BaseModel):
 # A local program's lifecycle (core.inference.mcp_client: PROCESS_MODES, IDLE_TIMEOUT_CHOICES). Seconds; 0 = never.
 McpProcessMode = Literal["shared", "per_chat"]
 McpIdleTimeout = Literal[60, 300, 1800, 7200, 0]
+
+# Raw MCP tool names as the server lists them (core.inference.mcp_client: MAX_TOOL_SETTING_NAMES).
+McpToolName = Annotated[StrictStr, Field(min_length = 1, max_length = 256)]
+McpToolNames = Annotated[list[McpToolName], Field(max_length = 2000)]
 
 
 class McpServerCreate(BaseModel):
@@ -51,6 +55,10 @@ class McpServerUpdate(BaseModel):
     # process on its next use.
     process_mode: Optional[McpProcessMode] = None
     idle_timeout_seconds: Optional[McpIdleTimeout] = None
+    # Absent = leave as-is; null or [] = none. The whole set each time: the tools never offered to a model (and
+    # refused if one calls them anyway), and the tools that always ask first under "Approve for me".
+    disabled_tools: Optional[McpToolNames] = None
+    ask_tools: Optional[McpToolNames] = None
 
 
 class McpServerResponse(BaseModel):
@@ -70,8 +78,43 @@ class McpServerResponse(BaseModel):
     # Resolved: a row that never chose an idle timeout reports its mode's default. HTTP servers ignore both.
     process_mode: McpProcessMode = "per_chat"
     idle_timeout_seconds: int = 300
+    # Raw tool names, sorted. Every tool not listed in disabled_tools is on, including ones the server adds later.
+    disabled_tools: list[str] = Field(default_factory = list)
+    ask_tools: list[str] = Field(default_factory = list)
     created_at: str
     updated_at: str
+
+
+class McpToolEntry(BaseModel):
+    """One tool a server lists for the model, as the per-tool controls show it."""
+
+    name: str
+    title: Optional[str] = None
+    # Plain text from a third-party server: first sentence, and the full text capped for a tooltip.
+    summary: str = ""
+    description: str = ""
+    enabled: bool = True
+    ask: bool = False
+    # What this tool's schema adds to every request while it is on.
+    tokens: int = 0
+
+
+class McpToolCatalog(BaseModel):
+    server_id: str
+    # False until the server's tools have been discovered (a chat used it, or Refresh); tools is then empty.
+    cached: bool = False
+    # The server announced a tool-list change since this list was read; the next chat or Refresh re-reads it.
+    stale: bool = False
+    tools: list[McpToolEntry] = Field(default_factory = list)
+    enabled_count: int = 0
+    total_count: int = 0
+    enabled_tokens: int = 0
+    # Counted with the loaded model's tokenizer; otherwise estimated from characters.
+    tokens_measured: bool = False
+    # The loaded model's context window, when one is known.
+    context_tokens: Optional[int] = None
+    # Turned-off names the server does not list (any more); kept, so the tool stays off if it comes back.
+    unlisted_disabled: list[str] = Field(default_factory = list)
 
 
 class McpServerStatus(BaseModel):

@@ -83,6 +83,7 @@ import {
 } from "./mcp-server-form";
 import { McpImageMappings } from "./mcp-image-mappings";
 import { McpImportFromApps } from "./mcp-import-from-apps";
+import { McpServerTools } from "./mcp-server-tools";
 import { parseMcpConfigFile } from "./utils/mcp-config-file";
 import {
   MCP_IDLE_TIMEOUT_OPTIONS,
@@ -1286,6 +1287,21 @@ export function ChatMcpServersDialog({
     }
   }
 
+  // A row the backend just saved from its Tools section, shown without waiting for the list to reload. A switch
+  // mid-toggle keeps its optimistic state, as in refresh().
+  const replaceServer = useCallback((updated: McpServerConfig) => {
+    if (!openRef.current) return;
+    setServers((rows) =>
+      rows.map((row) =>
+        row.id !== updated.id
+          ? row
+          : togglingIdsRef.current.has(row.id)
+            ? { ...updated, is_enabled: row.is_enabled }
+            : updated,
+      ),
+    );
+  }, []);
+
   // The existing Settings > Logs action, on this server's MCP log source.
   function viewServerLog(status: McpServerStatus) {
     if (!status.log_path) return;
@@ -1800,103 +1816,113 @@ export function ChatMcpServersDialog({
             ) : (
               <ul className="flex flex-col divide-y rounded-md border">
                 {servers.filter((server) => !server.builtin_id).map((server) => (
-                  <li
-                    key={server.id}
-                    className="flex items-center justify-between gap-3 px-3 py-2"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex min-w-0 items-center gap-2">
-                        <span className="truncate font-medium">
-                          {server.display_name}
-                        </span>
-                        {stdioBlocked && !isHttpAddress(server.url) && (
-                          <span
-                            className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
-                            title={capabilities?.stdio_disabled_reason ?? undefined}
-                          >
-                            Paused
+                  <li key={server.id} className="px-3 py-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="truncate font-medium">
+                            {server.display_name}
                           </span>
-                        )}
-                      </div>
-                      <div className="truncate text-xs text-muted-foreground">
-                        {displayAddress(server.url)}
-                      </div>
-                      {!isHttpAddress(server.url) && statuses[server.id] && (
-                        <McpProcessStatusLine
-                          server={server}
-                          status={statuses[server.id]}
-                          pending={lifecyclePending[server.id] ?? null}
-                          restartBlockedReason={
-                            stdioBlocked
-                              ? (capabilities?.stdio_disabled_reason ??
-                                "Local programs are turned off")
-                              : !server.is_enabled
-                                ? "Turn the server on to start it"
+                          {stdioBlocked && !isHttpAddress(server.url) && (
+                            <span
+                              className="shrink-0 rounded-sm bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                              title={capabilities?.stdio_disabled_reason ?? undefined}
+                            >
+                              Paused
+                            </span>
+                          )}
+                        </div>
+                        <div className="truncate text-xs text-muted-foreground">
+                          {displayAddress(server.url)}
+                        </div>
+                        {!isHttpAddress(server.url) && statuses[server.id] && (
+                          <McpProcessStatusLine
+                            server={server}
+                            status={statuses[server.id]}
+                            pending={lifecyclePending[server.id] ?? null}
+                            restartBlockedReason={
+                              stdioBlocked
+                                ? (capabilities?.stdio_disabled_reason ??
+                                  "Local programs are turned off")
+                                : !server.is_enabled
+                                  ? "Turn the server on to start it"
+                                  : null
+                            }
+                            onRestart={() =>
+                              void manageProcess(server, "restart")
+                            }
+                            onStop={() => void manageProcess(server, "stop")}
+                            onViewLog={
+                              isAccountOwner()
+                                ? () => viewServerLog(statuses[server.id])
                                 : null
-                          }
-                          onRestart={() =>
-                            void manageProcess(server, "restart")
-                          }
-                          onStop={() => void manageProcess(server, "stop")}
-                          onViewLog={
-                            isAccountOwner()
-                              ? () => viewServerLog(statuses[server.id])
-                              : null
-                          }
-                        />
-                      )}
-                    </div>
-                    <div className="flex items-center gap-1">
-                      <Switch
-                        checked={server.is_enabled}
-                        onCheckedChange={(next) => toggleEnabled(server, next)}
-                        aria-label={`Enable ${server.display_name}`}
-                        disabled={importing || busyIds.has(server.id)}
-                      />
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => refreshTools(server)}
-                        aria-label={`Refresh tools for ${server.display_name}`}
-                        title={
-                          stdioBlocked && !isHttpAddress(server.url)
-                            ? (capabilities?.stdio_disabled_reason ?? undefined)
-                            : "Refresh tools from this server"
-                        }
-                        disabled={
-                          importing ||
-                          busyIds.has(server.id) ||
-                          (stdioBlocked && !isHttpAddress(server.url))
-                        }
-                      >
-                        {refreshingIds.has(server.id) ? (
-                          <Spinner />
-                        ) : (
-                          <RefreshGlyph className="size-3.5" />
+                            }
+                          />
                         )}
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => void startEdit(server)}
-                        aria-label={`Edit ${server.display_name}`}
-                        disabled={importing || busyIds.has(server.id)}
-                      >
-                        <HugeiconsIcon icon={Edit03Icon} className="size-3.5" />
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => setConfirmingDelete(server)}
-                        aria-label={`Delete ${server.display_name}`}
-                        disabled={importing || busyIds.has(server.id)}
-                      >
-                        <HugeiconsIcon icon={Delete02Icon} className="size-3.5" />
-                      </Button>
+                      </div>
+                      <div className="flex items-center gap-1">
+                        <Switch
+                          checked={server.is_enabled}
+                          onCheckedChange={(next) => toggleEnabled(server, next)}
+                          aria-label={`Enable ${server.display_name}`}
+                          disabled={importing || busyIds.has(server.id)}
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => refreshTools(server)}
+                          aria-label={`Refresh tools for ${server.display_name}`}
+                          title={
+                            stdioBlocked && !isHttpAddress(server.url)
+                              ? (capabilities?.stdio_disabled_reason ?? undefined)
+                              : "Refresh tools from this server"
+                          }
+                          disabled={
+                            importing ||
+                            busyIds.has(server.id) ||
+                            (stdioBlocked && !isHttpAddress(server.url))
+                          }
+                        >
+                          {refreshingIds.has(server.id) ? (
+                            <Spinner />
+                          ) : (
+                            <RefreshGlyph className="size-3.5" />
+                          )}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => void startEdit(server)}
+                          aria-label={`Edit ${server.display_name}`}
+                          disabled={importing || busyIds.has(server.id)}
+                        >
+                          <HugeiconsIcon icon={Edit03Icon} className="size-3.5" />
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => setConfirmingDelete(server)}
+                          aria-label={`Delete ${server.display_name}`}
+                          disabled={importing || busyIds.has(server.id)}
+                        >
+                          <HugeiconsIcon icon={Delete02Icon} className="size-3.5" />
+                        </Button>
+                      </div>
                     </div>
+                    <McpServerTools
+                      server={server}
+                      disabled={importing}
+                      refreshBlockedReason={
+                        stdioBlocked && !isHttpAddress(server.url)
+                          ? (capabilities?.stdio_disabled_reason ??
+                            "Local programs are turned off")
+                          : null
+                      }
+                      onServerChange={replaceServer}
+                    />
                   </li>
                 ))}
               </ul>

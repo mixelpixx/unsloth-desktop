@@ -38,8 +38,43 @@ export interface McpServerConfig {
   process_mode?: McpProcessMode;
   /** Seconds a process may sit unused before it is stopped; 0 = never. */
   idle_timeout_seconds?: number;
+  /** Raw tool names turned off: never offered to the model. Every other tool is on, including ones the
+   *  server adds later. Optional: absent on a backend older than per-tool settings. */
+  disabled_tools?: string[];
+  /** Raw tool names that always ask before running under "Approve for me". */
+  ask_tools?: string[];
   created_at: string;
   updated_at: string;
+}
+
+/** One tool a server lists for the model (GET /api/mcp/servers/{id}/tool-catalog). The text is the
+ *  third-party server's: render it as plain text only. */
+export interface McpToolEntry {
+  name: string;
+  title: string | null;
+  summary: string;
+  description: string;
+  enabled: boolean;
+  ask: boolean;
+  /** What this tool's schema adds to every request while it is on. */
+  tokens: number;
+}
+
+export interface McpToolCatalog {
+  server_id: string;
+  /** False until a chat or Refresh has discovered the server's tools; `tools` is then empty. */
+  cached: boolean;
+  /** The server said its tools changed since this list was read. */
+  stale: boolean;
+  tools: McpToolEntry[];
+  enabled_count: number;
+  total_count: number;
+  enabled_tokens: number;
+  /** Counted with the loaded model's tokenizer rather than estimated from characters. */
+  tokens_measured: boolean;
+  context_tokens: number | null;
+  /** Turned-off names the server does not list; they stay off if it lists them again. */
+  unlisted_disabled: string[];
 }
 
 /** What a local program's processes are doing now (GET /api/mcp/servers/status). */
@@ -278,6 +313,10 @@ export function updateMcpServer(
     processMode?: McpProcessMode;
     /** A new idle timeout reaches a running process without restarting it. */
     idleTimeoutSeconds?: number;
+    /** The whole set of tools turned off; [] turns every tool on. */
+    disabledTools?: string[];
+    /** The whole set of tools that ask before running. */
+    askTools?: string[];
   },
 ): Promise<McpServerConfig> {
   const body: Record<string, unknown> = {};
@@ -298,6 +337,9 @@ export function updateMcpServer(
     body.process_mode = payload.processMode;
   if (payload.idleTimeoutSeconds !== undefined)
     body.idle_timeout_seconds = payload.idleTimeoutSeconds;
+  if (payload.disabledTools !== undefined)
+    body.disabled_tools = payload.disabledTools;
+  if (payload.askTools !== undefined) body.ask_tools = payload.askTools;
   return trackMcpServerMutation(
     mcpRequest(`/${serverId}`, { method: "PUT", body }),
   );
@@ -334,6 +376,14 @@ export function listMcpServerTools(
   serverId: string,
 ): Promise<{ name: string; inputSchema?: unknown }[]> {
   return mcpRequest(`/${serverId}/tools`);
+}
+
+/** The server's tools with their on/off and ask-first state and token cost. Cache only: it never starts
+ *  the server, so a server nobody has used yet answers `cached: false` until Refresh. */
+export function getMcpServerToolCatalog(
+  serverId: string,
+): Promise<McpToolCatalog> {
+  return mcpRequest(`/${encodeURIComponent(serverId)}/tool-catalog`);
 }
 
 export function testMcpServer(payload: {
