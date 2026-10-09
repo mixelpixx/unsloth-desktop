@@ -9,6 +9,7 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useTheme } from "@/features/settings/stores/theme-store";
+import { recordToastError } from "@/lib/activity-store";
 import { suppressTransportErrorToast } from "@/lib/connection-monitor";
 import { createLoadingToastIcon } from "@/lib/toast";
 import { Toaster as Sonner, type ToasterProps, toast } from "sonner";
@@ -22,11 +23,20 @@ const ERROR_TOAST_DURATION_MS = 15_000;
 const SUPPRESSED_TOAST_ID = "connection-suppressed";
 const showErrorToast = toast.error;
 toast.error = (message, data) => {
-  const show = () =>
-    showErrorToast(message, {
+  const show = () => {
+    // The activity bell keeps the error after the toast's 15 s, until it is dismissed there.
+    // Recorded here, as the toast is shown, so a transport failure held back below is never
+    // recorded and one the monitor replays after all is. Never at the toast's expense.
+    try {
+      recordToastError(message, data?.description, data?.action);
+    } catch {
+      // The toast still shows.
+    }
+    return showErrorToast(message, {
       ...data,
       duration: data?.duration ?? ERROR_TOAST_DURATION_MS,
     });
+  };
   // While the connection banner says the backend cannot be reached, a toast per failed request is
   // the same news again, once per request in flight. Only that news is held back; any other error
   // still shows. A toast with an id is updating one already on screen, a loading toast more often

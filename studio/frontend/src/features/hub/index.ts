@@ -8,6 +8,7 @@ export {
   finishExternalJob,
   jobKeyOf,
   pendingDrafterPresentation,
+  presentedProgress,
   scopedVariant,
   type StagedDownloadProgress,
   startExternalJob,

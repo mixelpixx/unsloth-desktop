@@ -296,6 +296,7 @@ import { buildChatItemMarkdown } from "@/features/chat/prompt-storage/prompt-sto
 import { useActiveChatMenuStore } from "@/features/chat/stores/active-chat-menu-store";
 import { type PinnedPage, PinnedPageRow, usePinnedPages } from "@/features/browser";
 import { ResourcesStrip } from "@/features/gpu-resources";
+import { ActivityBell, useActivityFeeds } from "@/features/activity";
 import { translate, useT, type TranslationKey } from "@/i18n";
 
 const RECENT_SLOT_NUMBERS = [1, 2, 3, 4, 5, 6] as const;
@@ -2702,6 +2703,8 @@ export function AppSidebar() {
     (trainingInProgress || exportInProgress || anyChatRunning || storeThreadId != null);
   // The Train-page status poll doesn't run off-route; keep state fresh so the spinner clears.
   useTrainingCompletionWatch();
+  // The header bell's list, fed from the stores above rather than polls of its own.
+  useActivityFeeds();
 
   const chatDisabled = trainingInProgress;
   const usesDesktopTitlebar = usesCustomTitlebar || usesNativeMacTitlebar;
@@ -5341,6 +5344,7 @@ export function AppSidebar() {
                   </span>
                 </Link>
               <div className="flex shrink-0 items-center gap-0.25">
+                <ActivityBell />
                 <Tooltip>
                   <TooltipPrimitive.Trigger asChild>
                     <button

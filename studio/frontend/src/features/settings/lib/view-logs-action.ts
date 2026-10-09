@@ -34,6 +34,9 @@ export function viewLogsAction(
   | {
       label: string;
       onClick: () => void;
+      /** What it opens, as data: the activity bell keeps an error after its toast is gone, and
+       *  reads this off the toast's action to offer the same View logs (lib/activity-store.ts). */
+      logTarget: { family: FailureLogFamily; sourcePath: string | null };
     }
   | undefined {
   if (!isAccountOwner()) return undefined;
@@ -41,6 +44,7 @@ export function viewLogsAction(
     label: translate("settings.debugging.viewLogs"),
     onClick: () =>
       useSettingsDialogStore.getState().openLogs(family, sourcePath ?? null),
+    logTarget: { family, sourcePath: sourcePath ?? null },
   };
 }
 

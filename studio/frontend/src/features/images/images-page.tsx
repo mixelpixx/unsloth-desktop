@@ -186,7 +186,10 @@ import {
 } from "@/lib/diffusion-route-search";
 import { toast } from "@/lib/toast";
 import { loadGalleryUntil } from "@/lib/gallery-deep-link";
-import { subscribeModelEjected } from "@/lib/model-lifecycle-events";
+import {
+  registerModelLoadCancel,
+  subscribeModelEjected,
+} from "@/lib/model-lifecycle-events";
 import { DEFAULT_GEN, defaultsFor, defaultsKeyFor, residentDefaultsKey, resolutionFor } from "./image-generation-defaults";
 import {
   MIN_DIM,
@@ -3895,6 +3898,16 @@ export function ImagesPage({
   useEffect(() => {
     cancelLoadRef.current = () => void handleCancelLoad();
   }, [handleCancelLoad]);
+
+  // The activity bell's Cancel, offered only while a load is running: the handler unloads, and
+  // must not reach a model that has finished loading.
+  useEffect(
+    () =>
+      busy === "loading"
+        ? registerModelLoadCancel("image", cancelLoadFromToast)
+        : undefined,
+    [busy, cancelLoadFromToast],
+  );
 
   // Seed reference detail and match-source area from the build's canvas tier when the loaded build changes.
   const buildKey = status?.loaded

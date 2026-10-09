@@ -136,6 +136,12 @@ function generalTab(initialToken: string) {
     "@/features/gpu-resources": {
       RESOURCES_STRIP_PREFERENCE_KEY: "unsloth_show_resources_strip",
     },
+    "@/lib/activity-store": {
+      ACTIVITY_PREFERENCE_KEYS: [
+        "unsloth_activity_history",
+        "unsloth_activity_notify",
+      ],
+    },
     "@/features/hub": {
       TRANSPORT_MODE_STORAGE_KEY: "transport",
       useHfTokenStore: Object.assign(

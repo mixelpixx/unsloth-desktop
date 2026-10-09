@@ -715,6 +715,65 @@ export const en = {
         "GPU memory bars at the bottom of the sidebar, with the loaded models and the other apps holding memory.",
     },
   },
+  // The jobs and notification center: the bell in the sidebar header and its panel
+  // (features/activity). {title} is a model, repo, run or error message, kept as written.
+  activity: {
+    title: "Activity",
+    // Accessible name of the bell. {active} and {errors} are counts.
+    bellLabel: "Activity. Running: {active}. New errors: {errors}.",
+    tabs: {
+      active: "Active",
+      recent: "Recent",
+      errors: "Errors",
+    },
+    empty: {
+      active: "Nothing is running.",
+      recent: "Finished jobs will show up here.",
+      errors: "No errors.",
+    },
+    kind: {
+      download: "Download",
+      training: "Training",
+      export: "Export",
+      recipe: "Data recipe",
+      modelLoad: "Model load",
+      error: "Error",
+    },
+    state: {
+      active: "Running",
+      done: "Finished",
+      failed: "Failed",
+      cancelled: "Cancelled",
+    },
+    // Sizes arrive formatted, e.g. "1.2 GB"; steps and rows are plain numbers.
+    meter: {
+      bytes: "{done} of {total}",
+      steps: "Step {done} of {total}",
+      rows: "{done} of {total} rows",
+    },
+    actions: {
+      open: "Open",
+      cancel: "Cancel",
+      retry: "Retry",
+      dismiss: "Dismiss {title}",
+    },
+    // After an error's title: how many times the same error came in a row.
+    repeated: "×{count}",
+    justNow: "just now",
+    untitledError: "Something went wrong",
+    clearRecent: "Clear finished",
+    clearErrors: "Clear errors",
+    notify: {
+      toggle: "Notify me when long jobs finish",
+      blocked: "Notifications are blocked for this site in the browser's settings.",
+      unsupported: "This browser can't show notifications here.",
+      // Titles of the system notification.
+      trainingDone: "Training finished",
+      trainingFailed: "Training failed",
+      exportDone: "Export finished",
+      downloadDone: "Download finished",
+    },
+  },
   // The banner and notices of the connection monitor (lib/connection-monitor.ts).
   connection: {
     banner: {

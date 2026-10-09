@@ -20,12 +20,18 @@ export type EjectedModelRuntime = "image" | "video";
  *  one it did. */
 export type ModelRuntime = "chat" | "image" | "video" | "stt" | "tts";
 
+/** How a settled load ended, when the call could tell. */
+export type ModelLoadOutcome = "loaded" | "failed" | "cancelled";
+
 export type ModelLifecycle = {
   runtime: ModelRuntime;
   /** True while the load is in flight, false once it settled either way. */
   loading: boolean;
   /** What is being loaded, for the row shown before any status confirms it. */
   model: string | null;
+  /** Set on the settling announcement when the call knows how it ended. Absent when it does not:
+   *  a background load whose progress stopped answering is not known to have failed. */
+  outcome?: ModelLoadOutcome;
 };
 
 export function notifyModelEjected(runtime: EjectedModelRuntime): void {
@@ -67,6 +73,51 @@ export function subscribeModelLifecycle(
   return () => window.removeEventListener(MODEL_LIFECYCLE_EVENT, handler);
 }
 
+// Who can stop a load in flight, so a surface other than the load toast (the activity bell) can
+// offer the same Cancel. The pages that start loads own the stopping, since only they hold the
+// run: each registers while it can stop one, and several may hold the same runtime (chat's model
+// runtime is mounted by Chat and by the API page), each a no-op unless the run is its own.
+const loadCancels = new Map<ModelRuntime, Set<() => void>>();
+const loadCancelListeners = new Set<() => void>();
+
+function announceLoadCancels(): void {
+  for (const listener of loadCancelListeners) listener();
+}
+
+/** Offer `cancel` for loads on `runtime` until the returned function is called. */
+export function registerModelLoadCancel(
+  runtime: ModelRuntime,
+  cancel: () => void,
+): () => void {
+  const set = loadCancels.get(runtime) ?? new Set();
+  set.add(cancel);
+  loadCancels.set(runtime, set);
+  announceLoadCancels();
+  return () => {
+    const current = loadCancels.get(runtime);
+    if (!current?.delete(cancel)) return;
+    if (current.size === 0) loadCancels.delete(runtime);
+    announceLoadCancels();
+  };
+}
+
+export function canCancelModelLoad(runtime: ModelRuntime): boolean {
+  return (loadCancels.get(runtime)?.size ?? 0) > 0;
+}
+
+/** Ask every registered owner to stop its load on `runtime`. False when nobody can. */
+export function cancelModelLoad(runtime: ModelRuntime): boolean {
+  const owners = [...(loadCancels.get(runtime) ?? [])];
+  for (const cancel of owners) cancel();
+  return owners.length > 0;
+}
+
+/** Calls back whenever the set of runtimes that can be cancelled changes. */
+export function subscribeModelLoadCancels(listener: () => void): () => void {
+  loadCancelListeners.add(listener);
+  return () => loadCancelListeners.delete(listener);
+}
+
 /**
  * Announce a load around `run`, so the indicator shows it for the whole time
  * the toast does. Settles on failure too, or a failed load would leave the row
@@ -78,11 +129,24 @@ export async function withModelLoadNotice<T>(
   run: () => Promise<T>,
 ): Promise<T> {
   notifyModelLifecycle({ runtime, loading: true, model });
+  let outcome: ModelLoadOutcome = "failed";
   try {
-    return await run();
+    const result = await run();
+    outcome = "loaded";
+    return result;
+  } catch (error) {
+    if (isCancelledLoad(error)) outcome = "cancelled";
+    throw error;
   } finally {
-    notifyModelLifecycle({ runtime, loading: false, model });
+    notifyModelLifecycle({ runtime, loading: false, model, outcome });
   }
+}
+
+/** An abort, or chat's tagged user cancellation (chat-api.ts isUserCancelledLoad). */
+function isCancelledLoad(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const tagged = error as { name?: unknown; unslothUserCancelled?: unknown };
+  return tagged.name === "AbortError" || tagged.unslothUserCancelled === true;
 }
 
 /**
@@ -148,8 +212,18 @@ export async function withBackgroundLoadNotice<T>(
   } finally {
     // A load that never started settles here; one that did settles from the
     // poll, so exactly one of the two paths ends the notice.
-    if (!started) notifyModelLifecycle({ runtime, loading: false, model });
+    if (!started) {
+      notifyModelLifecycle({ runtime, loading: false, model, outcome: "failed" });
+    }
   }
+}
+
+/** What a terminal load-progress phase says about how the load ended. */
+function outcomeOfPhase(phase: LoadPhase): ModelLoadOutcome {
+  if (phase === "ready") return "loaded";
+  if (phase === "error") return "failed";
+  // null: nothing loading and nothing loaded, which a cancelled or evicted load leaves behind.
+  return "cancelled";
 }
 
 async function settleWhenLoadEnds(
@@ -162,6 +236,7 @@ async function settleWhenLoadEnds(
   const readTimeoutMs = timing.readTimeoutMs ?? BACKGROUND_READ_TIMEOUT_MS;
   const stallMs = timing.stallMs ?? BACKGROUND_STALL_TIMEOUT_MS;
   let lastHealthy = Date.now();
+  let outcome: ModelLoadOutcome | undefined;
   try {
     for (;;) {
       await new Promise((resolve) => setTimeout(resolve, pollMs));
@@ -175,11 +250,19 @@ async function settleWhenLoadEnds(
         if (Date.now() - lastHealthy >= stallMs) return;
         continue;
       }
-      if (phase !== "downloading" && phase !== "finalizing") return;
+      if (phase !== "downloading" && phase !== "finalizing") {
+        outcome = outcomeOfPhase(phase);
+        return;
+      }
       lastHealthy = Date.now();
     }
   } finally {
-    notifyModelLifecycle({ runtime, loading: false, model });
+    notifyModelLifecycle({
+      runtime,
+      loading: false,
+      model,
+      ...(outcome ? { outcome } : {}),
+    });
   }
 }
 

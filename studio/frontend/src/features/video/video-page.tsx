@@ -180,7 +180,10 @@ import {
 } from "@/lib/native-files";
 import { toast } from "@/lib/toast";
 import { loadGalleryUntil } from "@/lib/gallery-deep-link";
-import { subscribeModelEjected } from "@/lib/model-lifecycle-events";
+import {
+  registerModelLoadCancel,
+  subscribeModelEjected,
+} from "@/lib/model-lifecycle-events";
 import { BlobUrlCache } from "@/lib/blob-url-cache";
 
 import { MATCH_SOURCE_RESOLUTION, matchedCanvas } from "./keyframe-canvas";
@@ -3372,6 +3375,16 @@ function VideoGenerator({
   useEffect(() => {
     cancelLoadRef.current = () => void handleCancelLoad();
   }, [handleCancelLoad]);
+
+  // The activity bell's Cancel, offered only while a load is running: the handler unloads, and
+  // must not reach a model that has finished loading.
+  useEffect(
+    () =>
+      busy === "loading"
+        ? registerModelLoadCancel("video", cancelLoadFromToast)
+        : undefined,
+    [busy, cancelLoadFromToast],
+  );
 
   const handleCancelGenerate = useCallback(async () => {
     setStopping(true);

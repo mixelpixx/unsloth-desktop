@@ -120,6 +120,7 @@ export {
 } from "./stores/keyboard-shortcuts-store";
 export type { ShortcutId } from "./lib/keyboard-shortcuts";
 export { SETTINGS_TABS, useSettingsDialogStore } from "./stores/settings-dialog-store";
+export { viewLogsAction } from "./lib/view-logs-action";
 export { settingsTabVisible } from "./settings-tab-visibility";
 export { DIALOG_SETTINGS_SEARCH_INDEX } from "./dialog-search-index";
 export type { SettingsTab } from "./stores/settings-dialog-store";

@@ -40,6 +40,7 @@ import {
 } from "@/hooks/use-llama-update-pref";
 import { useHfTokenValidation } from "@/hooks";
 import { LOCALE_STORAGE_KEY, useT } from "@/i18n";
+import { ACTIVITY_PREFERENCE_KEYS } from "@/lib/activity-store";
 import { isTauri } from "@/lib/api-base";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
@@ -178,6 +179,8 @@ const PREFS_KEYS: string[] = [
   LOADED_MODELS_PREFERENCE_KEYS.dismissed,
   // The sidebar's GPU memory strip (Appearance).
   RESOURCES_STRIP_PREFERENCE_KEY,
+  // The activity bell's finished-job history and its "Notify me when long jobs finish" toggle.
+  ...ACTIVITY_PREFERENCE_KEYS,
   // Voice settings
   "unsloth_voice_settings",
   // Retired keys. The onboarding wizard is gone, but installs that ran it still

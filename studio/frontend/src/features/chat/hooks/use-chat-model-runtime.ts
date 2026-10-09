@@ -20,7 +20,10 @@ import {
   isBackendDownForDesktopUpdate,
   isSilencedDesktopUpdateFailure,
 } from "@/lib/desktop-update-activity";
-import { subscribeModelLifecycle } from "@/lib/model-lifecycle-events";
+import {
+  registerModelLoadCancel,
+  subscribeModelLifecycle,
+} from "@/lib/model-lifecycle-events";
 import {
   type TransferSample,
   appendSample,
@@ -1209,6 +1212,12 @@ export function useChatModelRuntime() {
   const cancelLoading = useCallback(
     (): Promise<boolean> => cancelLoadingWithCheckpointPolicy(false),
     [cancelLoadingWithCheckpointPolicy],
+  );
+  // The activity bell's Cancel stops a chat load the way the load toast's does. A no-op when this
+  // instance holds no run, which is how a second mount of this hook stays out of the way.
+  useEffect(
+    () => registerModelLoadCancel("chat", () => void cancelLoading()),
+    [cancelLoading],
   );
   /**
    * Stop the pending load so a different pick can take the slot. Preserves the
