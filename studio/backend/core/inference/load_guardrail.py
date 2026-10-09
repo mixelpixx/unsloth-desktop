@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 import threading
 import time
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from loggers import get_logger
 
@@ -252,8 +252,14 @@ def verdict_from_breakdown(
     tensor_split: Optional[Sequence[float]] = None,
     vram_fraction: Optional[float] = None,
     ram_available_bytes: Optional[int] = None,
+    link_preference: Optional[Mapping[int, float]] = None,
+    link_shared: Sequence[int] = (),
 ) -> LoadVerdict:
-    """The verdict for a ``_GgufMemoryBreakdown`` (taken structurally) and a measurement."""
+    """The verdict for a ``_GgufMemoryBreakdown`` (taken structurally) and a measurement.
+
+    ``link_preference`` / ``link_shared``: the hardware check's measured host bandwidth per card
+    and the cards another model runs on, when the loader will place with them (see
+    ``load_verdict.VerdictInputs``)."""
     if vram_fraction is None:
         try:
             from core.inference.llama_cpp import _active_vram_fraction
@@ -281,6 +287,8 @@ def verdict_from_breakdown(
         tensor_split = tuple(tensor_split) if tensor_split else None,
         vram_fraction = float(vram_fraction),
         ram_available_bytes = ram_available_bytes,
+        link_preference = dict(link_preference) if link_preference else None,
+        link_shared = tuple(int(i) for i in link_shared),
     )
     # A failed probe (None) arrives as no cards, which compute_load_verdict reads as "no
     # reading" for any load that wants the GPU.

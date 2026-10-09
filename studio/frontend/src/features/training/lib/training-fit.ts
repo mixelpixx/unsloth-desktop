@@ -48,6 +48,21 @@ export interface TrainingFitSuggestion {
   batchSize: number | null;
 }
 
+/** Settings > Resources > Hardware check: the run's GPUs that sit on a slow PCIe link, as
+ *  measured. Only sent when "Warn when training uses a slow-link GPU" is on. */
+export interface TrainingSlowLink {
+  gpus: {
+    index: number;
+    width: number | null;
+    widthMax: number | null;
+    h2dGibs: number | null;
+  }[];
+  bestGpu: number | null;
+  bestH2dGibs: number | null;
+  /** Offloaded gradient checkpointing copies activations over that link every step. */
+  offloadedGradientCheckpointing: boolean;
+}
+
 export interface TrainingFitEstimate {
   verdict: TrainingFitVerdict;
   /** Why the verdict is unknown, or which check an "exceeds" failed. */
@@ -60,6 +75,7 @@ export interface TrainingFitEstimate {
   minPerGpuGb: number | null;
   gpus: TrainingFitGpu[];
   suggestion: TrainingFitSuggestion | null;
+  slowLink: TrainingSlowLink | null;
 }
 
 /** A GPU the run can be pinned to, as the GPU inventory reports it. */
@@ -165,7 +181,45 @@ const UNKNOWN_ESTIMATE: TrainingFitEstimate = {
   minPerGpuGb: null,
   gpus: [],
   suggestion: null,
+  slowLink: null,
 };
+
+function intOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+/** The estimate's slow-link warning, or null when absent or malformed (no GPU named). */
+export function parseTrainingSlowLink(raw: unknown): TrainingSlowLink | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const body = raw as Record<string, unknown>;
+  const gpus = Array.isArray(body.gpus)
+    ? body.gpus.flatMap((item): TrainingSlowLink["gpus"] => {
+        if (!item || typeof item !== "object") return [];
+        const gpu = item as Record<string, unknown>;
+        const index = intOrNull(gpu.index);
+        if (index === null) return [];
+        return [
+          {
+            index,
+            width: intOrNull(gpu.width),
+            widthMax: intOrNull(gpu.width_max),
+            h2dGibs: finiteOrNull(gpu.h2d_gibs),
+          },
+        ];
+      })
+    : [];
+  if (gpus.length === 0) {
+    return null;
+  }
+  return {
+    gpus,
+    bestGpu: intOrNull(body.best_gpu),
+    bestH2dGibs: finiteOrNull(body.best_h2d_gibs),
+    offloadedGradientCheckpointing: body.offloaded_gradient_checkpointing === true,
+  };
+}
 
 /**
  * The /api/train/estimate body, checked rather than trusted.
@@ -237,6 +291,7 @@ export function parseTrainingFitEstimate(raw: unknown): TrainingFitEstimate {
     minPerGpuGb: finiteOrNull(body.min_per_gpu_gb),
     gpus,
     suggestion,
+    slowLink: parseTrainingSlowLink(body.slow_link),
   };
 }
 

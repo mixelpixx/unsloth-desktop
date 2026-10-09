@@ -20735,7 +20735,14 @@ def _placement_pricer(
     Shared by ``/estimate-memory`` and the ``/load`` guardrail so the verdict a load is
     refused on is priced exactly like the figure the panel showed for it.
     """
+    from core.inference.llama_cpp import _hardware_check_avoids_env_tensor
     from core.inference.llama_server_args import _effective_tensor_parallel
+
+    # The loader declines an inherited tensor split mode when the hardware check says the link
+    # is slow ("Avoid tensor parallel on slow links"); price the layer split it launches instead.
+    # A trailing --split-mode layer is how the extras say so, and it is the pricer's copy only.
+    if _hardware_check_avoids_env_tensor(tensor_parallel, llama_extra_args, selected_gpu_ids):
+        llama_extra_args = [*(llama_extra_args or []), "--split-mode", "layer"]
 
     # A CPU-only launch drops the split flags, so a pin charges no per-device buffers.
     pinned_gpu_ids = (
@@ -20850,6 +20857,7 @@ def _load_guardrail_verdict(
     llama_extra_args: Optional[list[str]],
     context_pinned: bool,
     tensor_split: Optional[list[float]] = None,
+    tensor_parallel: bool = False,
     fresh: bool,
 ):
     """The load guardrail's verdict for a priced GGUF load, against memory free now.
@@ -20883,6 +20891,12 @@ def _load_guardrail_verdict(
             other_studio_model_resident = _other_studio_model_resident(),
             fresh = fresh,
         )
+    link_preference, link_shared = _guardrail_link_preference(
+        gpu_ids = gpu_ids,
+        gpu_memory_mode = gpu_memory_mode,
+        llama_extra_args = llama_extra_args,
+        tensor_parallel = tensor_parallel,
+    )
     return verdict_from_breakdown(
         breakdown,
         gpus = gpus,
@@ -20890,7 +20904,49 @@ def _load_guardrail_verdict(
         context_pinned = context_pinned,
         tensor_split = tensor_split if placement == PLACEMENT_FIXED else None,
         ram_available_bytes = available_ram_bytes(),
+        link_preference = link_preference,
+        link_shared = link_shared,
     )
+
+
+def _guardrail_link_preference(
+    *,
+    gpu_ids: Optional[list[int]],
+    llama_extra_args: Optional[list[str]],
+    tensor_parallel: bool,
+    gpu_memory_mode: Optional[str] = None,
+) -> tuple[Optional[dict[int, float]], tuple[int, ...]]:
+    """The hardware check's link preference the loader will place this load with, or None.
+
+    The loader applies it to automatic single-card placement only: not to an explicit GPU pick,
+    not to Manual memory (which hands every card to llama.cpp without the planner), and not to
+    a tensor split, which spans the cards whatever their links. The cards another model runs on
+    come along, since the loader keeps a single-card load off those first.
+    """
+    if gpu_ids or gpu_memory_mode == "manual":
+        return None, ()
+    try:
+        from core.inference.llama_cpp import (
+            _hardware_check_avoids_env_tensor,
+            _hardware_check_link_preference,
+        )
+        from core.inference.llama_server_args import _effective_tensor_parallel
+
+        if _effective_tensor_parallel(
+            llama_extra_args, bool(tensor_parallel)
+        ) and not _hardware_check_avoids_env_tensor(tensor_parallel, llama_extra_args, gpu_ids):
+            return None, ()
+        preference = _hardware_check_link_preference()
+        if not preference:
+            return None, ()
+        try:
+            shared = tuple(sorted(int(i) for i in get_llama_cpp_backend()._other_planned_vram_mib()))
+        except Exception:
+            shared = ()
+        return preference, shared
+    except Exception as exc:  # noqa: BLE001 -- the verdict stands without it
+        logger.debug("Link preference unavailable for the guardrail: %s", exc)
+        return None, ()
 
 
 def _load_verdict_info(verdict, mode: str) -> dict[str, Any]:
@@ -20968,6 +21024,7 @@ def _enforce_load_guardrail(
                 extra_llama_args,
             ),
             tensor_split = request.tensor_split,
+            tensor_parallel = bool(request.tensor_parallel),
             fresh = True,
         )
     except Exception as exc:  # noqa: BLE001 -- an unpriced load is not a refused one
@@ -21252,6 +21309,7 @@ def _estimate_route_verdict(breakdown, request: EstimateMemoryRequest) -> Option
             gpu_layers = request.gpu_layers,
             llama_extra_args = request.llama_extra_args,
             context_pinned = _context_is_pinned(request.n_ctx, request.llama_extra_args),
+            tensor_parallel = bool(request.tensor_parallel),
             fresh = False,
         )
         return _load_verdict_info(verdict, get_load_guardrail_mode())

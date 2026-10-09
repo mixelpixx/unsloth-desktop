@@ -421,6 +421,7 @@ def build_snapshot(
     models: Optional[list[ResidentModel]] = None,
     loading: Optional[bool] = None,
     visible: Any = ...,
+    link_badges: Optional[dict[int, dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """The whole payload. Arguments are seams for tests; the route passes none."""
     from utils.hardware.gpu_resources import default_reader, split_gpu_memory
@@ -434,12 +435,29 @@ def build_snapshot(
     )
     holders = reader.holders()
     gpus, unplaced = split_gpu_memory(readings, holders, estimate_by_gpu = studio_estimate(models))
+    badges = _link_badges() if link_badges is None else link_badges
+    for gpu in gpus:
+        badge = badges.get(gpu["index"])
+        if badge:
+            # Only once Settings > Resources > Hardware check measured the card.
+            gpu["link"] = badge
     return {
         "gpus": gpus,
         "models": [m.to_json() for m in models],
         "other_apps": unplaced,
         "loading": bool(loading),
     }
+
+
+def _link_badges() -> dict[int, dict[str, Any]]:
+    """The hardware check's measured link per card (width, host GiB/s, whether it is slow), from
+    the stored result when it describes the GPUs installed now. Empty otherwise; never raises."""
+    try:
+        from utils.hardware.hardware_check import resource_link_badges
+
+        return resource_link_badges()
+    except Exception:
+        return {}
 
 
 def _slots_loading() -> bool:

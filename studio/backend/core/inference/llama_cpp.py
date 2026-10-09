@@ -4315,6 +4315,46 @@ def _active_vram_fraction() -> float:
         return _CTX_FIT_VRAM_FRACTION
 
 
+def _hardware_check_link_preference() -> Optional[dict[int, float]]:
+    """Measured host-to-device GiB/s per physical GPU for automatic placement, or None.
+
+    None unless Settings > Resources > Hardware check has "Prefer fast-link GPUs" on and its
+    stored result describes the GPUs installed now (utils.hardware.hardware_check), and unless
+    the placement ids are nvidia-smi's own indices, the index space the check stored. Every
+    caller keeps its placement exactly as before on None. Read per load, like the VRAM budget.
+    """
+    if LlamaCppBackend._GPU_IDS_ARE_PCI_INDICES is not True:
+        return None
+    try:
+        from utils.hardware.hardware_check import active_link_preference
+        return active_link_preference()
+    except Exception:
+        return None
+
+
+def _hardware_check_avoids_env_tensor(
+    requested_tensor_parallel: bool,
+    extra_args: Optional[Iterable[str]],
+    gpu_ids: Optional[Iterable[int]],
+) -> bool:
+    """Whether an inherited ``LLAMA_ARG_SPLIT_MODE=tensor`` is declined for this load.
+
+    True only with the hardware check's "Avoid tensor parallel on slow links" on, a current
+    result that measured a slow link or a pair without peer access among these GPUs, and tensor
+    mode coming from the environment alone. Shared with the memory estimate
+    (routes.inference._placement_pricer), so the two price the same split mode.
+    """
+    try:
+        from utils.hardware.hardware_check import env_tensor_split_avoided
+        return env_tensor_split_avoided(
+            bool(requested_tensor_parallel),
+            list(extra_args) if extra_args else None,
+            [int(i) for i in gpu_ids] if gpu_ids else None,
+        )
+    except Exception:
+        return False
+
+
 def _kv_bytes_per_elem(cache_type: Optional[str]) -> float:
     """Bytes per KV-cache element for a llama.cpp cache type (f16 default)."""
     return {
@@ -16283,11 +16323,17 @@ class LlamaCppBackend:
         per_device_overhead_bytes: int = 0,
         min_gpus: int = 1,
         shared: frozenset = frozenset(),
+        prefer_bandwidth: Optional[Mapping[int, float]] = None,
     ) -> tuple[Optional[list[int]], bool]:
         """Pick GPU(s) for a model from estimated VRAM and free memory.
 
         ``shared``: GPUs another loaded model runs on. A model that fits one card alone
         takes a card outside it when one fits, so two models don't share compute.
+
+        ``prefer_bandwidth`` ({gpu: measured host GiB/s}, from the hardware check's "Prefer
+        fast-link GPUs"): a model that fits one card alone goes on a clearly faster-linked
+        card instead of the default pick when that card holds it comfortably
+        (``utils.hardware.link_preference.faster_card``). None keeps the pick unchanged.
 
         ``min_gpus`` (default 1, capped at ``len(gpus)``) keeps a downgraded
         tensor/multi-GPU request spread instead of collapsing to one card.
@@ -16338,10 +16384,35 @@ class LlamaCppBackend:
 
         # Try 1 GPU at the usable-VRAM threshold (only when one device is allowed).
         if min_gpus <= 1 and _usable(ranked[0][0], ranked[0][1]) >= model_size_mib:
-            for idx, free_mib in ranked:
-                if idx not in shared and _usable(idx, free_mib) >= model_size_mib:
-                    return [idx], False
-            return [ranked[0][0]], False
+            default = next(
+                (
+                    idx
+                    for idx, free_mib in ranked
+                    if idx not in shared and _usable(idx, free_mib) >= model_size_mib
+                ),
+                ranked[0][0],
+            )
+            if prefer_bandwidth:
+                from utils.hardware.link_preference import faster_card
+
+                faster = faster_card(
+                    default,
+                    [(idx, _usable(idx, free_mib)) for idx, free_mib in ranked],
+                    prefer_bandwidth,
+                    need_mib = model_size_mib,
+                    shared = shared,
+                )
+                if faster is not None:
+                    logger.info(
+                        "Placing on GPU %s rather than GPU %s: it has the faster measured host "
+                        "link (%.1f vs %.1f GiB/s, Settings > Resources > Hardware check).",
+                        faster,
+                        default,
+                        prefer_bandwidth.get(faster, 0.0),
+                        prefer_bandwidth.get(default, 0.0),
+                    )
+                    return [faster], False
+            return [default], False
 
         # Try N GPUs (most-free first); each past the first adds per-device overhead.
         # Require at least min_gpus devices before accepting a fit.
@@ -16374,6 +16445,7 @@ class LlamaCppBackend:
         min_gpus: int = 1,
         split_extra_bytes: int = 0,
         shared: frozenset = frozenset(),
+        prefer_bandwidth: Optional[Mapping[int, float]] = None,
     ) -> tuple[Optional[list[int]], bool]:
         """``_select_gpus``, re-checked at the multi-device context-compute rate.
 
@@ -16394,6 +16466,7 @@ class LlamaCppBackend:
             per_device_overhead_bytes = per_device_overhead_bytes,
             min_gpus = min_gpus,
             shared = shared,
+            prefer_bandwidth = prefer_bandwidth,
         )
         if use_fit or split_extra_bytes <= 0 or not gpu_indices or len(gpu_indices) < 2:
             return gpu_indices, use_fit
@@ -16415,6 +16488,7 @@ class LlamaCppBackend:
             per_device_overhead_bytes = per_device_overhead_bytes,
             min_gpus = 1,
             shared = shared,
+            prefer_bandwidth = prefer_bandwidth,
         )
         if not single_fit and single is not None and len(single) == 1:
             return single, False
@@ -24677,7 +24751,25 @@ class LlamaCppBackend:
                 # would run tensor unbudgeted otherwise). The duplicate-load matchers
                 # use the same helper so a healthy env-driven tensor server matches.
                 split_mode_override = parse_split_mode_override(extra_args)
+                # Hardware check "Avoid tensor parallel on slow links": the inherited env is the
+                # one automatic way into tensor mode, so it alone is declined across a slow
+                # link or a pair without peer access. The toggle and an extras --split-mode are
+                # the user's and pass. The launch clears the env once tensor_parallel is off.
+                _tensor_env_avoided = _hardware_check_avoids_env_tensor(
+                    tensor_parallel, extra_args, gpu_ids
+                )
                 tensor_parallel = _effective_tensor_parallel(extra_args, tensor_parallel)
+                if _tensor_env_avoided:
+                    tensor_parallel = False
+                    # Planned against the env's tensor mode; re-plan without it, as every
+                    # other downgrade does.
+                    planned_flash_attn = _replanned_flash_attn(tensor_parallel)
+                    logger.info(
+                        "Inherited LLAMA_ARG_SPLIT_MODE=tensor declined: the hardware check "
+                        "measured a slow link or no direct GPU-to-GPU access between these "
+                        "GPUs, where a layer split is faster (Settings > Resources > Hardware "
+                        "check)."
+                    )
                 # gpu_layers=0 leaves nothing to split, yet --split-mode tensor or
                 # a per-GPU ratio still launches tensor mode -- and under the
                 # CPU-only mask below (no visible devices) that aborts the server
@@ -24888,6 +24980,10 @@ class LlamaCppBackend:
                 # A path that never prices the launch must not commit the previous one's plan.
                 self._pending_plan_mib = {}
                 _shared_gpus = frozenset()
+                # Hardware check "Prefer fast-link GPUs": measured host GiB/s per card, or
+                # None (option off, no current result, an explicit pick, a Vulkan build).
+                # Bound before the try: the launch's device order reads it too.
+                _link_pref: Optional[dict[int, float]] = None
                 # Sized inputs for the tensor-spill planner, None when the fit never
                 # priced them. Bound before the try like _placement_verdict_partial:
                 # the except arm restores use_fit=True without rebinding
@@ -24998,6 +25094,13 @@ class LlamaCppBackend:
                     _gpu_mem = self._get_gpu_memory(binary, for_llama_server = not gpu_ids)
                     _held_by_others = self._other_planned_vram_mib()
                     _shared_gpus = frozenset(_held_by_others)
+                    # Automatic placement only: an explicit pick is the user's, and a Vulkan
+                    # build indexes by ggml ordinal, not the nvidia-smi index the check stored.
+                    _link_pref = (
+                        None
+                        if (gpu_ids or is_vulkan_backend)
+                        else _hardware_check_link_preference()
+                    )
                     _gpu_mem = _net_of_held_vram(_gpu_mem, _held_by_others)
                     # Every present device gated out (#7624). Left alone the launch
                     # takes the `--fit on` arm with `gpu_indices` still None, so no
@@ -26514,6 +26617,7 @@ class LlamaCppBackend:
                                 min_gpus = _layer_min_gpus,
                                 split_extra_bytes = _cc_split_extra(effective_ctx),
                                 shared = _shared_gpus,
+                                prefer_bandwidth = _link_pref,
                             )
                             # No silent shrink: effective_ctx stays == requested_ctx.
                             # use_fit = the pin failed and --fit on will offload; say why.
@@ -26624,6 +26728,51 @@ class LlamaCppBackend:
                                 if _unshared is not None:
                                     ranked.remove(_unshared)
                                     ranked.insert(0, _unshared)
+                            if _link_pref and _auto_min_gpus == 1 and effective_ctx > 0 and ranked:
+                                # Hardware check "Prefer fast-link GPUs": the single card this
+                                # pass would try first, swapped for a clearly faster-linked one
+                                # that holds the model comfortably -- at the full context, or
+                                # (the window is Auto's to size) at the fit floor with at most
+                                # AUTO_CONTEXT_ROOM_TOLERANCE_MIB less room. Never a card the
+                                # n = 1 pass below could fail on, so it never turns into a split.
+                                from utils.hardware.link_preference import (
+                                    AUTO_CONTEXT_ROOM_TOLERANCE_MIB,
+                                    faster_card,
+                                )
+
+                                def _footprint_mib(ctx: int) -> float:
+                                    return (
+                                        _subset_model_size(1)
+                                        + _kv_bytes(ctx)
+                                        + _mtp_bytes(ctx)
+                                        + _cc_bytes(ctx, 1)
+                                    ) / (1024 * 1024)
+
+                                _default_card = ranked[0]
+                                _faster_idx = faster_card(
+                                    _default_card[0],
+                                    [(g[0], _gpu_usable(g, pin_fraction)) for g in ranked],
+                                    _link_pref,
+                                    need_mib = _footprint_mib(effective_ctx),
+                                    shared = _shared_gpus,
+                                    floor_need_mib = _footprint_mib(
+                                        min(_FIT_MIN_CTX, effective_ctx)
+                                    ),
+                                    room_tolerance_mib = AUTO_CONTEXT_ROOM_TOLERANCE_MIB,
+                                )
+                                if _faster_idx is not None:
+                                    _faster = next(g for g in ranked if g[0] == _faster_idx)
+                                    ranked.remove(_faster)
+                                    ranked.insert(0, _faster)
+                                    logger.info(
+                                        "Placing on GPU %s rather than GPU %s: it has the faster "
+                                        "measured host link (%.1f vs %.1f GiB/s, Settings > "
+                                        "Resources > Hardware check).",
+                                        _faster_idx,
+                                        _default_card[0],
+                                        _link_pref.get(_faster_idx, 0.0),
+                                        _link_pref.get(_default_card[0], 0.0),
+                                    )
                             for n_gpus in range(_auto_min_gpus, len(ranked) + 1):
                                 subset = ranked[:n_gpus]
                                 pool_budget = _pool_budget_mib(subset, pin_fraction)
@@ -26740,6 +26889,7 @@ class LlamaCppBackend:
                             per_device_overhead_bytes = _pipeline_overhead_bytes,
                             min_gpus = _layer_min_gpus,
                             shared = _shared_gpus,
+                            prefer_bandwidth = _link_pref,
                         )
                         if use_fit and not explicit_ctx:
                             # Without KV metadata, llama.cpp owns the fit. Keep the
@@ -29875,6 +30025,44 @@ class LlamaCppBackend:
                                     )
                                 except (TypeError, ValueError):
                                     self._auto_tensor_split_emitted = None
+                    # Hardware check "Prefer fast-link GPUs": in a split, device 0 is the card
+                    # llama.cpp runs host-resident work on (layers --fit leaves in system RAM
+                    # are streamed to it for prompt processing), so the fastest-linked card goes
+                    # first. Automatic placement only, with nothing inherited to preserve and no
+                    # pass-through ratio or device flag that is positional over the old order.
+                    if (
+                        _link_pref
+                        and not gpu_ids
+                        and _inherited_order is None
+                        and len(_pin_ids) > 1
+                        and _p2p_launch_order_pinned
+                        and not _extra_args_have_tensor_split(extra_args, env)
+                        and _extra_args_device(extra_args, {"--main-gpu", "-mg", "--device", "-dev"})
+                        is None
+                        and not str(env.get("LLAMA_ARG_MAIN_GPU", "")).strip()
+                        and not str(env.get("LLAMA_ARG_DEVICE", "")).strip()
+                    ):
+                        from utils.hardware.link_preference import fast_first_order
+
+                        _fast_first = fast_first_order(_pin_ids, _link_pref)
+                        if _fast_first != _pin_ids and self._repoint_emitted_tensor_split(
+                            cmd, _pin_ids, _fast_first
+                        ):
+                            logger.info(
+                                "Ordering the split's GPUs fastest link first: %s (ascending "
+                                "would be %s; Settings > Resources > Hardware check).",
+                                _fast_first,
+                                _pin_ids,
+                            )
+                            _pin_ids = _fast_first
+                            if "--tensor-split" in cmd and gpu_memory_mode != "manual":
+                                _rewritten = cmd[cmd.index("--tensor-split") + 1]
+                                try:
+                                    self._auto_tensor_split_emitted = self._auto_split_fingerprint(
+                                        [float(x) for x in str(_rewritten).split(",")]
+                                    )
+                                except (TypeError, ValueError):
+                                    self._auto_tensor_split_emitted = None
                     # Mask on AMD at the ROCr/HSA layer: HIP-only masking still
                     # enumerates every agent first, which segfaults on a deselected
                     # unsupported GPU (e.g. gfx1036 iGPU under a gfx103X prebuilt).
@@ -30050,6 +30238,39 @@ class LlamaCppBackend:
                         # physical/PCI order, so pin the child's enumeration to match.
                         # The whole visible set stays in use, only its order is fixed.
                         _child_gpu_physical_ids = self._pin_visible_gpu_order_for_split(env)
+                    elif (
+                        _link_pref
+                        and not tensor_parallel
+                        and gpu_memory_mode != "manual"
+                        and _p2p_launch_order_pinned
+                        and "--tensor-split" not in cmd
+                        and not _extra_args_have_tensor_split(extra_args, env)
+                        and _extra_args_device(extra_args, {"--main-gpu", "-mg", "--device", "-dev"})
+                        is None
+                        and not str(env.get("LLAMA_ARG_MAIN_GPU", "")).strip()
+                        and not str(env.get("LLAMA_ARG_DEVICE", "")).strip()
+                    ):
+                        # Hardware check "Prefer fast-link GPUs", --fit owning placement
+                        # across every card: same rule as the pinned split above, device 0
+                        # being where llama.cpp streams the layers it leaves in system RAM.
+                        # The visible set is unchanged; only its order is pinned.
+                        from utils.hardware.link_preference import fast_first_order
+
+                        _visible_ids = sorted({int(idx) for idx, _free, _total in _gpu_mem})
+                        _fast_first = fast_first_order(_visible_ids, _link_pref)
+                        if len(_visible_ids) > 1 and _fast_first != _visible_ids:
+                            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+                            self._emit_child_gpu_visibility(
+                                env,
+                                LlamaCppBackend._child_visibility_for(_fast_first),
+                                prefer_rocr = True,
+                            )
+                            _child_gpu_physical_ids = tuple(_fast_first)
+                            logger.info(
+                                "Ordering the GPUs fastest link first for --fit: %s "
+                                "(Settings > Resources > Hardware check).",
+                                _fast_first,
+                            )
 
                 _child_has_no_gpu = (
                     # each names a device present but unusable, so it owns the empty pool

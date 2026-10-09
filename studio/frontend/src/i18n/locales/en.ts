@@ -4645,4 +4645,144 @@ export const en = {
     failed: "Error {status}",
     invalidJson: "The request body is not valid JSON.",
   },
+  hardwareCheck: {
+    title: "Hardware check",
+    description:
+      "Measures how each GPU and drive is connected and suggests the options that suit this machine. It takes about 10 seconds, and nothing changes until you switch an option on.",
+    keywords:
+      "pcie lanes link bandwidth slot x1 x4 x16 nvme sata ssd p2p peer benchmark speed test scan placement tensor parallel",
+    lastChecked: "Last checked {time}",
+    neverChecked: "Not checked yet.",
+    outOfDate: "Out of date: the GPUs changed since this check. Run it again.",
+    currencyUnknown:
+      "Could not read the GPUs installed now, so this result may be out of date.",
+    run: "Run check",
+    running: "Checking…",
+    phase: {
+      starting: "Starting…",
+      gpus: "Measuring GPUs…",
+      storage: "Reading drives…",
+    },
+    skip: {
+      alreadyRunning: "A check is already running.",
+      training:
+        "Not run: a training run is active. Run it again when the training finishes.",
+      loading:
+        "Not run: a model is loading. Run it again when the load finishes.",
+      generating: "Waiting: a response is being generated.",
+      other: "Not run right now.",
+    },
+    runError: "The check failed: {error}",
+    loadError: "Could not read the hardware check.",
+    gpus: {
+      heading: "GPUs",
+      gpu: "GPU",
+      linkNow: "Link under load",
+      linkMax: "Maximum",
+      toGpu: "System → GPU",
+      fromGpu: "GPU → system",
+      gibs: "{value} GiB/s",
+      notMeasured: "Not measured",
+      slow: "Slow link",
+    },
+    pairs: {
+      heading: "Between GPUs",
+      pair: "GPU {a} ↔ GPU {b}",
+      direct: "Direct access",
+      copy: "Copy speed",
+      yes: "Yes",
+      no: "No",
+      unknown: "Unknown",
+    },
+    storage: {
+      heading: "Drives",
+      location: "Location",
+      drive: "Drive",
+      bus: "Connection",
+      media: "Type",
+      unknown: "Unknown",
+    },
+    locations: {
+      studioHome: "Studio home",
+      hfCache: "Hugging Face cache",
+      temp: "Temp folder",
+      other: "Studio folder",
+    },
+    findings: {
+      heading: "Findings",
+      slowLink:
+        "GPU {gpu} runs at PCIe x{width} (of x{widthMax}): {h2d} GiB/s from system memory vs {best} GiB/s on GPU {bestGpu}, so loading a model onto it is about {ratio}× slower.",
+      slowLinkBandwidth:
+        "GPU {gpu} moves only {h2d} GiB/s from system memory vs {best} GiB/s on GPU {bestGpu}, so loading a model onto it is about {ratio}× slower.",
+      slowLinkAlone:
+        "GPU {gpu} runs at PCIe x{width} (of x{widthMax}): {h2d} GiB/s from system memory, so loading a model onto it is slow.",
+      noPeerAccess:
+        "GPU {a} and GPU {b} cannot access each other directly: tensor parallelism moves every layer's results through system memory ({copy} GiB/s between them).",
+      noPeerAccessWindows:
+        "GPU {a} and GPU {b} cannot access each other directly (Windows): tensor parallelism moves every layer's results through system memory ({copy} GiB/s between them).",
+      storageSata:
+        "{location} ({drive}) is on a SATA SSD; an NVMe drive loads models faster.",
+      storageHdd:
+        "{location} ({drive}) is on a hard disk; an SSD loads models much faster.",
+      storageUsb:
+        "{location} ({drive}) is on a USB drive; an internal SSD loads models much faster.",
+      gpuSkippedLowMemory:
+        "GPU {gpu} was not measured: only {free} GiB was free. Unload what is on it and run the check again.",
+      gpuSkippedHidden:
+        "GPU {gpu} was not measured: Studio is set not to use it.",
+      gpuFailed: "GPU {gpu} could not be measured.",
+      probeFailed: "The GPU measurement did not finish: {reason}",
+      allGood:
+        "All good: every measured GPU and drive is connected as fast as it can be.",
+    },
+    options: {
+      heading: "Options",
+      recommended: "Recommended",
+      applyRecommended: "Apply recommended",
+      applied: "Recommended options switched on.",
+      nothingToApply: "Everything recommended is already on.",
+      saveError: "Could not save the setting.",
+      preferFastLink: {
+        label: "Prefer fast-link GPUs for automatic placement",
+        description:
+          "A model that fits on one GPU loads onto the one with the fastest measured link, and a model split across GPUs puts that one first. A GPU you pick yourself is never changed.",
+      },
+      avoidTensorSplit: {
+        label: "Avoid tensor parallel on slow links",
+        description:
+          "Automatic choices never use tensor parallelism across a slow link or GPUs that cannot reach each other directly. Switching Tensor Parallelism on yourself still works, with a warning.",
+      },
+      warnTraining: {
+        label: "Warn when training uses a slow-link GPU",
+        description:
+          "The training memory plan says when a run would use a GPU on a slow link, where offloaded gradient checkpointing is slow.",
+      },
+    },
+    autoRun: {
+      label: "Check automatically when the hardware changes",
+      description:
+        "Runs once in the background after Studio starts when there is no result for the GPUs installed now.",
+    },
+    badge: {
+      label: "x{width}",
+      tooltip:
+        "PCIe x{width} (of x{widthMax}): {h2d} GiB/s from system memory, vs {best} GiB/s on GPU {bestGpu}. Measured by the hardware check.",
+    },
+    tensorWarning: {
+      title: "Likely slower on this machine",
+      body:
+        "Tensor parallelism sends every layer's results between the GPUs. With it off, whole layers are split across the GPUs, which is faster here.",
+      slowLink:
+        "GPU {gpu} runs at PCIe x{width}: {h2d} GiB/s from system memory vs {best} GiB/s on GPU {bestGpu}.",
+      noPeer:
+        "GPU {a} and GPU {b} cannot access each other directly: {copy} GiB/s between them.",
+    },
+    training: {
+      slowLink:
+        "GPU {gpu} is on a slow PCIe link (x{width}, {h2d} GiB/s vs {best} GiB/s on GPU {bestGpu}), so loading the model onto it is slow.",
+      offloaded:
+        "Offloaded gradient checkpointing copies activations over that link every step, so training there is slow.",
+      pickFast: "Choose GPU {bestGpu} above to keep the run on the fast link.",
+    },
+  },
 } as const;

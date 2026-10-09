@@ -844,6 +844,19 @@ def _training_gpu_rows(devices: List[Dict[str, Any]], selected: List[int]) -> Li
     return rows
 
 
+def _slow_link_warning(gpu_ids: List[int], gradient_checkpointing: str) -> Optional[Dict[str, Any]]:
+    """Settings > Resources > Hardware check: the run's GPUs that sit on a slow PCIe link, when
+    "Warn when training uses a slow-link GPU" is on. Offloaded gradient checkpointing ("unsloth")
+    copies activations over that link every step, so it is named. Never raises."""
+    try:
+        from utils.hardware.hardware_check import training_slow_link_warning
+
+        return training_slow_link_warning(gpu_ids, gradient_checkpointing)
+    except Exception as exc:  # noqa: BLE001 -- a courtesy line, never a failed preview
+        logger.debug("Training slow-link warning unavailable: %s", exc)
+        return None
+
+
 def estimate_training_fit(
     *,
     model_name: str,
@@ -878,6 +891,8 @@ def estimate_training_fit(
         "min_per_gpu_gb": None,
         "gpus": [],
         "suggestion": None,
+        # The hardware check's warning when the run would use a slow-link GPU, or None.
+        "slow_link": None,
     }
     try:
         from utils.hardware import (
@@ -946,6 +961,7 @@ def estimate_training_fit(
         required_gb, meta, selected_ids = _price()
         result["gpu_ids"] = selected_ids
         result["gpus"] = _training_gpu_rows(devices, selected_ids)
+        result["slow_link"] = _slow_link_warning(selected_ids, est_kwargs["gradient_checkpointing"])
         if required_gb is None:
             result["reason"] = "estimate_unavailable"
             return result

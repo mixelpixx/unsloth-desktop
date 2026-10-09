@@ -156,6 +156,11 @@ _ALLOWED_TP_DROP_GUARDS = {
     # to every request here, including one already asking for manual/0 (whose extras can
     # still carry an --override-tensor the route does not strip).
     "_paravirtual_cpu_forced",
+    # Settings > Resources > Hardware check, "Avoid tensor parallel on slow links" (off by
+    # default): declines ONLY an inherited LLAMA_ARG_SPLIT_MODE=tensor -- no toggle and no
+    # extras --split-mode, so no user request is ignored and there is no extras group to
+    # strip -- across GPUs the check measured on a slow link or without peer access.
+    "_tensor_env_avoided",
 }
 
 

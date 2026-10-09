@@ -173,6 +173,7 @@ export {
   type TrainingFitPart,
   type TrainingGpuDevice,
   type TrainingGpuTarget,
+  type TrainingSlowLink,
   formatFitGiB,
   trainingFitBarGeometry,
   trainingFitLine,

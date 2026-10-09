@@ -41,6 +41,7 @@ import {
 import { InferenceEnginesSection } from "@/features/model-picker/components/inference-engines";
 import { useSettingsDialogStore } from "../stores/settings-dialog-store";
 import { CacheStorageRows } from "../components/cache-storage-rows";
+import { HardwareCheckSection } from "../components/hardware-check-section";
 import { LlamaBackendSection } from "../components/llama-backend-section";
 import { ModelMemorySection } from "../components/model-memory-section";
 import { SettingsRow } from "../components/settings-row";
@@ -864,6 +865,10 @@ export function ResourcesTab() {
       <InferenceEnginesSection />
 
       <ModelMemorySection />
+
+      {/* Measures the links the sections above place models across, and holds the options
+          that act on them. */}
+      <HardwareCheckSection />
 
       <SettingsSection
         ref={storageSectionRef}

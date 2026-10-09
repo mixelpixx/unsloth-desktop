@@ -759,6 +759,23 @@ class TrainingEstimateSuggestion(BaseModel):
     batch_size: Optional[int] = None
 
 
+class TrainingEstimateSlowLinkGpu(BaseModel):
+    index: int
+    width: Optional[int] = None
+    width_max: Optional[int] = None
+    h2d_gibs: Optional[float] = None
+
+
+class TrainingEstimateSlowLink(BaseModel):
+    """Settings > Resources > Hardware check: the run's GPUs on a slow PCIe link, as measured."""
+
+    gpus: List[TrainingEstimateSlowLinkGpu] = Field(default_factory = list)
+    best_gpu: Optional[int] = None
+    best_h2d_gibs: Optional[float] = None
+    # Offloaded gradient checkpointing copies activations over that link every step.
+    offloaded_gradient_checkpointing: bool = False
+
+
 class TrainingEstimateResponse(BaseModel):
     verdict: TrainingFitVerdict
     # Machine code: why the verdict is unknown, or which check an "exceeds" failed.
@@ -774,6 +791,7 @@ class TrainingEstimateResponse(BaseModel):
     min_per_gpu_gb: Optional[float] = None
     gpus: List[TrainingEstimateGpu] = Field(default_factory = list)
     suggestion: Optional[TrainingEstimateSuggestion] = None
+    slow_link: Optional[TrainingEstimateSlowLink] = None
 
 
 class TrainingJobResponse(BaseModel):

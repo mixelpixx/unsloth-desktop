@@ -55,6 +55,7 @@ SECTION_ORDER = (
     "python",
     "llama_cpp",
     "storage",
+    "hardware_check",
     "models",
     "mcp",
     "environment",
@@ -778,6 +779,61 @@ def collect_storage() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------------------------
+# Hardware check
+
+
+def collect_hardware_check() -> dict[str, Any]:
+    """The last Settings > Resources > Hardware check result, its findings and the options.
+
+    Read from the stored JSON; nothing is measured here (a run takes ~10 s and touches every GPU).
+    """
+    from utils.hardware import hardware_check
+    from utils.hardware_check_settings import get_hardware_check_settings
+
+    result = hardware_check.load_result()
+    if not result:
+        raise Unavailable("the hardware check has not run yet")
+    summary = hardware_check.analyze(result)
+    return {
+        "checked_at": result.get("finished_at"),
+        "trigger": result.get("trigger"),
+        "duration_ms": result.get("duration_ms"),
+        "up_to_date": hardware_check.result_is_current(result),
+        "settings": get_hardware_check_settings(),
+        "gpus": [
+            {
+                "index": gpu.get("index"),
+                "name": gpu.get("name"),
+                "status": gpu.get("status"),
+                "reason": gpu.get("reason"),
+                "link": gpu.get("link"),
+                "link_idle": gpu.get("link_idle"),
+                "h2d_gibs": gpu.get("h2d_gibs"),
+                "d2h_gibs": gpu.get("d2h_gibs"),
+            }
+            for gpu in result.get("gpus") or []
+        ],
+        "pairs": list(result.get("pairs") or []),
+        "storage": [
+            {
+                "key": entry.get("key"),
+                "drive": entry.get("drive"),
+                "bus_type": entry.get("bus_type"),
+                "media_type": entry.get("media_type"),
+                "model": entry.get("model"),
+            }
+            for entry in result.get("storage") or []
+        ],
+        "gpu_error": result.get("gpu_error"),
+        "storage_error": result.get("storage_error"),
+        "findings": [
+            {"id": f["id"], "severity": f["severity"], "text": f["text"]} for f in summary["findings"]
+        ],
+        "recommended": summary["recommended"],
+    }
+
+
+# --------------------------------------------------------------------------------------------
 # Environment
 
 
@@ -891,6 +947,7 @@ def default_collectors(frontend_build_path: Optional[Path] = None) -> dict[str, 
         "python": collect_python,
         "llama_cpp": collect_llama_cpp,
         "storage": collect_storage,
+        "hardware_check": collect_hardware_check,
         "models": collect_models,
         "mcp": collect_mcp,
         "environment": collect_environment,
@@ -1104,6 +1161,7 @@ _LOCATION_LABELS = {
     "studio_home": "Studio home",
     "hf_home": "Hugging Face home",
     "hf_hub_cache": "Hugging Face hub cache",
+    "hf_cache": "Hugging Face hub cache",
     "temp": "Temp",
 }
 
@@ -1125,6 +1183,72 @@ def _md_storage(data: dict) -> list[str]:
         lines += ["", "- Hugging Face hub cache size: the folder does not exist yet"]
     else:
         lines += ["", "- Hugging Face hub cache size: still being measured"]
+    return lines
+
+
+def _gibs(value: Any) -> str:
+    return f"{value:.1f} GiB/s" if isinstance(value, (int, float)) else "-"
+
+
+def _link_text(link: Any) -> str:
+    if not isinstance(link, Mapping):
+        return "-"
+    gen, width, width_max = link.get("gen_current"), link.get("width_current"), link.get("width_max")
+    if width is None and gen is None:
+        return "-"
+    return f"Gen{gen or '?'} x{width or '?'}" + (f" (max x{width_max})" if width_max else "")
+
+
+_OPTION_TEXT = (
+    ("prefer_fast_link", "prefer fast-link GPUs"),
+    ("avoid_tensor_split", "avoid tensor parallel on slow links"),
+    ("warn_training_slow_link", "warn when training uses a slow-link GPU"),
+    ("auto_run", "check automatically when the hardware changes"),
+)
+
+
+def _md_hardware_check(data: dict) -> list[str]:
+    current = data.get("up_to_date")
+    state = "up to date" if current is True else ("out of date: the GPUs changed since" if current is False else "currency unknown")
+    lines = [f"- Checked: {data.get('checked_at') or '?'} ({state})"]
+    settings = data.get("settings") or {}
+    lines.append(
+        "- Options: "
+        + ", ".join(f"{label} {'on' if settings.get(key) else 'off'}" for key, label in _OPTION_TEXT)
+    )
+    gpus = data.get("gpus") or []
+    if gpus:
+        lines += [
+            "",
+            "| # | GPU | Link under load | Link at rest | Host to GPU | GPU to host |",
+            "|---|-----|-----------------|--------------|-------------|-------------|",
+        ]
+        for gpu in gpus:
+            measured = gpu.get("status") == "measured"
+            lines.append(
+                f"| {_cell(gpu.get('index'))} | {_cell(gpu.get('name'))} | "
+                f"{_cell(_link_text(gpu.get('link')) if measured else gpu.get('reason') or gpu.get('status'))} | "
+                f"{_cell(_link_text(gpu.get('link_idle')))} | {_gibs(gpu.get('h2d_gibs'))} | {_gibs(gpu.get('d2h_gibs'))} |"
+            )
+    for pair in data.get("pairs") or []:
+        peer = {True: "yes", False: "no"}
+        lines.append(
+            f"- GPU {pair.get('a')} and GPU {pair.get('b')}: peer access "
+            f"{peer.get(pair.get('peer_ab'), '?')}/{peer.get(pair.get('peer_ba'), '?')}, copy "
+            f"{_gibs(pair.get('copy_ab_gibs'))} / {_gibs(pair.get('copy_ba_gibs'))}"
+        )
+    storage = data.get("storage") or []
+    if storage:
+        lines += ["", "| Location | Drive | Bus | Media | Model |", "|----------|-------|-----|-------|-------|"]
+        for entry in storage:
+            lines.append(
+                f"| {_LOCATION_LABELS.get(entry.get('key'), entry.get('key'))} | {_cell(entry.get('drive'))} | "
+                f"{_cell(entry.get('bus_type'))} | {_cell(entry.get('media_type'))} | {_cell(entry.get('model'))} |"
+            )
+    findings = data.get("findings") or []
+    if findings:
+        lines += ["", "Findings:"]
+        lines += [f"- [{f.get('severity')}] {f.get('text')}" for f in findings]
     return lines
 
 
@@ -1182,6 +1306,7 @@ _MARKDOWN_SECTIONS = (
     ("python", "Python and packages", _md_python),
     ("llama_cpp", "llama.cpp", _md_llama),
     ("storage", "Storage", _md_storage),
+    ("hardware_check", "Hardware check", _md_hardware_check),
     ("models", "Loaded models", _md_models),
     ("mcp", "MCP servers", _md_mcp),
     ("environment", "Environment", _md_environment),

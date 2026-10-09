@@ -394,6 +394,7 @@ from routes.library import router as library_router
 from routes.profile_stats import router as profile_stats_router
 from routes.resources import router as resources_router
 from routes.diagnostics import router as diagnostics_router
+from routes.hardware_check import router as hardware_check_router
 from auth import policy as auth_policy, storage
 from auth.authentication import authenticated_via_api_key, get_current_subject
 from hub.utils.host_paths import redact_inventory_host_paths
@@ -645,6 +646,24 @@ def _start_linked_folder_auto_sync(generation: Optional[int]) -> None:
         )
 
 
+def _start_hardware_check_auto_run(generation: Optional[int]) -> None:
+    """Settings > Resources > Hardware check, once, when there is no result for the GPUs installed now.
+
+    Started here because hardware detection and the torch warm are over by now; the runner waits a further
+    settle delay, skips while a training run, a load or a generation is going on, and stands down with this
+    lifespan. The measurements run in a child process, so nothing here touches the GPUs."""
+    if generation is None:
+        return
+    try:
+        from utils.hardware.hardware_check import start_auto_run
+
+        start_auto_run(alive = lambda: _post_warm_current_generation() == generation)
+    except Exception as exc:  # noqa: BLE001 -- the check is advisory
+        import structlog as _structlog
+
+        _structlog.get_logger(__name__).debug("hardware check auto-run skipped: %s", exc)
+
+
 def _post_warm_background_work(generation: Optional[int] = None) -> None:
     """Platform repair and linked-folder lifecycle work after the coordinated warm. MLX repair used to probe the
     runtime before the socket bound; joining first keeps that optional probe out of the login-screen
@@ -700,6 +719,7 @@ def _post_warm_background_work(generation: Optional[int] = None) -> None:
     if _post_warm_retired(generation):
         return
     _start_linked_folder_auto_sync(generation)
+    _start_hardware_check_auto_run(generation)
 
     try:
         from core import chat_originals
@@ -1805,6 +1825,7 @@ app.include_router(library_router, prefix = "/api/library", tags = ["library"])
 app.include_router(profile_stats_router, prefix = "/api/profile", tags = ["profile"])
 app.include_router(resources_router, prefix = "/api/resources", tags = ["resources"])
 app.include_router(diagnostics_router, prefix = "/api/diagnostics", tags = ["diagnostics"])
+app.include_router(hardware_check_router, prefix = "/api/hardware-check", tags = ["hardware-check"])
 app.include_router(datasets_router, prefix = "/api/datasets", tags = ["datasets"])
 app.include_router(data_recipe_router, prefix = "/api/data-recipe", tags = ["data-recipe"])
 app.include_router(llama_router, prefix = "/api/llama", tags = ["llama"])

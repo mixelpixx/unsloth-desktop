@@ -12,6 +12,18 @@ export type ResourceAttribution = "process" | "estimate";
 
 export type ResourceApp = { pid: number; name: string; bytes: number };
 
+/** The hardware check's measured link for a card (Settings > Resources > Hardware check). Only
+ *  on a card the stored result measured, and only while it describes the GPUs installed now. */
+export type ResourceGpuLink = {
+  width: number | null;
+  width_max: number | null;
+  gen: number | null;
+  h2d_gibs: number | null;
+  best_gpu: number | null;
+  best_h2d_gibs: number | null;
+  slow: boolean;
+};
+
 export type ResourceGpu = {
   index: number;
   name: string | null;
@@ -24,6 +36,8 @@ export type ResourceGpu = {
   /** "process": Windows' per-process counter. "estimate": what Studio's runtimes logged. */
   attribution: ResourceAttribution | null;
   apps: ResourceApp[];
+  /** Absent until the hardware check has measured this card. */
+  link?: ResourceGpuLink;
 };
 
 export type ResourceModelKind =
@@ -86,6 +100,22 @@ function text(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function gpuLink(value: unknown): ResourceGpuLink | null {
+  if (!value || typeof value !== "object") return null;
+  const link = value as Record<string, unknown>;
+  const int = (v: unknown) =>
+    typeof v === "number" && Number.isInteger(v) ? v : null;
+  return {
+    width: int(link.width),
+    width_max: int(link.width_max),
+    gen: int(link.gen),
+    h2d_gibs: finite(link.h2d_gibs),
+    best_gpu: int(link.best_gpu),
+    best_h2d_gibs: finite(link.best_h2d_gibs),
+    slow: link.slow === true,
+  };
+}
+
 function apps(value: unknown): ResourceApp[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((row) => {
@@ -117,6 +147,7 @@ export function normalizeResourceSnapshot(raw: unknown): ResourceSnapshot {
       gpu.attribution === "process" || gpu.attribution === "estimate"
         ? gpu.attribution
         : null;
+    const link = gpuLink(gpu.link);
     return [
       {
         index,
@@ -128,6 +159,7 @@ export function normalizeResourceSnapshot(raw: unknown): ResourceSnapshot {
         other_bytes: finite(gpu.other_bytes),
         attribution,
         apps: apps(gpu.apps),
+        ...(link ? { link } : {}),
       } satisfies ResourceGpu,
     ];
   });
@@ -257,6 +289,30 @@ export function gpuFigures(gpu: ResourceGpu): {
     studio:
       gpu.studio_bytes === null ? null : formatResourceGiB(gpu.studio_bytes),
     other: gpu.other_bytes === null ? null : formatResourceGiB(gpu.other_bytes),
+  };
+}
+
+// ── The link badge ────────────────────────────────────────────────
+
+/** What the strip's "x1" badge says, or null: only a card the hardware check measured as slow,
+ *  with the width it trained at under load. The tooltip's numbers come along, formatted. */
+export function linkBadge(gpu: ResourceGpu): {
+  width: number;
+  widthMax: number | string;
+  h2d: string;
+  best: string;
+  bestGpu: number | string;
+} | null {
+  const link = gpu.link;
+  if (!link?.slow || link.width === null) return null;
+  const gibs = (value: number | null) =>
+    value === null ? "?" : value.toFixed(1);
+  return {
+    width: link.width,
+    widthMax: link.width_max ?? "?",
+    h2d: gibs(link.h2d_gibs),
+    best: gibs(link.best_h2d_gibs),
+    bestGpu: link.best_gpu ?? "?",
   };
 }
 

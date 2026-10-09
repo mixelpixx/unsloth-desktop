@@ -209,6 +209,7 @@ import { ChatTemplateEditorDialog } from "./chat-template-editor-dialog";
 import { MemoryEstimateRow } from "./memory-estimate-row";
 import type { ModelPickTarget } from "./model-selector/types";
 import { reconcileTensorSplit } from "@/hooks/gpu-tensor-split";
+import { TensorParallelLinkWarning } from "@/features/hardware-check";
 import {
   NumericValueInput,
   type NumericValueInputHandle,
@@ -1693,6 +1694,11 @@ function GgufAdvancedSettings({
           />
         </div>
       )}
+      {/* Settings > Resources > Hardware check, when "Avoid tensor parallel on slow links" is on:
+          a switch turned on by hand is warned about with the measured numbers, never blocked. */}
+      {!isDiffusion && config.tensorParallel ? (
+        <TensorParallelLinkWarning gpuIds={config.selectedGpuIds ?? null} />
+      ) : null}
 
       {/* withoutUnsupportedDiffusionSettings forces disableVision back to false on a diffusion model
           and the runner never reads it, so the switch would flip back under the pointer. */}

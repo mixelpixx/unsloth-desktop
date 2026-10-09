@@ -98,6 +98,11 @@ export const SETTINGS_SEARCH_INDEX: Record<SettingsTab, TranslationKey[]> = {
     "settings.resources.modelMemory.title",
     "settings.resources.modelMemory.keepResident",
     "settings.resources.modelMemory.noRamReserve",
+    "hardwareCheck.title",
+    "hardwareCheck.options.preferFastLink.label",
+    "hardwareCheck.options.avoidTensorSplit.label",
+    "hardwareCheck.options.warnTraining.label",
+    "hardwareCheck.autoRun.label",
     "settings.resources.storage.title",
     "settings.resources.storage.modelsFolder",
     "settings.resources.storage.futureDownloads",
@@ -422,6 +427,10 @@ export const SETTINGS_SEARCH_KEYWORDS: Partial<
     "settings.resources.modelMemory.modelMemoryKeywords",
   "settings.resources.modelMemory.noRamReserve":
     "settings.resources.modelMemory.modelMemoryKeywords",
+  // PCIe, lanes, NVMe and P2P are in none of the hardware check's labels.
+  "hardwareCheck.title": "hardwareCheck.keywords",
+  "hardwareCheck.options.preferFastLink.label": "hardwareCheck.keywords",
+  "hardwareCheck.options.avoidTensorSplit.label": "hardwareCheck.keywords",
   "settings.chat.autoCompact": "settings.chat.autoCompactKeywords",
   // These rows are labelled with what they are, so the verbs people search for live here.
   "settings.chat.thinking.visibility": "settings.chat.visibilityKeywords",

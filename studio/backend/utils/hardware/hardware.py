@@ -5860,6 +5860,25 @@ def auto_select_gpu_ids(
 
     ranked = sorted(gpu_candidates, key = lambda item: (-item["free_gb"], item["index"]))
     free_by_index = {item["index"]: item["free_gb"] for item in ranked}
+
+    # Settings > Resources > Hardware check "Prefer fast-link GPUs": a run that fits one card
+    # alone goes on a clearly faster-linked card when that card holds it comfortably. Only for
+    # nvidia-smi's physical indices, the space the check stored; None leaves this unchanged.
+    preferred = _fast_link_single_gpu(ranked, devices, required_gb)
+    if preferred is not None:
+        metadata["usable_gb"] = round(free_by_index[preferred], 3)
+        metadata["selection_mode"] = "auto"
+        metadata["selected_gpu_ids"] = [preferred]
+        metadata["fast_link_preferred"] = True
+        logger.info(
+            "Selected GPU %s for its faster measured host link (Settings > Resources > "
+            "Hardware check): model=%s required_gb=%s",
+            preferred,
+            model_name,
+            metadata.get("required_gb"),
+        )
+        return [preferred], metadata
+
     selected: list[int] = []
     usable_gb = 0.0
     # Sharding has inter-GPU overhead, so each extra GPU contributes less than its raw free memory. 0.85 is empirical on 2-8 GPU setups: NCCL buffers, pipeline bubbles, fragmentation.
@@ -5924,6 +5943,36 @@ def auto_select_gpu_ids(
         multi_gpu_overhead,
     )
     return fallback_all, metadata
+
+
+def _fast_link_single_gpu(
+    ranked: list[dict[str, Any]], devices: list[dict[str, Any]], required_gb: float
+) -> Optional[int]:
+    """The card auto-selection should use instead of the roomiest one, or None to keep it.
+
+    None unless the hardware check's "Prefer fast-link GPUs" is on with a current result, the
+    roomiest card holds the run alone (so the default is a single card too), and another card
+    is clearly faster-linked and holds it comfortably (utils.hardware.link_preference)."""
+    if not ranked or required_gb is None or ranked[0]["free_gb"] < required_gb:
+        return None
+    if any(d.get("index_kind") not in (None, "physical") for d in devices):
+        return None
+    try:
+        from utils.hardware.hardware_check import active_link_preference
+        from utils.hardware.link_preference import faster_card
+
+        preference = active_link_preference()
+        if not preference:
+            return None
+        return faster_card(
+            int(ranked[0]["index"]),
+            [(int(c["index"]), float(c["free_gb"]) * 1024.0) for c in ranked],
+            preference,
+            need_mib = float(required_gb) * 1024.0,
+        )
+    except Exception as exc:  # noqa: BLE001 -- a preference never fails a selection
+        logger.debug("Fast-link GPU preference unavailable: %s", exc)
+        return None
 
 
 def prepare_gpu_selection(

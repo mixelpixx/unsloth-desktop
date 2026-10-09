@@ -833,6 +833,12 @@ def test_health_response_reports_desktop_capability_fields(monkeypatch):
     sandbox_capability_module.router = APIRouter()
     systemone_module = ModuleType("routes.systemone")
     systemone_module.router = APIRouter()
+    hardware_check_module = ModuleType("routes.hardware_check")
+    hardware_check_module.router = APIRouter()
+    resources_module = ModuleType("routes.resources")
+    resources_module.router = APIRouter()
+    diagnostics_module = ModuleType("routes.diagnostics")
+    diagnostics_module.router = APIRouter()
     # main.py mounts the Decisions MCP app from these at import.
     from fastmcp import FastMCP
 
@@ -867,6 +873,9 @@ def test_health_response_reports_desktop_capability_fields(monkeypatch):
     monkeypatch.setitem(sys.modules, "routes.library", library_module)
     monkeypatch.setitem(sys.modules, "routes.sandbox_capability", sandbox_capability_module)
     monkeypatch.setitem(sys.modules, "routes.systemone", systemone_module)
+    monkeypatch.setitem(sys.modules, "routes.hardware_check", hardware_check_module)
+    monkeypatch.setitem(sys.modules, "routes.resources", resources_module)
+    monkeypatch.setitem(sys.modules, "routes.diagnostics", diagnostics_module)
 
     import studio.backend.main as backend_main
 

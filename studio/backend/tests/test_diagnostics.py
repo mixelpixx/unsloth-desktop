@@ -51,6 +51,7 @@ def _fast_collectors(**overrides):
         "python": lambda: {"version": "3.12.0", "packages": {"torch": "2.9.0"}, "torch": {"cuda": "13.0"}},
         "llama_cpp": lambda: {"version": "b1", "update": {"state": "not_checked"}},
         "storage": lambda: {"locations": [], "hf_cache_size": {"state": "computing"}},
+        "hardware_check": lambda: {"gpus": [], "findings": [], "settings": {}},
         "models": lambda: {"models": []},
         "mcp": lambda: {"servers": []},
         "environment": lambda: {"variables": []},

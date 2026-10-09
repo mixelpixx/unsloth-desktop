@@ -38,7 +38,7 @@ an occasional crash the guardrail failed to predict.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 __all__ = [
     "AUTO_MIN_CONTEXT",
@@ -157,6 +157,12 @@ class VerdictInputs:
     tensor_split: Optional[Sequence[float]] = None
     vram_fraction: float = 0.97
     ram_available_bytes: Optional[int] = None
+    # Hardware check "Prefer fast-link GPUs": {gpu index: measured host GiB/s}. An Auto load
+    # that fits one card alone is judged on the card the loader then picks (the faster-linked
+    # one when it holds the load comfortably), not on the pool. None: the pool, as before.
+    link_preference: Optional[Mapping[int, float]] = None
+    # Cards another loaded model runs on, which the loader keeps a single-card load off.
+    link_shared: tuple[int, ...] = ()
 
 
 @dataclass(frozen = True)
@@ -285,6 +291,9 @@ def compute_load_verdict(inputs: VerdictInputs) -> LoadVerdict:
         split_verdict = _fixed_split_verdict(inputs, gpus, gpu_need_eff)
         if split_verdict is not None:
             return split_verdict
+
+    if inputs.placement == PLACEMENT_AUTO and inputs.link_preference and len(gpus) > 1:
+        gpus = _link_preferred_gpus(inputs, gpus, gpu_need, gpu_need_eff)
 
     indices = tuple(g.index for g in gpus)
     free = int(sum(max(0, g.free_bytes) for g in gpus))
@@ -417,6 +426,40 @@ def compute_load_verdict(inputs: VerdictInputs) -> LoadVerdict:
         headroom_bytes = free - gpu_need_eff,
         **numbers,
     )
+
+
+def _link_preferred_gpus(
+    inputs: VerdictInputs, gpus: list[GpuMemory], need_full: int, need_floor: int
+) -> list[GpuMemory]:
+    """The one card the loader puts an Auto load on when "Prefer fast-link GPUs" moves it,
+    else ``gpus`` unchanged. The same rule the loader applies
+    (``utils.hardware.link_preference.faster_card``), from the same default: the roomiest card
+    no other model runs on that holds the whole load, else the roomiest card."""
+    from utils.hardware.link_preference import AUTO_CONTEXT_ROOM_TOLERANCE_MIB, faster_card
+
+    usable = {
+        g.index: max(0, g.free_bytes - _reserve_bytes(g, inputs.vram_fraction)) / _MIB for g in gpus
+    }
+    ranked = sorted(gpus, key = lambda g: usable[g.index], reverse = True)
+    shared = set(inputs.link_shared)
+    need_full_mib = need_full / _MIB
+    default = next(
+        (g.index for g in ranked if g.index not in shared and usable[g.index] >= need_full_mib),
+        ranked[0].index,
+    )
+    auto_window = not inputs.context_pinned
+    faster = faster_card(
+        default,
+        [(g.index, usable[g.index]) for g in ranked],
+        inputs.link_preference,
+        need_mib = need_full_mib,
+        shared = shared,
+        floor_need_mib = need_floor / _MIB if auto_window else None,
+        room_tolerance_mib = AUTO_CONTEXT_ROOM_TOLERANCE_MIB if auto_window else 0.0,
+    )
+    if faster is None:
+        return gpus
+    return [g for g in gpus if g.index == faster]
 
 
 def _runtime_overflow(

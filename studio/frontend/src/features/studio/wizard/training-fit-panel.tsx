@@ -304,6 +304,53 @@ function FitSuggestion({
 }
 
 /**
+ * Settings > Resources > Hardware check, when "Warn when training uses a slow-link GPU" is on: the
+ * run's GPUs on a slow PCIe link, with the measured numbers. Offloaded gradient checkpointing (the
+ * default) copies activations over that link every step, so it is named when it is in use.
+ */
+function SlowLinkWarning({
+  estimate,
+  devices,
+}: {
+  estimate: TrainingFitEstimate;
+  devices: TrainingGpuDevice[];
+}): ReactElement | null {
+  const t = useT();
+  const slow = estimate.slowLink;
+  if (!slow) return null;
+  const gibs = (value: number | null) => (value === null ? "?" : value.toFixed(1));
+  const bestOffered =
+    slow.bestGpu !== null &&
+    !estimate.gpuIds.includes(slow.bestGpu) &&
+    devices.some((device) => device.index === slow.bestGpu);
+  return (
+    <div
+      role="note"
+      data-training-slow-link=""
+      className="flex flex-col gap-0.5 text-ui-10p5 leading-relaxed text-status-warning"
+    >
+      {slow.gpus.map((gpu) => (
+        <p key={gpu.index}>
+          {t("hardwareCheck.training.slowLink", {
+            gpu: gpu.index,
+            width: gpu.width ?? "?",
+            h2d: gibs(gpu.h2dGibs),
+            best: gibs(slow.bestH2dGibs),
+            bestGpu: slow.bestGpu ?? "?",
+          })}
+        </p>
+      ))}
+      {slow.offloadedGradientCheckpointing ? (
+        <p>{t("hardwareCheck.training.offloaded")}</p>
+      ) : null}
+      {bestOffered ? (
+        <p>{t("hardwareCheck.training.pickFast", { bestGpu: slow.bestGpu ?? "?" })}</p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
  * The run preview's memory plan: which GPUs the run targets, how the estimate stacks up against
  * their free memory, and the one cheaper setting that would fit when it does not.
  */
@@ -370,6 +417,7 @@ export function TrainingFitPanel({
           {text}
         </p>
         {status === "ready" ? <FitSuggestion estimate={estimate} /> : null}
+        {status === "ready" ? <SlowLinkWarning estimate={estimate} devices={devices} /> : null}
       </div>
     );
   }

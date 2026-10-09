@@ -29,6 +29,7 @@ import {
   canEjectModel,
   formatResourceGiB,
   gpuFigures,
+  linkBadge,
   modelFacts,
   shortResourceName,
 } from "./resources-model";
@@ -58,6 +59,24 @@ function barLabel(t: Translate, gpu: ResourceGpu): string {
         free: figures.free,
         total: figures.total,
       });
+}
+
+/** "x1" beside a card the hardware check measured on a slow PCIe link, with the measured
+ *  bandwidth in its tooltip. Nothing until the check has measured the card. */
+function LinkBadge({ gpu, t }: { gpu: ResourceGpu; t: Translate }) {
+  const badge = linkBadge(gpu);
+  if (!badge) return null;
+  const tooltip = t("hardwareCheck.badge.tooltip", badge);
+  return (
+    <span
+      data-link-badge=""
+      title={tooltip}
+      aria-label={tooltip}
+      className="shrink-0 rounded-full bg-amber-500/15 px-1.5 text-ui-10 font-semibold leading-tight text-amber-700 tabular-nums dark:text-amber-400"
+    >
+      {t("hardwareCheck.badge.label", { width: badge.width })}
+    </span>
+  );
 }
 
 /** One card's bar, horizontal in the strip and the panel, vertical on the collapsed rail. */
@@ -162,6 +181,7 @@ function GpuSection({ gpu, t }: { gpu: ResourceGpu; t: Translate }) {
             {gpu.name}
           </span>
         )}
+        <LinkBadge gpu={gpu} t={t} />
       </div>
       <GpuBar gpu={gpu} label={barLabel(t, gpu)} meter={true} />
       <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-ui-11 text-muted-foreground tabular-nums">
@@ -449,11 +469,14 @@ export function ResourcesStrip() {
               <span key={gpu.index} className="contents">
                 {/* Expanded: a label over a thin bar. */}
                 <span className="flex flex-col gap-1 group-data-[collapsible=icon]:hidden">
-                  <span className="truncate text-ui-11 tabular-nums text-muted-foreground">
-                    {t("resources.gpuFree", {
-                      index: gpu.index,
-                      free: formatResourceGiB(gpu.free_bytes),
-                    })}
+                  <span className="flex min-w-0 items-center gap-1.5">
+                    <span className="min-w-0 truncate text-ui-11 tabular-nums text-muted-foreground">
+                      {t("resources.gpuFree", {
+                        index: gpu.index,
+                        free: formatResourceGiB(gpu.free_bytes),
+                      })}
+                    </span>
+                    <LinkBadge gpu={gpu} t={t} />
                   </span>
                   <GpuBar gpu={gpu} label={label} />
                 </span>
