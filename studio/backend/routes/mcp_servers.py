@@ -22,11 +22,15 @@ from auth.authentication import (
     require_ui_session_for_local_commands,
 )
 from core.inference.mcp_client import (
+    PROCESS_MODE_PER_CHAT,
+    PROCESS_MODE_SHARED,
     TOOL_CACHE_INVALIDATING_FIELDS,
+    McpServerBusy,
     McpStdioServerError,
     UI_RESOURCE_SCHEME,
     cache_tools,
     call_tool_structured_sync,
+    clear_server_failure,
     get_cached_tools,
     in_failure_cooloff,
     clear_oauth_tokens_async,
@@ -34,6 +38,7 @@ from core.inference.mcp_client import (
     invalidate_tool_cache,
     is_stdio,
     join_stdio_command,
+    list_session_tools_sync,
     list_tools_async,
     oauth_client_kwargs,
     parse_server_headers,
@@ -41,10 +46,19 @@ from core.inference.mcp_client import (
     probe_timeout,
     read_resource_sync,
     record_probe_failure,
+    record_server_failure,
     serialize_mcp_server_mutation,
+    server_idle_timeout,
+    server_lifecycle,
+    server_process_mode,
+    server_status,
+    shared_session_scope,
     stdio_mcp_disabled_reason,
     stdio_mcp_enabled,
+    retime_server_processes,
+    stop_server_processes,
     tool_visible_to,
+    tools_cache_epoch,
     unquoted_spaced_program,
 )
 from core.inference import mcp_import_sources
@@ -64,6 +78,7 @@ from models.mcp_servers import (
     McpServerImportResult,
     McpServerProbeResult,
     McpServerResponse,
+    McpServerStatus,
     McpServerTestRequest,
     McpServerUpdate,
     McpStdioCommand,
@@ -280,9 +295,21 @@ def _row_to_response(row: dict, *, include_headers: bool = True) -> McpServerRes
         has_oauth_client_secret = bool(row.get("oauth_client_secret")),
         image_input_mappings = image_input_mappings(row),
         image_mappings_active = _image_mappings_active(row),
+        process_mode = server_process_mode(row),
+        idle_timeout_seconds = server_idle_timeout(row),
         created_at = row["created_at"],
         updated_at = row["updated_at"],
     )
+
+
+def _new_process_mode(url: str, requested: Optional[str]) -> str:
+    """A new local program shares one process across chats unless asked otherwise, like the apps servers are
+    imported from: a server holding a serial port or SSH sessions cannot run twice, and one that loads toolsets
+    must keep them between chats. Rows saved before the setting existed stay per chat (see mcp_servers_db). An
+    HTTP server has no process; it is stored per chat, the behaviour it has always had."""
+    if not is_stdio(url):
+        return PROCESS_MODE_PER_CHAT
+    return requested or PROCESS_MODE_SHARED
 
 
 def _blender_row():
@@ -486,6 +513,8 @@ async def create_mcp_server(
         oauth_client_id = client_id,
         oauth_client_secret = client_secret,
         cwd = cwd,
+        process_mode = _new_process_mode(url, payload.process_mode),
+        idle_timeout_seconds = payload.idle_timeout_seconds,
     )
     return _row_to_response(mcp_servers_db.get_server(server_id))
 
@@ -522,6 +551,13 @@ def _changes_from_payload(payload: McpServerUpdate) -> dict:
         changes["oauth_client_id"] = (payload.oauth_client_id or "").strip() or None
     if "oauth_client_secret" in sent:
         changes["oauth_client_secret"] = payload.oauth_client_secret or None
+    if "process_mode" in sent:
+        if payload.process_mode is None:
+            raise HTTPException(status_code = 400, detail = "process_mode must be shared or per_chat")
+        changes["process_mode"] = payload.process_mode
+    if "idle_timeout_seconds" in sent:
+        # null = back to the mode's default.
+        changes["idle_timeout_seconds"] = payload.idle_timeout_seconds
     # stdio is OAuth-less: drop a stale OAuth flag when switching to a command.
     if "url" in changes and is_stdio(changes["url"]):
         changes["use_oauth"] = False
@@ -608,6 +644,9 @@ async def update_mcp_server(
         await asyncio.to_thread(
             lambda: close_mcp_sessions(old["url"], parse_server_headers(old), cwd = old.get("cwd"))
         )
+    elif "idle_timeout_seconds" in changes:
+        # A running process keeps going under the new timeout rather than being restarted for it.
+        retime_server_processes(mcp_servers_db.get_server(server_id) or old)
     return _row_to_response(mcp_servers_db.get_server(server_id), include_headers = not no_credential)
 
 
@@ -683,15 +722,22 @@ async def refresh_mcp_server_tools(
             raise HTTPException(status_code = 400, detail = stdio_mcp_disabled_reason())
 
     use_oauth = bool(server.get("use_oauth"))
+    epoch = tools_cache_epoch(server_id)
     try:
-        tools = await list_tools_async(
-            url = server["url"],
-            headers = parse_server_headers(server),
-            timeout = probe_timeout(server["url"], use_oauth),
-            use_oauth = use_oauth,
-            cwd = server.get("cwd"),
-            **oauth_client_kwargs(server),
-        )
+        if _shares_process(server):
+            tools = await _list_shared_process_tools(server)
+        else:
+            tools = await list_tools_async(
+                url = server["url"],
+                headers = parse_server_headers(server),
+                timeout = probe_timeout(server["url"], use_oauth),
+                use_oauth = use_oauth,
+                cwd = server.get("cwd"),
+                **oauth_client_kwargs(server),
+            )
+    except McpServerBusy as exc:
+        # The server is fine, just running another chat's call: no cool-off.
+        return McpServerProbeResult(ok = False, error = f"Could not refresh: {exc}")
     except Exception as exc:  # noqa: BLE001 - surface transport+timeout errors to UI
         _log_probe_failure("mcp_servers.refresh_failed", exc, server_id = server_id)
         current = mcp_servers_db.get_server(server_id)
@@ -702,14 +748,129 @@ async def refresh_mcp_server_tools(
             # while the probe was awaiting, the FAILURE belongs to the old config and must not park the newly edited
             # server.
             record_probe_failure(server_id, use_oauth)
+            record_server_failure(server, exc)
         return McpServerProbeResult(ok = False, error = safe_curated_detail(exc))
 
     current = mcp_servers_db.get_server(server_id)
     if current is not None and not any(
         current.get(k) != server.get(k) for k in TOOL_CACHE_INVALIDATING_FIELDS
     ):
-        cache_tools(server_id, tools)
+        cache_tools(server_id, tools, epoch = epoch)
     return McpServerProbeResult(ok = True, tool_count = len(tools))
+
+
+def _shares_process(server: dict) -> bool:
+    lifecycle = server_lifecycle(server)
+    return lifecycle is not None and lifecycle.shared
+
+
+async def _list_shared_process_tools(server: dict) -> list[dict]:
+    """A shared local program's tools, asked over its one process (started if it is not running, then kept for the
+    chats). Probing a second copy instead would fail for a server that holds a serial port or a session, and would
+    list the tools a fresh process starts with rather than the ones the chats are using."""
+    lifecycle = server_lifecycle(server)
+    return await asyncio.to_thread(
+        list_session_tools_sync,
+        server["url"],
+        parse_server_headers(server),
+        scope = shared_session_scope(lifecycle.server_id),
+        timeout = probe_timeout(server["url"], False),
+        cwd = server.get("cwd"),
+        lifecycle = lifecycle,
+        config_check = lambda: _row_still_matches(lifecycle.server_id, server),
+    )
+
+
+def _status_response(row: dict) -> McpServerStatus:
+    return McpServerStatus(
+        server_id = row["id"],
+        process_mode = server_process_mode(row),
+        idle_timeout_seconds = server_idle_timeout(row),
+        **server_status(row),
+    )
+
+
+def _local_program_or_error(
+    server_id: str, via_api_key: bool, no_credential: bool, *, executes: bool
+) -> dict:
+    """A saved local program whose processes this caller may manage: the installation owner, from a signed-in
+    Studio window (never an API key), with local programs allowed when ``executes`` would start one. Checked
+    before the row is read, so a refused caller learns nothing about which servers exist."""
+    _require_managed_access(via_api_key, no_credential, executes = executes)
+    if not is_owner_context():
+        raise HTTPException(
+            status_code = 403, detail = "Only the installation owner runs local programs."
+        )
+    server = mcp_servers_db.get_server(server_id)
+    if not server:
+        raise HTTPException(status_code = 404, detail = "MCP server not found")
+    if not is_stdio(server["url"]):
+        raise HTTPException(
+            status_code = 400, detail = "Only local programs have a process to stop or restart."
+        )
+    return server
+
+
+@router.get("/status", response_model = list[McpServerStatus])
+def list_mcp_server_status(
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+    no_credential: WithoutCredential = False,
+):
+    """What each saved local program's processes are doing: running, idle, stopped or failed. Empty for an API
+    key, a keyless caller or a managed account, none of which can run local programs (list_mcp_servers hides
+    those rows from them too)."""
+    if via_api_key or no_credential or not is_owner_context():
+        return []
+    return [
+        _status_response(row)
+        for row in mcp_servers_db.list_servers()
+        if is_stdio(row.get("url") or "")
+    ]
+
+
+@router.post("/{server_id}/restart", response_model = McpServerStatus)
+async def restart_mcp_server(
+    server_id: str,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+    no_credential: WithoutCredential = False,
+):
+    """End this server's processes and, for a shared one, start it again now and re-read its tools. A per-chat
+    server's processes start again in each chat on its next call."""
+    server = _local_program_or_error(server_id, via_api_key, no_credential, executes = True)
+    if not server.get("is_enabled"):
+        raise HTTPException(status_code = 400, detail = "Turn this server on before restarting it.")
+    await asyncio.to_thread(stop_server_processes, server)
+    clear_server_failure(server)
+    if _shares_process(server):
+        # After the stop: closing a process whose tools changed marks the list stale, and this re-read replaces it.
+        epoch = tools_cache_epoch(server_id)
+        try:
+            tools = await _list_shared_process_tools(server)
+        except Exception as exc:  # noqa: BLE001 - the failure is what the status reports
+            _log_probe_failure("mcp_servers.restart_failed", exc, server_id = server_id)
+            record_server_failure(server, exc)
+        else:
+            if _row_still_matches(server_id, server):
+                cache_tools(server_id, tools, epoch = epoch)
+    return _status_response(mcp_servers_db.get_server(server_id) or server)
+
+
+@router.post("/{server_id}/stop", response_model = McpServerStatus)
+async def stop_mcp_server(
+    server_id: str,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: ViaApiKey = False,
+    no_credential: WithoutCredential = False,
+):
+    """End this server's processes now (the shared one, or every chat's). Allowed while local programs are
+    suspended: stopping one starts nothing. The next call that needs it starts it again; switch the server off
+    to keep it stopped."""
+    server = _local_program_or_error(server_id, via_api_key, no_credential, executes = False)
+    await asyncio.to_thread(stop_server_processes, server)
+    clear_server_failure(server)
+    return _status_response(server)
 
 
 @router.post("/import", response_model = McpServerImportResult)
@@ -753,6 +914,8 @@ async def import_mcp_servers(
             is_enabled = entry.is_enabled,
             use_oauth = entry.use_oauth and not is_stdio(url),
             cwd = cwd,
+            # As in the app the config came from: one process per server.
+            process_mode = _new_process_mode(url, None),
         )
         seen_urls.add(url)
         created.append(_row_to_response(mcp_servers_db.get_server(server_id)))
@@ -917,6 +1080,8 @@ def _import_from_source(
         is_enabled = not reasons,
         use_oauth = entry.use_oauth and not is_stdio(url),
         cwd = cwd,
+        # As in the app it came from: one process per server.
+        process_mode = _new_process_mode(url, None),
     )
     if identity is not None:
         existing.add(identity)
@@ -988,7 +1153,24 @@ async def test_mcp_server(
         stored = mcp_servers_db.get_server(payload.server_id) or {}
         if stored.get("url") == url and stored.get("oauth_client_id") == client_id:
             client_secret = stored.get("oauth_client_secret")
+    # Testing the saved settings of a running shared server asks that process: a second copy could not open the
+    # serial port or session the first one holds, and would report a working server as broken.
+    running_as_saved = None
+    if payload.server_id and is_stdio(url):
+        stored = mcp_servers_db.get_server(payload.server_id)
+        if (
+            stored is not None
+            and stored.get("is_enabled")
+            and _shares_process(stored)
+            and stored["url"] == url
+            and parse_server_headers(stored) == headers
+            and (stored.get("cwd") or None) == cwd
+        ):
+            running_as_saved = stored
     try:
+        if running_as_saved is not None:
+            tools = await _list_shared_process_tools(running_as_saved)
+            return McpServerProbeResult(ok = True, tool_count = len(tools))
         tools = await list_tools_async(
             url = url,
             headers = headers,
@@ -1001,6 +1183,8 @@ async def test_mcp_server(
                 else {}
             ),
         )
+    except McpServerBusy as exc:
+        return McpServerProbeResult(ok = False, error = f"Could not test: {exc}")
     except Exception as exc:  # noqa: BLE001
         _log_probe_failure("mcp_servers.test_failed", exc)
         return McpServerProbeResult(ok = False, error = safe_curated_detail(exc))
@@ -1063,14 +1247,19 @@ async def _warm_tool_cache(server: dict) -> None:
             use_oauth = bool(server.get("use_oauth"))
             url = server["url"]
             try:
-                tools = await list_tools_async(
-                    url = url,
-                    headers = parse_server_headers(server),
-                    timeout = probe_timeout(url, use_oauth),
-                    use_oauth = use_oauth,
-                    **_cwd_kwargs(server),
-                    **oauth_client_kwargs(server),
-                )
+                if _shares_process(server):
+                    tools = await _list_shared_process_tools(server)
+                else:
+                    tools = await list_tools_async(
+                        url = url,
+                        headers = parse_server_headers(server),
+                        timeout = probe_timeout(url, use_oauth),
+                        use_oauth = use_oauth,
+                        **_cwd_kwargs(server),
+                        **oauth_client_kwargs(server),
+                    )
+            except McpServerBusy:
+                return  # not a failure: the next widget request asks again
             except Exception:  # noqa: BLE001 - a probe failure reads as "nothing declared"
                 tools = None
             # A row edited mid-probe: the old endpoint's answer must neither authorize a read nor be cached.
@@ -1083,17 +1272,25 @@ async def _warm_tool_cache(server: dict) -> None:
 
 
 def _ui_call_kwargs(server_id: str, server: dict, thread_id, session_id) -> dict:
-    from core.inference.tools import mcp_session_scope
+    from core.inference.tools import mcp_call_scope, mcp_session_scope
+
+    lifecycle = server_lifecycle(server)
     return {
         "url": server["url"],
         "headers": parse_server_headers(server),
         "timeout": _UI_TIMEOUT,
         "use_oauth": bool(server.get("use_oauth")),
         **oauth_client_kwargs(server),
-        # execute_tool's key (scope and working directory), so a widget reaches the chat's own stdio subprocess.
-        "scope": mcp_session_scope(session_id, thread_id),
+        # execute_tool's key (scope and working directory), so a widget reaches the process the chat's calls use:
+        # the server's shared one, or the chat's own.
+        "scope": mcp_call_scope(server, session_id, thread_id),
         **_cwd_kwargs(server),
         "config_check": lambda: _row_still_matches(server_id, server),
+        **(
+            {"lifecycle": lifecycle, "caller": mcp_session_scope(session_id, thread_id)}
+            if lifecycle is not None
+            else {}
+        ),
     }
 
 
@@ -1123,6 +1320,8 @@ async def read_mcp_ui_resource(
         contents = await asyncio.to_thread(
             read_resource_sync, uri = uri, **_ui_call_kwargs(server_id, server, thread_id, session_id)
         )
+    except McpServerBusy as exc:
+        raise HTTPException(status_code = 409, detail = f"MCP server: {exc}") from exc
     except Exception as exc:  # noqa: BLE001
         raise log_and_http_error(
             exc,
@@ -1186,6 +1385,9 @@ async def call_mcp_ui_tool(
             args = arguments,
             **_ui_call_kwargs(server_id, server, payload.thread_id, payload.session_id),
         )
+    except McpServerBusy as exc:
+        # The widget asks the user only on the exact "approval_required" detail; this one reads as an error.
+        raise HTTPException(status_code = 409, detail = f"MCP server: {exc}") from exc
     except Exception as exc:  # noqa: BLE001
         raise log_and_http_error(
             exc,

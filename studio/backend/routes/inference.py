@@ -6510,7 +6510,11 @@ async def _select_request_tools(
             apply_terminal_profile_for_request, tools, getattr(payload, "sandbox_level", None)
         )
     if mcp_allowed:
-        tools = tools + await get_enabled_mcp_tools()
+        # The chat's ids, so a per-chat MCP process that changed its tools offers this chat its own list.
+        tools = tools + await get_enabled_mcp_tools(
+            session_id = getattr(payload, "session_id", None),
+            thread_id = getattr(payload, "thread_id", None),
+        )
     # getattr: callers hand in lighter payload objects than the request models, not all of
     # which know this field.
     if getattr(payload, "deep_research_armed", None):

@@ -7,7 +7,13 @@ import {
   PlusSignIcon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
-import { ImportIcon, UploadIcon } from "lucide-react";
+import {
+  ImportIcon,
+  RotateCwIcon,
+  ScrollTextIcon,
+  SquareIcon,
+  UploadIcon,
+} from "lucide-react";
 import {
   type ChangeEvent,
   useCallback,
@@ -38,21 +44,35 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
+import { isAccountOwner } from "@/features/auth";
+import { useSettingsDialogStore } from "@/features/settings";
 import { subscribeToMcpServerMutationSettlements } from "./api/mcp-server-mutation-tracker";
 import {
   type McpCapabilities,
   type McpImageInputMapping,
+  type McpProcessMode,
   type McpServerConfig,
+  type McpServerStatus,
   createMcpServer,
   decodeMcpStdioCommand,
   deleteMcpServer,
   encodeMcpStdioCommand,
   getMcpCapabilities,
   importMcpServers,
+  listMcpServerStatus,
   listMcpServers,
   refreshMcpServerTools,
+  restartMcpServer,
+  stopMcpServer,
   testMcpServer,
   updateMcpServer,
 } from "./api/mcp-servers-api";
@@ -64,6 +84,15 @@ import {
 import { McpImageMappings } from "./mcp-image-mappings";
 import { McpImportFromApps } from "./mcp-import-from-apps";
 import { parseMcpConfigFile } from "./utils/mcp-config-file";
+import {
+  MCP_IDLE_TIMEOUT_OPTIONS,
+  MCP_PROCESS_MODE_OPTIONS,
+  defaultIdleTimeout,
+  idleTimeoutAfterModeChange,
+  mcpCanStop,
+  mcpStatusChip,
+  type McpStatusTone,
+} from "./utils/mcp-lifecycle";
 import { RefreshGlyph } from "@/lib/refresh-icon";
 
 type HeaderRow = { id: string; key: string; value: string };
@@ -84,6 +113,9 @@ type FormState = {
   oauthClientId: string;
   oauthClientSecret: string;
   imageInputMappings: McpImageInputMapping[];
+  // Local programs only: one process for every chat, or one per chat, and how long it may sit unused.
+  processMode: McpProcessMode;
+  idleTimeoutSeconds: number;
 };
 
 // What image-field discovery reads: it probes the SAVED server, so it waits for these to be saved. The
@@ -111,11 +143,125 @@ const EMPTY_FORM: FormState = {
   oauthClientId: "",
   oauthClientSecret: "",
   imageInputMappings: [],
+  // A new local program shares one process across chats, as in the apps servers are imported from.
+  processMode: "shared",
+  idleTimeoutSeconds: defaultIdleTimeout("shared"),
 };
 
 // What to send for the working directory: only a local program has one, and blank clears it.
 function cwdForTransport(form: FormState): string | null {
   return form.transport === "stdio" ? form.cwd.trim() || null : null;
+}
+
+// Only a local program has processes; an http(s) row keeps whatever it stored.
+function lifecyclePayload(form: FormState) {
+  return form.transport === "stdio"
+    ? {
+        processMode: form.processMode,
+        idleTimeoutSeconds: form.idleTimeoutSeconds,
+      }
+    : {};
+}
+
+const STATUS_POLL_MS = 3000;
+
+const STATUS_DOT: Record<McpStatusTone, string> = {
+  running: "bg-emerald-500",
+  idle: "bg-sky-500",
+  stopped: "bg-muted-foreground/50",
+  failed: "bg-destructive",
+};
+
+// A local program's process line in the list: state, what it is doing, and Restart / Stop / View log.
+function McpProcessStatusLine({
+  server,
+  status,
+  pending,
+  restartBlockedReason,
+  onRestart,
+  onStop,
+  onViewLog,
+}: {
+  server: McpServerConfig;
+  status: McpServerStatus;
+  pending: "restart" | "stop" | null;
+  restartBlockedReason: string | null;
+  onRestart: () => void;
+  onStop: () => void;
+  onViewLog: (() => void) | null;
+}) {
+  const chip = mcpStatusChip(status);
+  return (
+    <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+      <span
+        className="inline-flex shrink-0 items-center gap-1.5 font-medium"
+        data-mcp-status={chip.tone}
+      >
+        <span
+          aria-hidden="true"
+          className={`size-1.5 rounded-full ${STATUS_DOT[chip.tone]}`}
+        />
+        {chip.label}
+      </span>
+      <span
+        className={`min-w-0 flex-1 truncate ${chip.tone === "failed" ? "text-destructive" : "text-muted-foreground"}`}
+        title={chip.detail}
+      >
+        {chip.detail}
+      </span>
+      <span className="flex shrink-0 items-center">
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          onClick={onRestart}
+          disabled={pending !== null || restartBlockedReason !== null}
+          title={
+            restartBlockedReason ??
+            "End the server's processes and start it again"
+          }
+          aria-label={`Restart ${server.display_name}`}
+        >
+          {pending === "restart" ? (
+            <Spinner />
+          ) : (
+            <RotateCwIcon className="size-3" />
+          )}
+          Restart
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="xs"
+          onClick={onStop}
+          disabled={pending !== null || !mcpCanStop(status)}
+          title="End the server's processes now; a chat that uses it starts it again"
+          aria-label={`Stop ${server.display_name}`}
+        >
+          {pending === "stop" ? <Spinner /> : <SquareIcon className="size-3" />}
+          Stop
+        </Button>
+        {onViewLog && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            onClick={onViewLog}
+            disabled={!status.log_path}
+            title={
+              status.log_path
+                ? "Open this server's log in Settings > Logs"
+                : "No log yet: one is written when the program first starts"
+            }
+            aria-label={`View log for ${server.display_name}`}
+          >
+            <ScrollTextIcon className="size-3" />
+            View log
+          </Button>
+        )}
+      </span>
+    </div>
+  );
 }
 
 function newRowId(): string {
@@ -467,6 +613,14 @@ export function ChatMcpServersDialog({
   const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(() => new Set());
   const [confirmingDelete, setConfirmingDelete] =
     useState<McpServerConfig | null>(null);
+  // Local programs' process status by server id, polled while the list is showing.
+  const [statuses, setStatuses] = useState<
+    Readonly<Record<string, McpServerStatus>>
+  >({});
+  const [lifecyclePending, setLifecyclePending] = useState<
+    Readonly<Record<string, "restart" | "stop">>
+  >({});
+  const statusGenerationRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const formGenerationRef = useRef(0);
   const actionGenerationRef = useRef(0);
@@ -576,6 +730,32 @@ export function ChatMcpServersDialog({
     };
   }, [open, refresh]);
 
+  const refreshStatuses = useCallback(async () => {
+    const generation = statusGenerationRef.current + 1;
+    statusGenerationRef.current = generation;
+    try {
+      const rows = await listMcpServerStatus();
+      if (statusGenerationRef.current !== generation || !openRef.current)
+        return;
+      setStatuses(Object.fromEntries(rows.map((row) => [row.server_id, row])));
+    } catch {
+      // An older backend has no /status: the list just shows no process line.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open || view.kind !== "list") return;
+    const poll = () => void refreshStatuses();
+    // First read on the next tick, like the list's own open-time refresh, then every few seconds.
+    const first = window.setTimeout(poll, 0);
+    const timer = window.setInterval(poll, STATUS_POLL_MS);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(timer);
+      statusGenerationRef.current += 1;
+    };
+  }, [open, view.kind, refreshStatuses]);
+
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
@@ -640,6 +820,11 @@ export function ChatMcpServersDialog({
       oauthClientId: server.oauth_client_id ?? "",
       oauthClientSecret: "",
       imageInputMappings: server.image_input_mappings ?? [],
+      // A row saved before the setting existed runs per chat; the backend reports it so.
+      processMode: server.process_mode ?? "per_chat",
+      idleTimeoutSeconds:
+        server.idle_timeout_seconds ??
+        defaultIdleTimeout(server.process_mode ?? "per_chat"),
     };
 
     if (isHttpAddress(server.url)) {
@@ -854,6 +1039,7 @@ export function ChatMcpServersDialog({
           imageInputMappings: form.imageInputMappings,
           // Omitted for http: switching a row to a URL clears its working directory on the backend.
           cwd: stdio ? cwdForTransport(form) : undefined,
+          ...lifecyclePayload(form),
         });
         if (formGenerationRef.current !== generation) return;
         toast.success("MCP server updated");
@@ -865,6 +1051,7 @@ export function ChatMcpServersDialog({
           headers: headers,
           ...oauthPayload(form, stdio),
           cwd: cwdForTransport(form),
+          ...lifecyclePayload(form),
         });
         if (formGenerationRef.current !== generation) return;
         toast.success("MCP server added");
@@ -1065,6 +1252,47 @@ export function ChatMcpServersDialog({
     }
   }
 
+  async function manageProcess(
+    server: McpServerConfig,
+    action: "restart" | "stop",
+  ) {
+    if (lifecyclePending[server.id]) return;
+    const generation = actionGenerationRef.current;
+    setLifecyclePending((current) => ({ ...current, [server.id]: action }));
+    try {
+      const status = await (action === "restart"
+        ? restartMcpServer(server.id)
+        : stopMcpServer(server.id));
+      if (actionGenerationRef.current !== generation || !openRef.current)
+        return;
+      setStatuses((current) => ({ ...current, [server.id]: status }));
+      if (action === "restart" && status.state === "failed") {
+        toast.error(`"${server.display_name}" did not start`, {
+          description: status.last_error ?? undefined,
+        });
+      }
+    } catch (err) {
+      if (actionGenerationRef.current !== generation || !openRef.current)
+        return;
+      toast.error(action === "restart" ? "Restart failed" : "Stop failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setLifecyclePending((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(([id]) => id !== server.id),
+        ),
+      );
+    }
+  }
+
+  // The existing Settings > Logs action, on this server's MCP log source.
+  function viewServerLog(status: McpServerStatus) {
+    if (!status.log_path) return;
+    handleOpenChange(false);
+    useSettingsDialogStore.getState().openLogs("mcp", status.log_path);
+  }
+
   const showForm = view.kind !== "list";
   const formPending = importing || codecPending || testing || saving;
   // A local stdio command uses env vars, not headers or OAuth.
@@ -1225,6 +1453,79 @@ export function ChatMcpServersDialog({
                   Optional. The folder the program starts in, for servers that
                   read config or data files next to themselves. Must be the full
                   path to an existing folder.
+                </span>
+              </div>
+            )}
+
+            {addressIsCommand && (
+              <div className="grid gap-x-3 gap-y-2 sm:grid-cols-2">
+                <div className="grid gap-2">
+                  <Label htmlFor="mcp-process-mode">Processes</Label>
+                  <Select
+                    value={form.processMode}
+                    disabled={formPending}
+                    onValueChange={(next) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        processMode: next as McpProcessMode,
+                        idleTimeoutSeconds: idleTimeoutAfterModeChange(
+                          prev.processMode,
+                          next as McpProcessMode,
+                          prev.idleTimeoutSeconds,
+                        ),
+                      }))
+                    }
+                  >
+                    <SelectTrigger id="mcp-process-mode" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {MCP_PROCESS_MODE_OPTIONS.map((option) => (
+                        <SelectItem key={option.value} value={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="mcp-idle-timeout">Stop when unused for</Label>
+                  <Select
+                    value={String(form.idleTimeoutSeconds)}
+                    disabled={formPending}
+                    onValueChange={(next) =>
+                      setForm((prev) => ({
+                        ...prev,
+                        idleTimeoutSeconds: Number(next),
+                      }))
+                    }
+                  >
+                    <SelectTrigger id="mcp-idle-timeout" className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {MCP_IDLE_TIMEOUT_OPTIONS.map((option) => (
+                        <SelectItem
+                          key={option.value}
+                          value={String(option.value)}
+                        >
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <span className="text-xs text-muted-foreground sm:col-span-2">
+                  {
+                    MCP_PROCESS_MODE_OPTIONS.find(
+                      (option) => option.value === form.processMode,
+                    )?.hint
+                  }
+                  {view.kind === "edit" &&
+                    form.processMode !==
+                      (servers.find((s) => s.id === view.id)?.process_mode ??
+                        "per_chat") &&
+                    " Saving ends the processes running in the old mode."}
                 </span>
               </div>
             )}
@@ -1520,6 +1821,30 @@ export function ChatMcpServersDialog({
                       <div className="truncate text-xs text-muted-foreground">
                         {displayAddress(server.url)}
                       </div>
+                      {!isHttpAddress(server.url) && statuses[server.id] && (
+                        <McpProcessStatusLine
+                          server={server}
+                          status={statuses[server.id]}
+                          pending={lifecyclePending[server.id] ?? null}
+                          restartBlockedReason={
+                            stdioBlocked
+                              ? (capabilities?.stdio_disabled_reason ??
+                                "Local programs are turned off")
+                              : !server.is_enabled
+                                ? "Turn the server on to start it"
+                                : null
+                          }
+                          onRestart={() =>
+                            void manageProcess(server, "restart")
+                          }
+                          onStop={() => void manageProcess(server, "stop")}
+                          onViewLog={
+                            isAccountOwner()
+                              ? () => viewServerLog(statuses[server.id])
+                              : null
+                          }
+                        />
+                      )}
                     </div>
                     <div className="flex items-center gap-1">
                       <Switch

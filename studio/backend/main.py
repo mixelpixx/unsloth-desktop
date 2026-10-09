@@ -1028,6 +1028,23 @@ async def lifespan(app: FastAPI):
     if _chat_generation_supervisor is not None:
         await _chat_generation_supervisor.stop()
 
+    # After the chat supervisors, which may still be finishing a tool call: end every MCP process (a shared one can
+    # hold a serial port or SSH sessions) now, not at interpreter exit. Inline if the executor is already gone.
+    from core.inference.mcp_client import shutdown_mcp_sessions
+
+    try:
+        _mcp_close = asyncio.get_running_loop().run_in_executor(None, shutdown_mcp_sessions)
+    except RuntimeError:
+        try:
+            shutdown_mcp_sessions()
+        except Exception as exc:
+            _lifespan_log.warning("closing MCP servers failed at shutdown: %s", exc)
+    else:
+        try:
+            await _mcp_close
+        except Exception as exc:
+            _lifespan_log.warning("closing MCP servers failed at shutdown: %s", exc)
+
     from core.inference.llama_http import aclose as _close_llama_http
 
     await _close_llama_http()

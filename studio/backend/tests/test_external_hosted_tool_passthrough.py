@@ -396,7 +396,7 @@ def test_a_local_only_selection_takes_the_loop_on_a_hosted_provider(monkeypatch,
     # here held it to that. Default ``raising`` catches a future move.
     monkeypatch.setattr(
         "core.inference.tools.get_enabled_mcp_tools",
-        lambda: _noop_mcp(),
+        lambda **_chat: _noop_mcp(),
     )
     inf = _install(monkeypatch, "openai")
     with pytest.raises(LoopEntered):
@@ -439,7 +439,7 @@ def test_mcp_intent_with_no_tools_is_not_refused_for_a_prompt_it_can_never_show(
     through, so the check waits for the selected catalog."""
     monkeypatch.setattr(
         "core.inference.tools.get_enabled_mcp_tools",
-        lambda: _noop_mcp(),
+        lambda **_chat: _noop_mcp(),
     )
     inf = _install(monkeypatch, "openai")
     payload = _payload(mcp_enabled = True)
@@ -543,7 +543,7 @@ def test_b_external_tool_loop_receives_requested_nudge_setting(monkeypatch, nudg
     """The external Unsloth loop must receive the request-level nudge policy."""
     monkeypatch.setattr(
         "core.inference.tools.get_enabled_mcp_tools",
-        lambda: _noop_mcp(),
+        lambda **_chat: _noop_mcp(),
     )
     inf = _install(monkeypatch, "openai")
     payload = _payload(

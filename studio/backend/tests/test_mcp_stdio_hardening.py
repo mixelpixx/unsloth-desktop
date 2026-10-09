@@ -660,12 +660,33 @@ def test_test_and_refresh_probe_with_the_working_directory(tmp_path, monkeypatch
             McpServerTestRequest(url = "npx srv", cwd = str(tmp_path)), current_subject = "u"
         )
     )
+    # Per chat: refresh probes a one-shot copy, in the row's folder.
     created = asyncio.run(
         routes_mcp.create_mcp_server(
-            McpServerCreate(display_name = "s", url = "npx srv", cwd = str(tmp_path)), current_subject = "u"
+            McpServerCreate(
+                display_name = "s", url = "npx srv", cwd = str(tmp_path), process_mode = "per_chat"
+            ),
+            current_subject = "u",
         )
     )
     asyncio.run(routes_mcp.refresh_mcp_server_tools(created.id, current_subject = "u"))
+    assert probes == [str(tmp_path), str(tmp_path)]
+
+    # Shared (the default for a new local program): refresh asks the server's own process, started in that folder.
+    session_probes = []
+    monkeypatch.setattr(
+        routes_mcp,
+        "list_session_tools_sync",
+        lambda url, headers, **kwargs: session_probes.append(kwargs["cwd"]) or [],
+    )
+    shared = asyncio.run(
+        routes_mcp.create_mcp_server(
+            McpServerCreate(display_name = "t", url = "npx srv2", cwd = str(tmp_path)),
+            current_subject = "u",
+        )
+    )
+    asyncio.run(routes_mcp.refresh_mcp_server_tools(shared.id, current_subject = "u"))
+    assert session_probes == [str(tmp_path)]
     assert probes == [str(tmp_path), str(tmp_path)]
 
 

@@ -69,6 +69,7 @@ from core.inference.mcp_client import (
     MCP_TOOL_PREFIX,
     MCP_IMAGES_SENTINEL,
     TOOL_CACHE_INVALIDATING_FIELDS,
+    McpServerBusy,
     _session_log_id,
     cache_tools,
     call_tool_sync,
@@ -76,15 +77,23 @@ from core.inference.mcp_client import (
     in_failure_cooloff,
     is_studio_decisions,
     is_stdio,
+    list_session_tools_sync,
     list_tools_async,
     oauth_client_kwargs,
     parse_server_headers,
     parse_stdio_command,
     probe_timeout,
     record_probe_failure,
+    record_server_failure,
+    refresh_session_tools_sync,
+    server_lifecycle,
+    session_tool_overlay,
+    shared_session_scope,
     stdio_mcp_enabled,
     tool_ui_resource_uri,
     tool_visible_to,
+    tools_cache_epoch,
+    tools_cache_stale,
 )
 from storage import mcp_servers_db
 from utils.account_context import account_thread, current_account_id, is_owner_context
@@ -13813,7 +13822,136 @@ def cached_mcp_tools() -> tuple[list[dict], bool]:
     return _mcp_listing(listed), complete
 
 
-async def get_enabled_mcp_tools() -> list[dict]:
+# How long a chat send waits for a server's tool discovery before going ahead without that server's tools. The
+# discovery carries on in the background and caches its answer, so the next send has them: one slow or first-run
+# server (an `npx -y` download, a program that loads for a while) no longer holds every send for its whole timeout.
+_MCP_DISCOVERY_SEND_WAIT = 2.0
+# (account, server id, chat scope or "") -> (loop, row fingerprint, task): the discovery in flight, so the sends
+# that arrive while it runs wait on it instead of starting another probe. Per loop: a task cannot be awaited from
+# another one.
+_MCP_DISCOVERIES: dict = {}
+
+
+def _mcp_row_fingerprint(server: dict) -> tuple:
+    return tuple(server.get(k) for k in sorted(TOOL_CACHE_INVALIDATING_FIELDS))
+
+
+def _mcp_row_unchanged(server: dict) -> bool:
+    current = mcp_servers_db.get_server(server["id"])
+    return current is not None and _mcp_row_fingerprint(current) == _mcp_row_fingerprint(server)
+
+
+def _mcp_discovery(key: tuple, server: dict, start) -> "asyncio.Task":
+    loop = asyncio.get_running_loop()
+    fingerprint = _mcp_row_fingerprint(server)
+    running = _MCP_DISCOVERIES.get(key)
+    if running is not None:
+        task_loop, task_fingerprint, task = running
+        if task_loop is loop and task_fingerprint == fingerprint and not task.done():
+            return task
+    task = loop.create_task(start())
+    _MCP_DISCOVERIES[key] = (loop, fingerprint, task)
+
+    def _forget(done: "asyncio.Task") -> None:
+        if (_MCP_DISCOVERIES.get(key) or (None, None, None))[2] is done:
+            _MCP_DISCOVERIES.pop(key, None)
+
+    task.add_done_callback(_forget)
+    return task
+
+
+async def _discover_mcp_server(server: dict) -> None:
+    """Probe one server and cache what it lists. A shared local program is asked over its own long-lived process
+    (started here if it is not running yet, and then kept for the chat's calls); everything else keeps the
+    one-shot probe. Never raises: it may finish after the send that started it has moved on."""
+    use_oauth = bool(server.get("use_oauth"))
+    lifecycle = server_lifecycle(server)
+    epoch = tools_cache_epoch(server["id"])
+    try:
+        if lifecycle is not None and lifecycle.shared:
+            payload = await asyncio.to_thread(
+                list_session_tools_sync,
+                server["url"],
+                parse_server_headers(server),
+                scope = shared_session_scope(server["id"]),
+                timeout = probe_timeout(server["url"], False),
+                cwd = server.get("cwd"),
+                lifecycle = lifecycle,
+                config_check = lambda: _mcp_row_unchanged(server),
+            )
+        else:
+            payload = await list_tools_async(
+                url = server["url"],
+                headers = parse_server_headers(server),
+                timeout = probe_timeout(server["url"], use_oauth),
+                use_oauth = use_oauth,
+                **oauth_client_kwargs(server),
+                cwd = server.get("cwd"),
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        payload = exc
+    try:
+        # Keep this re-read on-loop so an edit cannot invalidate between it and the cache writes below. Drop a
+        # result for a changed or removed server.
+        fresh = {s["id"]: s for s in mcp_servers_db.list_servers()}.get(server["id"])
+        if fresh is None or any(
+            fresh.get(k) != server.get(k) for k in TOOL_CACHE_INVALIDATING_FIELDS
+        ):
+            return
+        if isinstance(payload, McpServerBusy):
+            # Another chat's call held the shared process the whole time: nothing is wrong with the server, so no
+            # cool-off; a stale list stays served and the next send asks again.
+            return
+        if isinstance(payload, BaseException):
+            # Never the raw address: a stdio command line can carry a token in its argv and an HTTP URL in its
+            # query string; the log id is the program/host plus a short digest.
+            logger.warning(
+                "MCP server '%s' (%s) discovery failed: %s",
+                server.get("display_name") or server["id"],
+                _session_log_id(server.get("url") or ""),
+                payload,
+            )
+            # Failures aren't cached, but record one so a down server isn't re-probed every send during the
+            # cool-off.
+            record_probe_failure(server["id"], bool(fresh.get("use_oauth")))
+            record_server_failure(server, payload)
+            return
+        cache_tools(server["id"], payload, epoch = epoch)
+    except Exception:  # noqa: BLE001
+        logger.exception("Caching MCP discovery for '%s' failed", server.get("id"))
+
+
+async def _relist_chat_process(server: dict, scope: str) -> None:
+    """A chat's own process announced new tools: re-read them over that process (never a new one)."""
+    try:
+        await asyncio.to_thread(
+            refresh_session_tools_sync,
+            server["url"],
+            parse_server_headers(server),
+            scope = scope,
+            timeout = probe_timeout(server["url"], False),
+            cwd = server.get("cwd"),
+            lifecycle = server_lifecycle(server),
+            config_check = lambda: _mcp_row_unchanged(server),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Re-reading the tools of MCP server '%s' (%s) for a chat failed: %s",
+            server.get("display_name") or server["id"],
+            _session_log_id(server.get("url") or ""),
+            exc,
+        )
+
+
+async def get_enabled_mcp_tools(
+    session_id: "str | None" = None, thread_id: "str | None" = None
+) -> list[dict]:
+    """The enabled MCP servers' tools for a send. ``session_id``/``thread_id`` name the chat, so a per-chat process
+    that announced a tool-list change offers that chat its own new list."""
     # Keep the SQLite-backed server list off the event loop.
     servers = await asyncio.to_thread(lambda: _enabled_mcp_servers(mcp_servers_db.list_servers()))
     # Never spawn stdio servers when stdio is disabled on this host.
@@ -13822,58 +13960,60 @@ async def get_enabled_mcp_tools() -> list[dict]:
     if not servers:
         return []
 
-    # Skip servers still in their post-failure cool-off, otherwise a down server gets re-probed, and blocks the send
-    # for the full timeout, on every message.
-    uncached = [
-        s for s in servers if get_cached_tools(s["id"]) is None and not in_failure_cooloff(s["id"])
+    account_id = current_account_id()
+    # Uncached, or listed before a shared process said its tools changed. Skip servers still in their post-failure
+    # cool-off, otherwise a down server gets re-probed on every message.
+    waits = [
+        _mcp_discovery((account_id, s["id"], ""), s, lambda s = s: _discover_mcp_server(s))
+        for s in servers
+        if (get_cached_tools(s["id"]) is None or tools_cache_stale(s["id"]))
+        and not in_failure_cooloff(s["id"])
     ]
-    if uncached:
-        results = await asyncio.gather(
-            *(
-                list_tools_async(
-                    url = s["url"],
-                    headers = parse_server_headers(s),
-                    timeout = probe_timeout(s["url"], bool(s.get("use_oauth"))),
-                    use_oauth = bool(s.get("use_oauth")),
-                    **oauth_client_kwargs(s),
-                    cwd = s.get("cwd"),
-                )
-                for s in uncached
-            ),
-            return_exceptions = True,
-        )
-        # Keep this re-read on-loop so an edit cannot invalidate between it and the cache writes below. Drop results
-        # for changed or removed servers.
-        current = {s["id"]: s for s in mcp_servers_db.list_servers()}
-        for server, payload in zip(uncached, results):
-            fresh = current.get(server["id"])
-            if fresh is None or any(
-                fresh.get(k) != server.get(k) for k in TOOL_CACHE_INVALIDATING_FIELDS
-            ):
+    chat_scope = mcp_session_scope(session_id, thread_id)
+    own_lists: dict[str, tuple] = {}
+    if chat_scope:
+        for server in servers:
+            lifecycle = server_lifecycle(server)
+            if lifecycle is None or lifecycle.shared:
                 continue
-            if isinstance(payload, BaseException):
-                # Never the raw address: a stdio command line can carry a token in its argv and an HTTP URL in
-                # its query string; the log id is the program/host plus a short digest.
-                logger.warning(
-                    "MCP server '%s' (%s) discovery failed: %s",
-                    server.get("display_name") or server["id"],
-                    _session_log_id(server.get("url") or ""),
-                    payload,
-                )
-                # Failures aren't cached, but record one so a down server isn't re-probed every send during the
-                # cool-off.
-                record_probe_failure(server["id"], bool(fresh.get("use_oauth")))
+            args = (server["url"], parse_server_headers(server), chat_scope, server.get("cwd"))
+            overlay = session_tool_overlay(*args)
+            if overlay is None:
                 continue
-            cache_tools(server["id"], payload)
+            own_lists[server["id"]] = args
+            if overlay[1]:
+                waits.append(
+                    _mcp_discovery(
+                        (account_id, server["id"], chat_scope),
+                        server,
+                        lambda s = server: _relist_chat_process(s, chat_scope),
+                    )
+                )
+    if waits:
+        # Not gather: a slow server must not hold the send. What finishes in time is used now, the rest next send.
+        await asyncio.wait(waits, timeout = _MCP_DISCOVERY_SEND_WAIT)
 
     listed: list[tuple[dict, list[dict], list[dict]]] = []
     for server in servers:
-        payload = get_cached_tools(server["id"])
+        payload = None
+        if server["id"] in own_lists:
+            overlay = session_tool_overlay(*own_lists[server["id"]])
+            payload = overlay[0] if overlay is not None else None
+        if payload is None:
+            payload = get_cached_tools(server["id"])
         if payload is None:
             continue
         payload = [public_tool(server, tool) for tool in payload]
         listed.append((server, payload, _mcp_specs_for_server(server, payload)))
     return _mcp_listing(listed)
+
+
+def mcp_call_scope(server: dict, session_id: "str | None", thread_id: "str | None") -> "str | None":
+    """The session a call to this server runs in: its one shared process, or the chat's own (mcp_session_scope)."""
+    lifecycle = server_lifecycle(server)
+    if lifecycle is not None and lifecycle.shared:
+        return shared_session_scope(lifecycle.server_id)
+    return mcp_session_scope(session_id, thread_id)
 
 
 def mcp_tool_definition(server_id: str, tool_name: str) -> "dict | None":
@@ -14108,7 +14248,10 @@ def execute_tool(
                     _mcp_tool_schema_text(display, tool),
                     0,
                 )
-        mcp_scope = mcp_session_scope(session_id, thread_id)
+        # A shared server's calls all go to its one process; the chat's own scope still names who is calling.
+        chat_scope = mcp_session_scope(session_id, thread_id)
+        lifecycle = server_lifecycle(server)
+        mcp_scope = mcp_call_scope(server, session_id, thread_id)
         headers = parse_server_headers(server)
         url = server["url"]
         use_oauth = bool(server.get("use_oauth"))
@@ -14180,6 +14323,7 @@ def execute_tool(
             config_check = _config_current,
             ui_resource_uri = tool_ui_resource_uri(mcp_tool_definition(server_id, tool_name)),
             cwd = cwd,
+            **({"lifecycle": lifecycle, "caller": chat_scope} if lifecycle is not None else {}),
         )
         if mcp_image is not None and isinstance(result, str):
             # Returned images may be resized copies of the user's; none of them reach the model on this call.

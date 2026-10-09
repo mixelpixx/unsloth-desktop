@@ -17,6 +17,9 @@ export type McpImageInputMapping = {
   encoding: "base64" | "data_url";
 };
 
+/** A local program's processes: one shared by every chat, or one per chat. HTTP servers ignore it. */
+export type McpProcessMode = "shared" | "per_chat";
+
 export interface McpServerConfig {
   id: string;
   builtin_id: string | null;
@@ -31,8 +34,31 @@ export interface McpServerConfig {
   has_oauth_client_secret?: boolean;
   image_input_mappings?: McpImageInputMapping[];
   image_mappings_active?: boolean;
+  // Optional: absent on a backend older than the lifecycle setting.
+  process_mode?: McpProcessMode;
+  /** Seconds a process may sit unused before it is stopped; 0 = never. */
+  idle_timeout_seconds?: number;
   created_at: string;
   updated_at: string;
+}
+
+/** What a local program's processes are doing now (GET /api/mcp/servers/status). */
+export interface McpServerStatus {
+  server_id: string;
+  state: "running" | "idle" | "stopped" | "failed";
+  process_mode: McpProcessMode;
+  idle_timeout_seconds: number;
+  processes: number;
+  started_at: number | null;
+  uptime_seconds: number | null;
+  idle_seconds: number | null;
+  stops_in_seconds: number | null;
+  busy_tool: string | null;
+  busy_seconds: number | null;
+  last_error: string | null;
+  last_error_at: number | null;
+  /** The program's stderr log, for Settings > Logs; null when it has never written one. */
+  log_path: string | null;
 }
 
 export interface McpServerProbeResult {
@@ -205,6 +231,9 @@ export function createMcpServer(payload: {
   oauthClientId?: string | null;
   oauthClientSecret?: string;
   imageInputMappings?: McpImageInputMapping[];
+  /** Local programs only; omit for the backend's default (shared). */
+  processMode?: McpProcessMode;
+  idleTimeoutSeconds?: number;
 }): Promise<McpServerConfig> {
   return trackMcpServerMutation(
     mcpRequest("/", {
@@ -219,6 +248,12 @@ export function createMcpServer(payload: {
         oauth_client_id: payload.oauthClientId ?? null,
         oauth_client_secret: payload.oauthClientSecret ?? null,
         image_input_mappings: payload.imageInputMappings ?? [],
+        ...(payload.processMode !== undefined
+          ? { process_mode: payload.processMode }
+          : {}),
+        ...(payload.idleTimeoutSeconds !== undefined
+          ? { idle_timeout_seconds: payload.idleTimeoutSeconds }
+          : {}),
       },
     }),
   );
@@ -239,6 +274,10 @@ export function updateMcpServer(
     /** omit to keep the stored secret */
     oauthClientSecret?: string;
     imageInputMappings?: McpImageInputMapping[];
+    /** A new mode ends the processes of the old one. */
+    processMode?: McpProcessMode;
+    /** A new idle timeout reaches a running process without restarting it. */
+    idleTimeoutSeconds?: number;
   },
 ): Promise<McpServerConfig> {
   const body: Record<string, unknown> = {};
@@ -255,9 +294,28 @@ export function updateMcpServer(
     body.oauth_client_secret = payload.oauthClientSecret;
   if (payload.imageInputMappings !== undefined)
     body.image_input_mappings = payload.imageInputMappings;
+  if (payload.processMode !== undefined)
+    body.process_mode = payload.processMode;
+  if (payload.idleTimeoutSeconds !== undefined)
+    body.idle_timeout_seconds = payload.idleTimeoutSeconds;
   return trackMcpServerMutation(
     mcpRequest(`/${serverId}`, { method: "PUT", body }),
   );
+}
+
+/** Every local program's process status. Empty for a caller that cannot run local programs. */
+export function listMcpServerStatus(): Promise<McpServerStatus[]> {
+  return mcpRequest<McpServerStatus[]>("/status");
+}
+
+/** End the server's processes; a shared one starts again at once and re-reads its tools. */
+export function restartMcpServer(serverId: string): Promise<McpServerStatus> {
+  return mcpRequest(`/${serverId}/restart`, { method: "POST" });
+}
+
+/** End the server's processes now; the next chat that needs it starts it again. */
+export function stopMcpServer(serverId: string): Promise<McpServerStatus> {
+  return mcpRequest(`/${serverId}/stop`, { method: "POST" });
 }
 
 export function deleteMcpServer(serverId: string): Promise<void> {

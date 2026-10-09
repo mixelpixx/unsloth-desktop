@@ -45,6 +45,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     ):
         if column not in cols:
             conn.execute(f"ALTER TABLE mcp_servers ADD COLUMN {column} TEXT")
+    # A local program's lifecycle. Rows saved before it existed keep "per_chat", the isolation they were configured
+    # under: switching them to one process shared by every chat would hand one conversation's server-side state (a
+    # signed-in browser, an open SSH session, a loaded toolset) to the next without the owner choosing that. The
+    # routes pick "shared" for servers created or imported from here on. idle_timeout_seconds NULL = the mode's
+    # default, 0 = never.
+    if "process_mode" not in cols:
+        conn.execute(
+            "ALTER TABLE mcp_servers ADD COLUMN process_mode TEXT NOT NULL DEFAULT 'per_chat'"
+        )
+    if "idle_timeout_seconds" not in cols:
+        conn.execute("ALTER TABLE mcp_servers ADD COLUMN idle_timeout_seconds INTEGER")
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS mcp_servers_builtin_id ON mcp_servers(builtin_id)"
     )
@@ -86,6 +97,8 @@ def create_server(
     oauth_client_id: Optional[str] = None,
     oauth_client_secret: Optional[str] = None,
     cwd: Optional[str] = None,
+    process_mode: str = "per_chat",
+    idle_timeout_seconds: Optional[int] = None,
 ) -> None:
     from core.inference.mcp_client import validate_mcp_address
 
@@ -98,8 +111,9 @@ def create_server(
             INSERT INTO mcp_servers
                 (id, display_name, url, headers_json,
                  is_enabled, use_oauth, created_at, updated_at, builtin_id, builtin_config_json,
-                 image_input_mappings_json, oauth_client_id, oauth_client_secret, cwd)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 image_input_mappings_json, oauth_client_id, oauth_client_secret, cwd,
+                 process_mode, idle_timeout_seconds)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 id,
@@ -116,6 +130,8 @@ def create_server(
                 oauth_client_id,
                 oauth_client_secret,
                 cwd,
+                process_mode,
+                idle_timeout_seconds,
             ),
         )
         conn.commit()

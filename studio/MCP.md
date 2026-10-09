@@ -22,6 +22,24 @@ with **Import config**. An entry's `cwd` is imported too.
 a config or data file next to themselves. It must be the full path to an existing folder.
 Left empty, the program starts in Unsloth's own working directory, as before.
 
+**Processes** decides how many copies of the program run. **Shared** (the default for a
+server you add or import) starts it once and every chat uses that one process, as Claude
+Desktop does: a server that holds a serial port, keeps SSH sessions open or loads toolsets
+keeps them between chats. Its calls run one at a time, and a call that waits more than a few
+seconds behind another chat's says the server is busy with another chat instead of hanging.
+**Per chat** gives each conversation its own process, so nothing one chat changes on the
+server reaches another. Servers added before this setting existed stay per chat until you
+change it. **Stop when unused for** (1 min, 5 min, 30 min, 2 h or Never; 30 min for shared,
+5 min per chat) ends a process nobody has used for that long; the next call starts it again.
+
+The server list shows each local program as Running, Idle, Stopped or Failed, with its uptime
+or last error, and offers **Restart**, **Stop** and **View log** (its log in Settings › Logs).
+When a server announces new tools (`notifications/tools/list_changed`, for example after
+loading a toolset), the next message re-reads them from the same process instead of starting
+another. A chat send waits at most about 2 seconds for a server that is slow to list its
+tools; it goes ahead without them and the next message has them. All of a server's processes
+end when Unsloth stops, including when it is closed abruptly on Windows.
+
 The program gets the environment variables you set, plus the system ones programs commonly
 need: `ProgramFiles`, `ProgramData`, `ComSpec`, `windir`, `TMP` and similar on Windows, and
 the proxy and certificate variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`,

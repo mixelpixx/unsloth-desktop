@@ -14,6 +14,11 @@ class McpImageInputMapping(BaseModel):
     encoding: Literal["base64", "data_url"] = "base64"
 
 
+# A local program's lifecycle (core.inference.mcp_client: PROCESS_MODES, IDLE_TIMEOUT_CHOICES). Seconds; 0 = never.
+McpProcessMode = Literal["shared", "per_chat"]
+McpIdleTimeout = Literal[60, 300, 1800, 7200, 0]
+
+
 class McpServerCreate(BaseModel):
     display_name: str
     url: str
@@ -25,6 +30,9 @@ class McpServerCreate(BaseModel):
     oauth_client_id: Optional[str] = None
     oauth_client_secret: Optional[str] = None
     image_input_mappings: list[McpImageInputMapping] = Field(default_factory = list, max_length = 64)
+    # Local programs only. None: "shared" for a local program; the idle timeout then defaults per mode.
+    process_mode: Optional[McpProcessMode] = None
+    idle_timeout_seconds: Optional[McpIdleTimeout] = None
 
 
 class McpServerUpdate(BaseModel):
@@ -39,6 +47,10 @@ class McpServerUpdate(BaseModel):
     oauth_client_id: Optional[str] = None
     oauth_client_secret: Optional[str] = None
     image_input_mappings: Optional[list[McpImageInputMapping]] = Field(None, max_length = 64)
+    # Absent = leave as-is. A new mode ends the processes of the old one; a new idle timeout reaches a running
+    # process on its next use.
+    process_mode: Optional[McpProcessMode] = None
+    idle_timeout_seconds: Optional[McpIdleTimeout] = None
 
 
 class McpServerResponse(BaseModel):
@@ -55,8 +67,33 @@ class McpServerResponse(BaseModel):
     image_input_mappings: list[McpImageInputMapping] = Field(default_factory = list)
     # False when no mapping matches a cached tool schema any more; true while the tools are unknown.
     image_mappings_active: bool = False
+    # Resolved: a row that never chose an idle timeout reports its mode's default. HTTP servers ignore both.
+    process_mode: McpProcessMode = "per_chat"
+    idle_timeout_seconds: int = 300
     created_at: str
     updated_at: str
+
+
+class McpServerStatus(BaseModel):
+    """A local program's processes now (core.inference.mcp_client.server_status)."""
+
+    server_id: str
+    state: Literal["running", "idle", "stopped", "failed"]
+    process_mode: McpProcessMode
+    idle_timeout_seconds: int
+    # Live processes: 0 or 1 when shared, one per chat with a process when per chat.
+    processes: int = 0
+    started_at: Optional[float] = None
+    uptime_seconds: Optional[float] = None
+    idle_seconds: Optional[float] = None
+    # Until the idle timeout stops it; None while busy, stopped, or set to never.
+    stops_in_seconds: Optional[float] = None
+    busy_tool: Optional[str] = None
+    busy_seconds: Optional[float] = None
+    last_error: Optional[str] = None
+    last_error_at: Optional[float] = None
+    # The program's stderr log, for Settings > Logs. Only the installation owner's UI session gets a local path.
+    log_path: Optional[str] = None
 
 
 class McpServerTestRequest(BaseModel):

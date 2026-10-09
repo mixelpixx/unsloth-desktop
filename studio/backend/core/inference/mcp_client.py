@@ -12,6 +12,7 @@ import importlib
 import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -28,9 +29,9 @@ from contextlib import asynccontextmanager, contextmanager, nullcontext
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
-from typing import Any, Optional, get_type_hints
+from typing import Any, NamedTuple, Optional, get_type_hints
 from urllib.parse import urlsplit, urlunsplit
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, ref as weak_ref
 
 from loggers import get_logger
 from utils.log_retention import prune_log_dir
@@ -1549,6 +1550,80 @@ def oauth_client_kwargs(row: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Per-server lifecycle of a local program
+#
+# "shared": one long-lived process serves every chat of the account, as in Claude Desktop. A server that holds a
+# serial port, keeps SSH sessions open or loads toolsets at runtime can only work this way: started once per chat, the
+# second copy cannot open the port and each chat sees its own toolsets. Calls stay serialized on its one stdio stream.
+# "per_chat": a process per conversation, the isolation every server had before this setting existed. HTTP servers
+# have no process and ignore both settings.
+# ---------------------------------------------------------------------------------------------------------------------
+
+PROCESS_MODE_SHARED = "shared"
+PROCESS_MODE_PER_CHAT = "per_chat"
+PROCESS_MODES = (PROCESS_MODE_SHARED, PROCESS_MODE_PER_CHAT)
+# Seconds a process may sit unused before it is stopped; 0 = never.
+IDLE_TIMEOUT_CHOICES = (60, 300, 1800, 7200, 0)
+# per_chat keeps the 300 s every chat process had before the setting existed.
+DEFAULT_IDLE_TIMEOUT = {PROCESS_MODE_SHARED: 1800, PROCESS_MODE_PER_CHAT: 300}
+# How long a call to a shared server waits behind another chat's call before it says so instead of waiting on.
+_SHARED_BUSY_GRACE = 10.0
+
+
+class McpLifecycle(NamedTuple):
+    """One saved local program's process settings. idle_ttl is math.inf for never."""
+
+    server_id: str
+    shared: bool
+    idle_ttl: float
+
+
+def server_process_mode(row: dict) -> str:
+    mode = row.get("process_mode")
+    return mode if mode in PROCESS_MODES else PROCESS_MODE_PER_CHAT
+
+
+def server_idle_timeout(row: dict) -> int:
+    """The row's idle timeout in seconds, 0 for never; a row that never chose one gets its mode's default."""
+    value = row.get("idle_timeout_seconds")
+    if isinstance(value, int) and not isinstance(value, bool) and value in IDLE_TIMEOUT_CHOICES:
+        return value
+    return DEFAULT_IDLE_TIMEOUT[server_process_mode(row)]
+
+
+def server_lifecycle(row: Optional[dict]) -> Optional[McpLifecycle]:
+    """How a saved local program's processes live, or None for anything without a process (HTTP, unsaved)."""
+    if not row or not row.get("id") or not is_stdio(row.get("url") or ""):
+        return None
+    idle = server_idle_timeout(row)
+    return McpLifecycle(
+        str(row["id"]),
+        server_process_mode(row) == PROCESS_MODE_SHARED,
+        math.inf if idle == 0 else float(idle),
+    )
+
+
+def shared_session_scope(server_id: str) -> str:
+    """The session scope of a shared server's one process. Chat scopes start "s=" and ephemeral ones "request-",
+    so this can collide with neither."""
+    return f"server={server_id}"
+
+
+class McpServerBusy(RuntimeError):
+    """A shared local program is running another chat's call. Calls on its one stdio stream stay serialized, so this
+    one would only wait; it reports instead of hanging silently."""
+
+    def __init__(self, tool: Optional[str], seconds: float):
+        self.tool = tool
+        self.seconds = seconds
+        running = f" (running '{tool}' for {int(seconds)}s)" if tool else ""
+        super().__init__(
+            f"the server is busy with another chat{running}. A shared server runs one call at a time; "
+            "try again when that call finishes."
+        )
+
+
 _SESSION_IDLE_TTL = 300.0
 _SESSION_REAP_INTERVAL = 30.0
 _STDIO_CONNECT_TIMEOUT = 60.0  # allows first-run `npx -y ...` package download
@@ -1756,6 +1831,34 @@ def _new_client(
     return _client(url, headers, use_oauth, cwd = cwd, **oauth)
 
 
+def _is_tool_list_changed(message: Any) -> bool:
+    root = getattr(message, "root", message)
+    return getattr(root, "method", None) == "notifications/tools/list_changed"
+
+
+def _watch_tool_list(client, session: "_McpSession") -> None:
+    """Route the server's notifications/tools/list_changed to ``session``, ahead of fastmcp's own handler. fastmcp
+    takes the handler at construction only and _client() builds clients for every path, so it is wrapped in place;
+    a client without that slot (a test double, a future fastmcp) simply never reports a change. The SDK awaits the
+    handler inside its read loop, so it only flips flags."""
+    kwargs = getattr(client, "_session_kwargs", None)
+    if not isinstance(kwargs, dict):
+        return
+    inner = kwargs.get("message_handler")
+    # Weak: the client is the session's, and must not keep a closed session alive.
+    owner = weak_ref(session)
+
+    async def handler(message) -> None:
+        if _is_tool_list_changed(message):
+            target = owner()
+            if target is not None:
+                target.note_tools_changed()
+        if inner is not None:
+            await inner(message)
+
+    kwargs["message_handler"] = handler
+
+
 class _McpSession:
     def __init__(
         self,
@@ -1763,6 +1866,7 @@ class _McpSession:
         headers: Optional[dict],
         use_oauth: bool = False,
         cwd: Optional[str] = None,
+        lifecycle: Optional[McpLifecycle] = None,
     ):
         # A cached session is built by _client(url, headers) with no auth, so an OAuth server must never reach here.
         # call_tool_sync already routes it to the one-shot path; this makes a future routing slip fail loudly rather
@@ -1791,6 +1895,21 @@ class _McpSession:
         # during the first one's probe would see no gap at all.
         self.proved_at = self.last_used
         self.in_flight = 0  # guarded by _mcp_sessions_lock
+        # The saved server this process belongs to, and how long it may idle (None: _SESSION_IDLE_TTL, read at reap
+        # time). A shared process is one per server, so it is left out of the per-account LRU cap.
+        self.server_id = lifecycle.server_id if lifecycle is not None else None
+        self.shared = bool(lifecycle is not None and lifecycle.shared)
+        self.idle_ttl: Optional[float] = lifecycle.idle_ttl if lifecycle is not None else None
+        self.started_at: Optional[float] = None  # wall clock, once connected
+        self.started_mono: Optional[float] = None
+        # (caller, tool, since) of the call holding call_lock, so a waiter can say what it is waiting behind.
+        self.call_holder: Optional[tuple[Optional[str], str, float]] = None
+        # notifications/tools/list_changed: bumped per notification. A shared process's change goes to the server's
+        # tool cache; a per-chat one's only to this chat, which re-reads the list over this session into `tools`.
+        self.tools_epoch = 0
+        self.tools_changed = False
+        self.tools_stale = False
+        self.tools: Optional[list[dict]] = None
         # On Windows a bare new_event_loop() can be a SelectorEventLoop (if any component set that policy), which
         # cannot spawn subprocesses natively; force a ProactorEventLoop so the stdio transport always works.
         if sys.platform == "win32":
@@ -1807,9 +1926,18 @@ class _McpSession:
         finally:
             self.loop.close()
 
+    def note_tools_changed(self) -> None:
+        """The server sent notifications/tools/list_changed on this session. Runs on the loop thread."""
+        self.tools_epoch += 1
+        self.tools_changed = True
+        self.tools_stale = True
+        if self.shared and self.server_id:
+            _mark_tools_stale(self.account_id, self.server_id)
+
     def connect(self, timeout: Optional[float], cancel_event) -> None:
         async def _open():
             client = _new_client(self.url, self.headers, cwd = self.cwd)
+            _watch_tool_list(client, self)
             launch = _stdio_launch_of(client)
             self.launch = launch
             if launch is None:
@@ -1819,6 +1947,8 @@ class _McpSession:
             # Publish on the loop thread with no await in between: if an abort races a just-completed connect, close()
             # still sees the client and __aexit__s it instead of orphaning the subprocess.
             self.client = client
+            self.started_at = time.time()
+            self.started_mono = time.monotonic()
             return client
 
         future = asyncio.run_coroutine_threadsafe(_open(), self.loop)
@@ -1923,6 +2053,10 @@ class _McpSession:
         thread = getattr(self, "_thread", None)
         if thread is not None:
             thread.join(timeout = 5.0)
+        if getattr(self, "shared", False) and getattr(self, "tools_changed", False) and self.server_id:
+            # The next process starts with its initial tool list, not the one this process changed into (a loaded
+            # toolset is gone with it), so the next send re-lists instead of offering tools nothing serves.
+            _mark_tools_stale(self.account_id, self.server_id)
 
 
 _mcp_sessions: dict[tuple, _McpSession] = {}
@@ -2053,6 +2187,10 @@ def _connect_slot(url: str, headers: Optional[dict], cwd: Optional[str] = None):
             _mcp_connects_in_flight -= 1
 
 
+class _NoLiveSession(Exception):
+    """A caller that must not start a process (spawn=False) found none running."""
+
+
 def _get_session(
     url: str,
     headers: Optional[dict],
@@ -2062,17 +2200,25 @@ def _get_session(
     config_check,
     use_oauth: bool = False,
     cwd: Optional[str] = None,
+    lifecycle: Optional[McpLifecycle] = None,
+    spawn: bool = True,
 ) -> tuple[_McpSession, float]:
     """``deadline`` is the caller's absolute monotonic budget (None = no limit): the key-lock wait
     and the connect share it, so a slow startup can't stack full timeout windows (see
     _call_session_tool). Returns the session and this borrower's idle gap (negative when we
-    connected it ourselves), which only the borrower may act on -- see _checkout_session."""
+    connected it ourselves), which only the borrower may act on -- see _checkout_session.
+    ``lifecycle`` binds the session to its saved server (an edited idle timeout reaches a running
+    process on its next use); ``spawn=False`` raises _NoLiveSession rather than start one."""
     global _mcp_reaper_started
     key = _session_key(url, headers, scope, cwd)
     with _mcp_sessions_lock:
         session, idle_for = _checkout_session(key)
         if session is not None:
+            if lifecycle is not None:
+                session.idle_ttl = lifecycle.idle_ttl
             return session, idle_for
+        if not spawn:
+            raise _NoLiveSession
         key_lock = _borrow_key_lock(key)
     try:
         # Poll the acquire with connect()'s deadline/cancel semantics: a second same-scope call must not block
@@ -2092,21 +2238,32 @@ def _get_session(
             with _mcp_sessions_lock:
                 session, idle_for = _checkout_session(key)
                 if session is not None:
+                    if lifecycle is not None:
+                        session.idle_ttl = lifecycle.idle_ttl
                     return session, idle_for
                 if key in _mcp_sessions:
                     stale = _mcp_sessions.pop(key)
             if stale is not None:
                 _retire_session(stale)
             with _connect_slot(url, headers, cwd) as generation:
-                session = _McpSession(url, headers, use_oauth, cwd)
+                session = (
+                    _McpSession(url, headers, use_oauth, cwd)
+                    if lifecycle is None
+                    else _McpSession(url, headers, use_oauth, cwd, lifecycle = lifecycle)
+                )
                 try:
                     session.connect(
                         None if deadline is None else max(0.0, deadline - time.monotonic()),
                         cancel_event,
                     )
-                except Exception:
+                except _MCPCancelled:
                     session.close()
                     raise
+                except Exception as exc:
+                    _record_server_error(url, headers, cwd, exc)
+                    session.close()
+                    raise
+                _clear_server_error(url, headers, cwd)
                 if config_check is not None:
                     try:
                         current = bool(config_check())
@@ -2156,10 +2313,13 @@ def _release_session(session: _McpSession, defer_close: bool = False) -> None:
         # reaper. Never evict the session we just used (its last_used is newest).
         # The cap is per account: finishing a call must not close a cached session of an account under its own limit.
         account_id = getattr(session, "account_id", None) or current_account_id()
+        # A shared process is one per saved server, already bounded, and holds the state shared mode exists to keep;
+        # it neither counts toward the cap nor is evicted by it.
         mine = {
             k: s
             for k, s in _mcp_sessions.items()
             if (k[3] if len(k) > 3 else OWNER_ACCOUNT_ID) == account_id
+            and not getattr(s, "shared", False)
         }
         while len(mine) > _MAX_SESSIONS:
             idle = [
@@ -2211,10 +2371,12 @@ def _evict_lru_locked() -> list:
     if len(_mcp_sessions) < _MAX_SESSIONS:
         return victims
     account_id = current_account_id()
+    # Shared processes are outside the cap, as in _release_session.
     candidates = {
         key: session
         for key, session in _mcp_sessions.items()
         if (key[3] if len(key) > 3 else OWNER_ACCOUNT_ID) == account_id
+        and not getattr(session, "shared", False)
     }
     while len(candidates) >= _MAX_SESSIONS:
         idle = [(s.last_used, k) for k, s in candidates.items() if s.in_flight == 0]
@@ -2416,13 +2578,38 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child = _reset_after_fork)
 
 
+def _session_idle_ttl(session) -> float:
+    ttl = getattr(session, "idle_ttl", None)
+    return _SESSION_IDLE_TTL if ttl is None else ttl
+
+
+def _stdio_suspended() -> bool:
+    """Local programs were allowed when these processes started and no longer are (Remote Access turned on, or
+    tools switched off). Every call is refused then anyway; a long-lived process must not keep running, holding a
+    serial port or an SSH session, behind a gate that is closed."""
+    if os.environ.get("UNSLOTH_STUDIO_ALLOW_STDIO_MCP") != "1":
+        return False
+    from utils.account_context import OWNER, run_as
+
+    try:
+        # As the owner: only the owner can run local programs, and the reaper thread binds no account.
+        return not run_as(OWNER, stdio_mcp_enabled)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _reap_idle_sessions(now: Optional[float] = None) -> None:
     now = time.monotonic() if now is None else now
+    suspended = _stdio_suspended()
     with _mcp_sessions_lock:
         expired = [
             key
             for key, session in _mcp_sessions.items()
-            if session.in_flight == 0 and now - session.last_used >= _SESSION_IDLE_TTL
+            if session.in_flight == 0
+            and (
+                now - session.last_used >= _session_idle_ttl(session)
+                or (suspended and is_stdio(session.url))
+            )
         ]
         sessions = [_mcp_sessions.pop(key) for key in expired]
         for key in expired:
@@ -2439,6 +2626,272 @@ def _session_reaper() -> None:
             _reap_idle_sessions()
         except Exception as exc:  # noqa: BLE001
             logger.debug("MCP session reaper iteration failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Lifecycle: status, stop, re-listing over a live process, shutdown
+# ---------------------------------------------------------------------------------------------------------------------
+
+_LIFECYCLE_ERROR_CHARS = 400
+# _cwd_close_key(url, headers, cwd) -> (wall time, message): how a configuration last failed to start or died, kept
+# until it next starts. Keyed by digest like the close generations, so no command or env value is held here.
+_server_errors: dict = {}
+
+
+def _lifecycle_error_text(url: str, headers: Optional[dict], exc: BaseException) -> str:
+    if isinstance(exc, McpStdioServerError):
+        text = exc.summary
+    elif isinstance(exc, _ConnectTimeout):
+        if exc.detail:
+            text = exc.detail.splitlines()[0]
+        else:
+            text = "Timed out while starting" + (
+                f" (after {exc.window:g}s)" if exc.window is not None else ""
+            )
+    elif isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        text = "Timed out"
+    else:
+        text = (str(exc).strip() or type(exc).__name__).splitlines()[0]
+    # The first line only, masked like the stderr log: an exception can quote the argv or an env value.
+    text = redact_log_text(mask_secret_values(text, mcp_secret_values(url, headers)))
+    return text[:_LIFECYCLE_ERROR_CHARS]
+
+
+def _record_server_error(url: str, headers: Optional[dict], cwd: Optional[str], exc) -> None:
+    if not is_stdio(url):
+        return
+    try:
+        message = _lifecycle_error_text(url, headers, exc)
+    except Exception:  # noqa: BLE001
+        message = type(exc).__name__
+    _server_errors[_cwd_close_key(url, headers, cwd)] = (time.time(), message)
+
+
+def _clear_server_error(url: str, headers: Optional[dict], cwd: Optional[str]) -> None:
+    _server_errors.pop(_cwd_close_key(url, headers, cwd), None)
+
+
+def record_server_failure(row: dict, exc: BaseException) -> None:
+    """A probe of this saved server failed; its status reports it until a process starts."""
+    _record_server_error(row.get("url") or "", parse_server_headers(row), row.get("cwd"), exc)
+
+
+def clear_server_failure(row: dict) -> None:
+    """The owner stopped or restarted the server: an earlier failure no longer describes it."""
+    _clear_server_error(row.get("url") or "", parse_server_headers(row), row.get("cwd"))
+
+
+def _server_sessions(url: str, headers: Optional[dict], cwd: Optional[str]) -> list:
+    """This account's live sessions of one configuration, any scope: a shared process, or each chat's own."""
+    hk = _headers_key(headers)
+    account_id = current_account_id()
+    with _mcp_sessions_lock:
+        return [
+            session
+            for key, session in _mcp_sessions.items()
+            if key[0] == url
+            and key[1] == hk
+            and _session_cwd(key) == (cwd or "")
+            and (key[3] if len(key) > 3 else OWNER_ACCOUNT_ID) == account_id
+            and not session.defunct
+            and not session.closed.is_set()
+        ]
+
+
+def _stdio_log_path(url: str) -> Optional[str]:
+    from utils.paths.storage_roots import studio_root
+
+    try:
+        parts = parse_stdio_command(url)
+        if not parts:
+            return None
+        path = Path(studio_root()) / "logs" / "mcp" / _stdio_log_name(url, parts[0])
+        return str(path) if path.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def server_status(row: dict) -> dict:
+    """What a saved local program is doing now. ``state``: running (a call is in flight), idle (up, waiting; stopped
+    after its idle timeout), stopped, or failed (its last start or its process failed; ``last_error`` says how).
+    Times are seconds; ``started_at``/``last_error_at`` are epoch seconds."""
+    url = row.get("url") or ""
+    headers = parse_server_headers(row)
+    cwd = row.get("cwd")
+    now = time.monotonic()
+    status: dict = {
+        "state": "stopped",
+        "processes": 0,
+        "started_at": None,
+        "uptime_seconds": None,
+        "idle_seconds": None,
+        "stops_in_seconds": None,
+        "busy_tool": None,
+        "busy_seconds": None,
+        "last_error": None,
+        "last_error_at": None,
+        "log_path": _stdio_log_path(url) if is_stdio(url) else None,
+    }
+    sessions = [s for s in _server_sessions(url, headers, cwd) if s.client is not None]
+    alive = []
+    for session in sessions:
+        if _transport_dead(session):
+            # Exited on its own: the next call reconnects, but until then this is what happened.
+            recorded = _server_errors.get(_cwd_close_key(url, headers, cwd))
+            if recorded is None or recorded[0] < (session.started_at or 0.0):
+                _record_server_error(
+                    url, headers, cwd, RuntimeError("The server process exited unexpectedly.")
+                )
+        else:
+            alive.append(session)
+    error = _server_errors.get(_cwd_close_key(url, headers, cwd))
+    if error is not None:
+        status["last_error_at"], status["last_error"] = error
+    if not alive:
+        status["state"] = "failed" if error is not None else "stopped"
+        return status
+    started = [s for s in alive if s.started_mono is not None]
+    if started:
+        oldest = min(started, key = lambda s: s.started_mono)
+        status["uptime_seconds"] = max(0.0, now - oldest.started_mono)
+        status["started_at"] = oldest.started_at
+    status["processes"] = len(alive)
+    holders = [s.call_holder for s in alive if s.call_holder is not None]
+    if holders or any(s.in_flight > 0 for s in alive):
+        status["state"] = "running"
+        if holders:
+            holder = min(holders, key = lambda h: h[2])
+            status["busy_tool"] = holder[1]
+            status["busy_seconds"] = max(0.0, now - holder[2])
+        return status
+    status["state"] = "idle"
+    latest = max(alive, key = lambda s: s.last_used)
+    idle = max(0.0, now - latest.last_used)
+    status["idle_seconds"] = idle
+    ttl = _session_idle_ttl(latest)
+    if math.isfinite(ttl):
+        status["stops_in_seconds"] = max(0.0, ttl - idle)
+    return status
+
+
+def retime_server_processes(row: dict) -> None:
+    """An edited idle timeout reaches this server's running processes now, not only on their next call."""
+    lifecycle = server_lifecycle(row)
+    if lifecycle is None:
+        return
+    for session in _server_sessions(row.get("url") or "", parse_server_headers(row), row.get("cwd")):
+        session.idle_ttl = lifecycle.idle_ttl
+
+
+def stop_server_processes(row: dict) -> int:
+    """End every process of this saved server (the shared one, or each chat's), now. The next call that needs it
+    starts it again. Returns how many were running."""
+    url = row.get("url") or ""
+    headers = parse_server_headers(row)
+    cwd = row.get("cwd")
+    running = len(_server_sessions(url, headers, cwd))
+    close_mcp_sessions(url, headers, cwd = cwd)
+    return running
+
+
+def list_session_tools_sync(
+    url: str,
+    headers: Optional[dict],
+    *,
+    scope: str,
+    timeout: Optional[float],
+    cwd: Optional[str] = None,
+    lifecycle: Optional[McpLifecycle] = None,
+    config_check = None,
+    spawn: bool = True,
+) -> list[dict]:
+    """tools/list over the cached session for ``scope`` -- a shared server's one process, or a chat's own -- starting
+    it unless ``spawn`` is False. Discovery for a shared server goes through here, so a stateful program is never
+    started a second time just to be asked for its tools, and the process it starts is the one the chat's calls
+    then use. Raises like list_tools_async (McpStdioServerError for an explained failed start)."""
+    try:
+        tools = _call_session_tool(
+            url,
+            headers,
+            "tools/list",
+            {},
+            timeout,
+            None,
+            scope,
+            config_check,
+            False,
+            cwd,
+            dispatch = lambda client: client.list_tools(),
+            lifecycle = lifecycle,
+            spawn = spawn,
+        )
+    except _ConnectTimeout as exc:
+        if exc.detail:
+            raise McpStdioServerError(exc.detail) from exc
+        raise
+    return [tool.model_dump(exclude_none = True) for tool in tools]
+
+
+def session_tool_overlay(
+    url: str, headers: Optional[dict], scope: Optional[str], cwd: Optional[str] = None
+) -> Optional[tuple[Optional[list[dict]], bool]]:
+    """A chat's own process that has announced a tool-list change: (its re-read tools, or None before the first
+    re-read; whether a re-read is due). None when the chat has no such process, so the server's cached list
+    applies. Per-chat mode only: a shared process's change goes to the server's cache instead."""
+    if not scope:
+        return None
+    with _mcp_sessions_lock:
+        session = _mcp_sessions.get(_session_key(url, headers, scope, cwd))
+    if session is None or session.defunct or session.closed.is_set() or session.client is None:
+        return None
+    if not getattr(session, "tools_changed", False):
+        return None
+    return session.tools, session.tools_stale
+
+
+def refresh_session_tools_sync(
+    url: str,
+    headers: Optional[dict],
+    *,
+    scope: str,
+    timeout: Optional[float],
+    cwd: Optional[str] = None,
+    lifecycle: Optional[McpLifecycle] = None,
+    config_check = None,
+) -> Optional[list[dict]]:
+    """Re-read a chat's own process's tools after it announced a change, over that same process; never starts one.
+    The list is kept on the session for session_tool_overlay. None when the process is gone."""
+    with _mcp_sessions_lock:
+        session = _mcp_sessions.get(_session_key(url, headers, scope, cwd))
+    if session is None:
+        return None
+    epoch = session.tools_epoch
+    try:
+        tools = list_session_tools_sync(
+            url,
+            headers,
+            scope = scope,
+            timeout = timeout,
+            cwd = cwd,
+            lifecycle = lifecycle,
+            config_check = config_check,
+            spawn = False,
+        )
+    except _NoLiveSession:
+        return None
+    if session.closed.is_set():
+        return None
+    session.tools = tools
+    if session.tools_epoch == epoch:
+        session.tools_stale = False
+    return tools
+
+
+def shutdown_mcp_sessions() -> None:
+    """Studio is stopping: end every MCP process, every account's, before the interpreter does. The atexit hook
+    does the same but runs late and not at all on some exits; on Windows a process that escapes both still dies
+    with Studio's kill-on-close job (utils.process_lifetime) and the SDK's per-child job."""
+    close_mcp_sessions(all_accounts = True)
 
 
 async def list_tools_async(
@@ -2502,9 +2955,10 @@ def serialize_mcp_server_mutation(handler):
 
 
 # MCP server fields whose change invalidates a server's discovered tools: the endpoint/auth used to probe it (url,
-# headers, oauth), where a local program runs (cwd: a server can expose different tools per project folder), or
-# whether it's used at all (is_enabled). A rename does not. The update route's eviction and get_enabled_mcp_tools'
-# mid-probe guard both key off this so they can't drift.
+# headers, oauth), where a local program runs (cwd: a server can expose different tools per project folder), whether
+# it's used at all (is_enabled), or which process answers (process_mode: a shared process and a chat's own can list
+# different tools, and the switch must end the processes of the old mode). A rename or a new idle timeout does not.
+# The update route's eviction and get_enabled_mcp_tools' mid-probe guard both key off this so they can't drift.
 TOOL_CACHE_INVALIDATING_FIELDS = frozenset(
     {
         "url",
@@ -2514,6 +2968,7 @@ TOOL_CACHE_INVALIDATING_FIELDS = frozenset(
         "oauth_client_secret",
         "is_enabled",
         "cwd",
+        "process_mode",
     }
 )
 
@@ -2522,9 +2977,46 @@ def get_cached_tools(server_id: str) -> Optional[list[dict]]:
     return _tool_cache.get(_account_key(server_id))
 
 
-def cache_tools(server_id: str, tools: list[dict]) -> None:
-    _tool_cache[_account_key(server_id)] = tools
-    _probe_cooloff_until.pop(_account_key(server_id), None)
+# notifications/tools/list_changed from a shared process. The list it replaces stays cached and served (a send that
+# cannot wait for the re-list is better off with the old tools than with none) but is marked stale, so the next send
+# re-lists it over that same process. The epoch counts notifications, so a re-list that raced one is cached still
+# stale rather than passed off as current.
+_tool_cache_stale: set = set()
+_tool_cache_epoch: dict = {}
+
+
+def _owner_key(account_id: str, server_id: str):
+    return server_id if account_id == OWNER_ACCOUNT_ID else (account_id, server_id)
+
+
+def _mark_tools_stale(account_id: str, server_id: str) -> None:
+    key = _owner_key(account_id, server_id)
+    _tool_cache_epoch[key] = _tool_cache_epoch.get(key, 0) + 1
+    if key in _tool_cache:
+        _tool_cache_stale.add(key)
+
+
+def mark_tools_stale(server_id: str) -> None:
+    _mark_tools_stale(current_account_id(), server_id)
+
+
+def tools_cache_stale(server_id: str) -> bool:
+    return _account_key(server_id) in _tool_cache_stale
+
+
+def tools_cache_epoch(server_id: str) -> int:
+    return _tool_cache_epoch.get(_account_key(server_id), 0)
+
+
+def cache_tools(server_id: str, tools: list[dict], epoch: Optional[int] = None) -> None:
+    """``epoch``: tools_cache_epoch() read before the probe began; a list_changed since leaves the entry stale."""
+    key = _account_key(server_id)
+    _tool_cache[key] = tools
+    _probe_cooloff_until.pop(key, None)
+    if epoch is not None and epoch != _tool_cache_epoch.get(key, 0):
+        _tool_cache_stale.add(key)
+    else:
+        _tool_cache_stale.discard(key)
 
 
 def record_probe_failure(server_id: str, use_oauth: bool = False) -> None:
@@ -2545,9 +3037,13 @@ def invalidate_tool_cache(server_id: Optional[str] = None) -> None:
                 owner = key[0] if isinstance(key, tuple) else OWNER_ACCOUNT_ID
                 if owner == account_id:
                     cache.pop(key, None)
+        for key in list(_tool_cache_stale):
+            if (key[0] if isinstance(key, tuple) else OWNER_ACCOUNT_ID) == account_id:
+                _tool_cache_stale.discard(key)
     else:
         _tool_cache.pop(_account_key(server_id), None)
         _probe_cooloff_until.pop(_account_key(server_id), None)
+        _tool_cache_stale.discard(_account_key(server_id))
 
 
 UI_RESOURCE_SCHEME = "ui://"
@@ -2956,7 +3452,13 @@ def _call_session_tool(
     use_oauth: bool = False,
     cwd: Optional[str] = None,
     dispatch = None,
+    lifecycle: Optional[McpLifecycle] = None,
+    caller: Optional[str] = None,
+    spawn: bool = True,
 ) -> Any:
+    """``caller`` names the chat a call on a shared process comes from, so a call queued behind another chat's
+    reports McpServerBusy after _SHARED_BUSY_GRACE instead of waiting out its whole budget in silence. Calls with
+    no caller (discovery, a restart) wait, and only say busy if their budget runs out behind a chat."""
     if cancel_event is not None and cancel_event.is_set():
         raise _MCPCancelled
     # One deadline covers the key-lock wait, connect, call-lock wait, and the call itself, matching the one-shot path
@@ -2984,8 +3486,21 @@ def _call_session_tool(
     # attempt 0 may find the cached session stale/dead *before* dispatch and reconnect once (safe); attempt 1 is a
     # freshly connected session.
     for attempt in (0, 1):
-        session, idle_for = _get_session(
-            url, headers, scope, deadline, cancel_event, config_check, use_oauth, cwd
+        session, idle_for = (
+            _get_session(url, headers, scope, deadline, cancel_event, config_check, use_oauth, cwd)
+            if lifecycle is None and spawn
+            else _get_session(
+                url,
+                headers,
+                scope,
+                deadline,
+                cancel_event,
+                config_check,
+                use_oauth,
+                cwd,
+                lifecycle = lifecycle,
+                spawn = spawn,
+            )
         )
         locked = False
         try:
@@ -2993,13 +3508,31 @@ def _call_session_tool(
             # interleave operations on one stateful stdio server (browser, REPL). HTTP multiplexes by request id, so
             # its calls run in parallel as they did one-shot.
             if session.serialize_calls:
+                queued_at = time.monotonic()
                 while not session.call_lock.acquire(timeout = 0.05):
                     if cancel_event is not None and cancel_event.is_set():
                         raise _MCPCancelled
+                    holder = session.call_holder
+                    # Behind another chat's call on a shared process: say so rather than hang.
+                    other_chat = (
+                        getattr(session, "shared", False)
+                        and holder is not None
+                        and holder[0] is not None
+                        and holder[0] != caller
+                    )
                     rem = _remaining()
                     if rem is not None and rem <= 0:
+                        if other_chat:
+                            raise McpServerBusy(holder[1], time.monotonic() - holder[2])
                         raise asyncio.TimeoutError
+                    if (
+                        other_chat
+                        and caller is not None
+                        and time.monotonic() - queued_at >= _SHARED_BUSY_GRACE
+                    ):
+                        raise McpServerBusy(holder[1], time.monotonic() - holder[2])
                 locked = True
+                session.call_holder = (caller, name, time.monotonic())
         except BaseException:
             # Never touched the transport: keep the session for its borrower.
             _release_session(session)
@@ -3094,6 +3627,8 @@ def _call_session_tool(
                 session.dirty = True
             elif not _is_tool_error(exc):
                 discard_session = True
+                # The process died or its stream broke: what the server's status shows until it starts again.
+                _record_server_error(url, headers, cwd, exc)
             raise
         finally:
             # Remove from the cache and mark defunct BEFORE giving up the borrow, so no other caller can check this
@@ -3105,6 +3640,7 @@ def _call_session_tool(
                 _drop_session(key, session)
             _release_session(session, defer_close = not ephemeral)
             if locked:
+                session.call_holder = None
                 session.call_lock.release()
         if not retry:
             break
@@ -3123,6 +3659,8 @@ def call_tool_sync(
     config_check = None,
     cwd: Optional[str] = None,
     ui_resource_uri: Optional[str] = None,
+    lifecycle: Optional[McpLifecycle] = None,
+    caller: Optional[str] = None,
     **oauth,
 ) -> str:
     """Call one MCP tool and return its flattened text/image result. Never raises: every failure comes
@@ -3140,6 +3678,8 @@ def call_tool_sync(
     in-flight call. ``config_check`` re-reads the server row so a call that raced an edit or delete
     cannot dispatch on the stale configuration. ``cwd`` is a local program's working directory
     (None: the backend's own). ``ui_resource_uri`` appends the frontend-only __MCP_UI__ envelope.
+    ``lifecycle`` (server_lifecycle of the row) binds the process to its saved server, and ``caller`` is the
+    chat's own scope when ``scope`` is a shared process's (see _call_session_tool).
     """
 
     async def _one_shot() -> Any:
@@ -3154,13 +3694,32 @@ def call_tool_sync(
 
     try:
         if is_stdio(url) or (scope and not use_oauth):
-            result = _call_session_tool(
-                url, headers, name, args, timeout, cancel_event, scope, config_check, use_oauth, cwd
+            result = (
+                _call_session_tool(
+                    url, headers, name, args, timeout, cancel_event, scope, config_check, use_oauth, cwd
+                )
+                if lifecycle is None and caller is None
+                else _call_session_tool(
+                    url,
+                    headers,
+                    name,
+                    args,
+                    timeout,
+                    cancel_event,
+                    scope,
+                    config_check,
+                    use_oauth,
+                    cwd,
+                    lifecycle = lifecycle,
+                    caller = caller,
+                )
             )
         else:
             result = asyncio.run(_race_tool_call(_one_shot(), timeout, cancel_event))
     except _MCPCancelled:
         return f"Error: MCP tool '{name}' cancelled"
+    except McpServerBusy as exc:
+        return f"Error: MCP tool '{name}' did not run: {exc}"
     except _ConnectTimeout as exc:
         if exc.detail:
             return f"Error: MCP tool '{name}' could not start its server: {exc.detail}"
@@ -3231,10 +3790,13 @@ def _ui_request_sync(
     scope = None,
     config_check = None,
     cwd = None,
+    lifecycle = None,
+    caller = None,
     **oauth,
 ) -> Any:
     """``dispatch(client)`` on the transport call_tool_sync would pick for this scope. ``cwd`` keys a local
-    program's session as call_tool_sync does, so a widget reaches the same process the chat's tool calls do."""
+    program's session as call_tool_sync does, so a widget reaches the same process the chat's tool calls do.
+    A shared process busy with another chat raises McpServerBusy."""
 
     async def _one_shot() -> Any:
         # As the session branch: an edit during discovery must not reach the old endpoint.
@@ -3257,7 +3819,11 @@ def _ui_request_sync(
     )
     try:
         if is_stdio(url) or (scope and not use_oauth):
-            return _call_session_tool(*session_args, dispatch = dispatch)
+            if lifecycle is None and caller is None:
+                return _call_session_tool(*session_args, dispatch = dispatch)
+            return _call_session_tool(
+                *session_args, dispatch = dispatch, lifecycle = lifecycle, caller = caller
+            )
         return asyncio.run(_race_tool_call(_one_shot(), timeout, cancel_event))
     except _MCPCancelled as exc:
         raise TimeoutError(f"{label} was cancelled") from exc
