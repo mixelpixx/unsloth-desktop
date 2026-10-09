@@ -1903,6 +1903,84 @@ def get_run_metrics(id: str) -> dict:
         conn.close()
 
 
+def get_run_metric_points(id: str) -> list[dict]:
+    """Per-step loss, eval loss and epoch, for pairing a run's checkpoints with the metrics logged near them."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT step, loss, eval_loss, epoch
+            FROM training_metrics
+            WHERE run_id = ?
+            ORDER BY step
+            """,
+            (id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def create_forked_run(
+    id: str,
+    *,
+    source_run_id: str,
+    model_name: str,
+    dataset_name: str,
+    config_json: str,
+    started_at: str,
+    total_steps: Optional[int],
+    final_step: int,
+    final_loss: Optional[float],
+    output_dir: str,
+    display_name: Optional[str],
+) -> None:
+    """A stopped run seeded from one checkpoint of ``source_run_id``, so the ordinary resume path can continue
+    it in its own folder. The source's metrics up to that step come along, so the fork's history starts where
+    the checkpoint does. One transaction: a half-made fork would be a resumable row with no history."""
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO training_runs (
+                id, status, model_name, dataset_name, config_json, started_at, ended_at,
+                total_steps, final_step, final_loss, output_dir, display_name
+            )
+            VALUES (?, 'stopped', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                id,
+                model_name,
+                dataset_name,
+                config_json,
+                started_at,
+                started_at,
+                total_steps,
+                final_step,
+                final_loss,
+                output_dir,
+                display_name,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO training_metrics
+                (run_id, step, loss, learning_rate, grad_norm, eval_loss, epoch, num_tokens, elapsed_seconds)
+            SELECT ?, step, loss, learning_rate, grad_norm, eval_loss, epoch, num_tokens, elapsed_seconds
+            FROM training_metrics
+            WHERE run_id = ? AND step <= ?
+            """,
+            (id, source_run_id, final_step),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def delete_run(id: str) -> None:
     conn = get_connection()
     try:

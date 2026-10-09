@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import Path as PathParam
 from loggers import get_logger
 
 from auth.authentication import (
@@ -19,6 +20,13 @@ from auth.authentication import (
     get_current_subject,
 )
 from core.training.resume import artifacts_present, can_resume_run
+from core.training.run_checkpoints import (
+    CheckpointActionError,
+    delete_run_checkpoint,
+    describe_run_checkpoints,
+    find_run_checkpoint,
+    fork_run_from_checkpoint,
+)
 from utils.training_runs import drop_non_finite
 from models import (
     TrainingRunDeleteResponse,
@@ -28,9 +36,15 @@ from models import (
     TrainingRunSummary,
     TrainingRunUpdateRequest,
 )
+from models.training import (
+    TrainingRunCheckpointDeleteResponse,
+    TrainingRunCheckpointForkResponse,
+    TrainingRunCheckpointsResponse,
+)
 from storage.studio_db import (
     delete_run,
     get_run,
+    get_run_metric_points,
     get_run_metrics,
     list_other_run_output_dirs,
     list_runs,
@@ -467,3 +481,114 @@ async def delete_training_run(
         artifacts_deleted = artifacts_deleted,
         artifacts_kept_reason = artifacts_kept_reason,
     )
+
+
+# Ids only: "final" or "checkpoint-<step>". The id is matched against what is on disk, never joined into a path.
+_CHECKPOINT_ID_PARAM = PathParam(..., max_length = 32, pattern = r"^(final|checkpoint-\d{1,12})$")
+
+
+def _checkpoint_run(run_id: str) -> dict:
+    # get_run reads the acting account's own database, so another account's run is simply not found.
+    run = get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code = 404, detail = f"Run {run_id} not found")
+    return run
+
+
+def _checkpoint_http_error(error: CheckpointActionError) -> HTTPException:
+    return HTTPException(
+        status_code = error.status_code,
+        detail = {"code": error.code, "message": error.message},
+    )
+
+
+@router.get("/runs/{run_id}/checkpoints", response_model = TrainingRunCheckpointsResponse)
+async def list_training_run_checkpoints(
+    run_id: str,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
+):
+    """A run's saved checkpoints with step, epoch, nearby losses, size, and how each could be resumed."""
+    run = _checkpoint_run(run_id)
+    metric_points = get_run_metric_points(run_id)
+    # Offloaded: sizes walk the folders and resume eligibility validates each checkpoint's state files.
+    listing = await asyncio.to_thread(describe_run_checkpoints, run, metric_points)
+    from hub.utils.host_paths import redact_host_paths
+
+    return redact_host_paths(
+        TrainingRunCheckpointsResponse(run_id = run_id, **listing),
+        via_api_key = via_api_key,
+    )
+
+
+@router.delete(
+    "/runs/{run_id}/checkpoints/{checkpoint_id}",
+    response_model = TrainingRunCheckpointDeleteResponse,
+)
+async def delete_training_run_checkpoint(
+    run_id: str,
+    checkpoint_id: str = _CHECKPOINT_ID_PARAM,
+    confirm_final: bool = Query(
+        False,
+        description = "Required to delete the run's final save rather than a numbered checkpoint",
+    ),
+    current_subject: str = Depends(get_current_subject),
+):
+    """Delete one checkpoint folder of a finished or stopped run."""
+    run = _checkpoint_run(run_id)
+    try:
+        result = await asyncio.to_thread(
+            delete_run_checkpoint, run, checkpoint_id, confirm_final = confirm_final
+        )
+    except CheckpointActionError as error:
+        raise _checkpoint_http_error(error) from None
+    return TrainingRunCheckpointDeleteResponse(**result)
+
+
+@router.post(
+    "/runs/{run_id}/checkpoints/{checkpoint_id}/fork",
+    response_model = TrainingRunCheckpointForkResponse,
+)
+async def fork_training_run_checkpoint(
+    run_id: str,
+    checkpoint_id: str = _CHECKPOINT_ID_PARAM,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Copy one checkpoint into a new run folder as a stopped run, which the normal resume then continues.
+    The source folder is never written, so its newer checkpoints survive."""
+    run = _checkpoint_run(run_id)
+    try:
+        result = await asyncio.to_thread(fork_run_from_checkpoint, run, checkpoint_id)
+    except CheckpointActionError as error:
+        raise _checkpoint_http_error(error) from None
+    return TrainingRunCheckpointForkResponse(**result)
+
+
+@router.post("/runs/{run_id}/checkpoints/{checkpoint_id}/reveal")
+async def reveal_training_run_checkpoint(
+    run_id: str,
+    checkpoint_id: str = _CHECKPOINT_ID_PARAM,
+    current_subject: str = Depends(get_current_subject),
+):
+    """Show a checkpoint's folder in the OS file manager. The backend host's, so the desktop app's."""
+    from hub.services.models import account_access
+    from utils.paths.file_manager import file_manager_kind
+    from utils.paths.path_utils import reveal_in_file_manager
+
+    account_access.require_installation_owner()
+    run = _checkpoint_run(run_id)
+    try:
+        _run_dir, entry = await asyncio.to_thread(find_run_checkpoint, run, checkpoint_id)
+    except CheckpointActionError as error:
+        raise _checkpoint_http_error(error) from None
+    # The UI hides the action on such a host; a direct call must not open a window nobody sees.
+    if file_manager_kind() is None:
+        raise HTTPException(status_code = 503, detail = "No file manager is available on this machine")
+    try:
+        await asyncio.to_thread(reveal_in_file_manager, entry.path, True)
+    except FileNotFoundError:
+        raise HTTPException(status_code = 404, detail = "Checkpoint folder not found")
+    except Exception:
+        logger.error("Failed to reveal checkpoint %s of run %s", checkpoint_id, run_id, exc_info = True)
+        raise HTTPException(status_code = 500, detail = "Failed to open file manager")
+    return {"status": "ok"}

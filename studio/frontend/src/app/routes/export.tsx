@@ -14,6 +14,9 @@ export type ExportSearch = {
   // Preselect a training run on the Export page (its output-dir basename, which
   // equals the checkpoint scan's model name). Set when arriving from a run view.
   run?: string;
+  // With `run`: preselect one of its checkpoints by the scan's display name
+  // ("checkpoint-500", or the run name for the run's own final save).
+  checkpoint?: string;
 };
 
 export const Route = createRoute({
@@ -23,6 +26,8 @@ export const Route = createRoute({
   beforeLoad: () => requireAuth(),
   validateSearch: (search: Record<string, unknown>): ExportSearch => ({
     run: typeof search.run === "string" ? search.run : undefined,
+    checkpoint:
+      typeof search.checkpoint === "string" ? search.checkpoint : undefined,
   }),
   component: ExportPage,
 });

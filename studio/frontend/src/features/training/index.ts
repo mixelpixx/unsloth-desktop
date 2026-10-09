@@ -74,8 +74,27 @@ export {
   getTrainingRun,
   deleteTrainingRun,
   renameTrainingRun,
+  listTrainingRunCheckpoints,
+  deleteTrainingRunCheckpoint,
+  forkTrainingRunCheckpoint,
+  revealTrainingRunCheckpoint,
   HistoryRequestError,
 } from "./api/history-api";
+export type {
+  TrainingRunCheckpoint,
+  TrainingRunCheckpointsResponse,
+} from "./types/checkpoints";
+export {
+  BEST_CHECKPOINT_LABEL_KEYS,
+  checkpointExportSearch,
+  checkpointResumeAction,
+  formatCheckpointEpoch,
+  formatCheckpointLoss,
+  formatCheckpointSavedAt,
+  forkedFromStep,
+  pickBestCheckpoint,
+  showRunCheckpoints,
+} from "./lib/run-checkpoints";
 export {
   onTrainingRunUpdated,
   onTrainingRunDeleted,

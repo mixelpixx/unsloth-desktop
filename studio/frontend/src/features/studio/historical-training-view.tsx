@@ -6,9 +6,11 @@ import { Spinner } from "@/components/ui/spinner";
 import {
   type TrainingRunDetailResponse,
   type TrainingViewData,
+  forkedFromStep,
   getTrainingRun,
   onTrainingRunUpdated,
   parseBackendTrainingMethod,
+  showRunCheckpoints,
   useTrainingActions,
 } from "@/features/training";
 import { translate, useT } from "@/i18n";
@@ -17,6 +19,7 @@ import { HugeiconsIcon } from "@hugeicons/react";
 import { type ReactElement, useEffect, useState } from "react";
 import { ChartsSection } from "./sections/charts-section";
 import { ProgressSection } from "./sections/progress-section";
+import { RunCheckpointsSection } from "./sections/run-checkpoints-section";
 import { mapRunConfigToOverride } from "./sections/run-config-override";
 
 type StudioT = ReturnType<typeof useT>;
@@ -198,9 +201,15 @@ export function HistoricalTrainingView({
 
   const viewData = mapToViewData(detail, t);
   const configOverride = mapRunConfigToOverride(detail.config);
+  const forkStep = forkedFromStep(detail.config);
 
   return (
     <div className="flex flex-col gap-6">
+      {forkStep !== null && (
+        <p className="text-xs text-muted-foreground">
+          {t("trainingRuns.forkedFrom", { step: forkStep })}
+        </p>
+      )}
       {detail.run.can_resume && (
         <div className="flex justify-end">
           <Button
@@ -240,6 +249,13 @@ export function HistoricalTrainingView({
         gradNormHistory={viewData.gradNormHistory}
         evalLossHistory={viewData.evalLossHistory}
       />
+      {showRunCheckpoints(detail.run.status, false) && (
+        <RunCheckpointsSection
+          runId={runId}
+          isDecision={viewData.isDecision}
+          onResumeStarted={onResumeStarted}
+        />
+      )}
     </div>
   );
 }

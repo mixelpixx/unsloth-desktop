@@ -350,24 +350,37 @@ export function ExportPage() {
   }, []);
 
   // Apply the ?run= deep link once its run appears in the checkpoint list: select the run and
-  // default to GGUF. The main checkpoint is auto-selected below, after the model-change effect.
-  const { run: preselectRun } = useSearch({ from: "/export" });
+  // default to GGUF. The main checkpoint is auto-selected below, after the model-change effect,
+  // unless ?checkpoint= names one of the run's checkpoints (from a run's Checkpoints table).
+  const { run: preselectRun, checkpoint: preselectCheckpoint } = useSearch({
+    from: "/export",
+  });
   const appliedRunRef = useRef<string | null>(null);
+  const pendingCheckpointRef = useRef<{ run: string; checkpoint: string } | null>(
+    null,
+  );
   useEffect(() => {
     if (!preselectRun) {
       // Deep link cleared (e.g. navigated to /export via the sidebar): stop preselecting that run.
       appliedRunRef.current = null;
+      pendingCheckpointRef.current = null;
       return;
     }
     if (models.length === 0) return;
-    if (appliedRunRef.current === preselectRun) return;
+    const linkKey = `${preselectRun}\n${preselectCheckpoint ?? ""}`;
+    if (appliedRunRef.current === linkKey) return;
     const match = models.find((m) => m.name === preselectRun);
     if (!match) return;
-    appliedRunRef.current = preselectRun;
+    appliedRunRef.current = linkKey;
+    pendingCheckpointRef.current = preselectCheckpoint
+      ? { run: match.name, checkpoint: preselectCheckpoint }
+      : null;
     setSourceMode("checkpoint");
     setSelectedModelIdx(match.name);
+    // Cleared so the default-checkpoint effect below runs even when this run was already selected.
+    setCheckpoint(null);
     setExportMethod("gguf");
-  }, [preselectRun, models]);
+  }, [preselectRun, preselectCheckpoint, models]);
 
   useEffect(() => {
     let cancelled = false;
@@ -622,7 +635,15 @@ export function ExportPage() {
   useEffect(() => {
     if (sourceMode !== "checkpoint") return;
     if (checkpoint != null || checkpointsForModel.length === 0) return;
-    setCheckpoint(checkpointsForModel[0].display_name);
+    const pending = pendingCheckpointRef.current;
+    let linked: string | null = null;
+    if (pending && pending.run === selectedModelIdx) {
+      pendingCheckpointRef.current = null;
+      if (checkpointsForModel.some((cp) => cp.display_name === pending.checkpoint)) {
+        linked = pending.checkpoint;
+      }
+    }
+    setCheckpoint(linked ?? checkpointsForModel[0].display_name);
   }, [sourceMode, selectedModelIdx, checkpoint, checkpointsForModel]);
 
   // Auto-reset export method if incompatible with the selected model type

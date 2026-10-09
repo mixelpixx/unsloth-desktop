@@ -940,6 +940,52 @@ class TrainingRunDeleteResponse(BaseModel):
     artifacts_kept_reason: Optional[Literal["shared_output_dir", "purge_failed"]] = None
 
 
+class TrainingRunCheckpoint(BaseModel):
+    """One saved checkpoint of a run: ``checkpoint-<step>``, or ``final`` for the run's own save."""
+
+    id: str
+    step: Optional[int] = None
+    epoch: Optional[float] = None
+    # The last training loss logged at or before the save, and the step it was logged at.
+    train_loss: Optional[float] = None
+    train_loss_step: Optional[int] = None
+    # Only an evaluation at the save step itself.
+    eval_loss: Optional[float] = None
+    saved_at: Optional[str] = None
+    size_bytes: Optional[int] = None
+    is_final: bool = False
+    is_adapter: bool = False
+    path: str
+    # in_place: the run's own resume continues from here. fork: a new run folder starts from a copy.
+    resume_mode: Optional[Literal["in_place", "fork"]] = None
+    resume_blocked_code: Optional[str] = None
+    resume_blocked_reason: Optional[str] = None
+
+
+class TrainingRunCheckpointsResponse(BaseModel):
+    run_id: str
+    # The output folder's name: the run name the checkpoint scan, and so the Export page, knows it by.
+    run_name: Optional[str] = None
+    checkpoints: List[TrainingRunCheckpoint] = Field(default_factory = list)
+    best_checkpoint_id: Optional[str] = None
+    best_basis: Optional[Literal["eval_loss", "train_loss"]] = None
+    total_size_bytes: Optional[int] = None
+
+
+class TrainingRunCheckpointDeleteResponse(BaseModel):
+    status: Literal["deleted"]
+    checkpoint_id: str
+    freed_bytes: Optional[int] = None
+
+
+class TrainingRunCheckpointForkResponse(BaseModel):
+    """The new stopped run that starts from the chosen checkpoint, ready for the ordinary resume."""
+
+    run_id: str
+    output_dir_name: str
+    step: int
+
+
 class DiffusionTrainingStartRequest(BaseModel):
     """Request to start a diffusion (SDXL) LoRA training job.
 

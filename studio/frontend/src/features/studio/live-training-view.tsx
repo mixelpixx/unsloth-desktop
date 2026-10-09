@@ -3,6 +3,7 @@
 
 import {
   getTrainingRun,
+  showRunCheckpoints,
   useTrainingConfigStore,
   useTrainingRuntimeStore,
 } from "@/features/training";
@@ -13,6 +14,7 @@ import { useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { ChartsSection } from "./sections/charts-section";
 import { ProgressSection } from "./sections/progress-section";
+import { RunCheckpointsSection } from "./sections/run-checkpoints-section";
 import {
   type RunConfigOverride,
   mapRunConfigToOverride,
@@ -205,6 +207,15 @@ export function LiveTrainingView(): ReactElement {
           gradNormHistory={viewData.gradNormHistory}
           evalLossHistory={viewData.evalLossHistory}
         />
+        {runtime.jobId &&
+          showRunCheckpoints(runtime.phase, runtime.isTrainingRunning) && (
+            // Keyed by phase, so a run that finishes or stops while this view is open is listed afresh.
+            <RunCheckpointsSection
+              key={`${runtime.jobId}:${runtime.phase}`}
+              runId={runtime.jobId}
+              isDecision={viewData.isDecision}
+            />
+          )}
       </div>
       {showOverlay ? (
         <TrainingStartOverlay
