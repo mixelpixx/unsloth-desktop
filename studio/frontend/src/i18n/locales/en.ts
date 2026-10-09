@@ -657,6 +657,64 @@ export const en = {
     search: "Search",
     shutdown: "Shutdown",
   },
+  // The GPU memory strip at the foot of the sidebar and the panel it opens
+  // (features/gpu-resources). Sizes arrive formatted, e.g. "10.3 GiB"; {index} is a GPU number.
+  resources: {
+    title: "Resources",
+    gpuFree: "GPU {index} · {free} free",
+    // Accessible name of the strip: {summary} is one gpuSummary per GPU, joined with "; ".
+    stripLabel: "GPU memory: {summary}. Show resources",
+    gpuSummary: "GPU {index}, {free} free of {total}",
+    barLabel:
+      "GPU {index}: Studio {studio}, other apps {other}, {free} free of {total}",
+    barLabelUnsplit: "GPU {index}: {used} in use, {free} free of {total}",
+    gpuHeading: "GPU {index}",
+    legendStudio: "Studio {size}",
+    legendOther: "Other apps {size}",
+    legendInUse: "In use {size}",
+    legendFree: "Free {free} of {total}",
+    estimated:
+      "Studio's share is estimated from its loaded models. Per-app memory is not available on this system.",
+    modelsHeading: "Loaded models",
+    noModels: "No models loaded",
+    otherAppsHeading: "Other apps",
+    kind: {
+      chat: "Chat",
+      audio: "Speech",
+      stt: "Dictation",
+      image: "Image",
+      video: "Video",
+      embedding: "Embedding",
+    },
+    model: {
+      gpus: "GPU {ids}",
+      cpu: "CPU",
+      layers: "{on}/{total} layers",
+      context: "{size} ctx",
+      vramApprox: "~{size} (approx.)",
+      loading: "Loading",
+      cached: "Cached",
+    },
+    ejectModel: "Eject {model}",
+    ejectAll: "Eject all",
+    toast: {
+      ejected: "Ejected {model}",
+      ejectedAll: "Ejected all models",
+      alreadyFree: "{model} was no longer loaded.",
+      replaced:
+        "{model} is no longer loaded. {resident} took its place and was left alone.",
+      stillResident:
+        "{model} was loaded again while ejecting, so it is still using memory.",
+      unverified:
+        "{model} was asked to unload, but its runtime did not confirm. Check again in a moment.",
+      failed: "Couldn't eject {model}.",
+    },
+    settings: {
+      showStrip: "Show resources in the sidebar",
+      showStripDescription:
+        "GPU memory bars at the bottom of the sidebar, with the loaded models and the other apps holding memory.",
+    },
+  },
   // The banner and notices of the connection monitor (lib/connection-monitor.ts).
   connection: {
     banner: {
@@ -3839,6 +3897,65 @@ export const en = {
     startAnywayDescription:
       "The memory estimate says this run won't fit ({verdict}). It will probably stop with an out-of-memory error.",
     startAnyway: "Start anyway",
+  },
+  // Training run checkpoints: the table on a finished or stopped run, and what each checkpoint can do.
+  trainingRuns: {
+    forkedFrom: "Started from the step {step} checkpoint of an earlier run.",
+    checkpoints: {
+      title: "Checkpoints",
+      description: "Saved checkpoints of this run",
+      summary: "{count} saved · {size} on disk",
+      summaryOne: "1 saved · {size} on disk",
+      loading: "Loading checkpoints…",
+      loadFailed: "Couldn't load checkpoints.",
+      retry: "Retry",
+      missing: "This run's files are no longer on disk.",
+      empty: "This run has no saved checkpoints. Set Save Steps before training to keep some along the way.",
+      colStep: "Step",
+      colEpoch: "Epoch",
+      colLoss: "Train loss",
+      colEvalLoss: "Eval loss",
+      colSaved: "Saved",
+      colSize: "Size",
+      colActions: "Actions",
+      final: "Final adapter",
+      finalModel: "Final model",
+      bestEval: "Best · lowest eval loss",
+      bestTrain: "Best · lowest training loss",
+      lossAtStep: "Logged at step {step}",
+      chat: "Chat",
+      chatUnavailableDecision: "Decision models can't be loaded in Chat",
+      export: "Export",
+      more: "More actions",
+      resume: "Resume from here",
+      resumeInPlaceHint: "Continues this run from its latest save.",
+      resumeForkHint: "Starts a new run from a copy, so later checkpoints stay as they are.",
+      forkSaved: "Checkpoint copied to a new run",
+      forkSavedDescription: "{name} is in History. Resume it from there when you're ready.",
+      forkFailed: "Couldn't start from this checkpoint",
+      copyPath: "Copy path",
+      pathCopied: "Path copied",
+      copyFailed: "Couldn't copy the path.",
+      revealFailed: "Couldn't open the folder",
+      delete: "Delete checkpoint",
+      deleteFinal: "Delete final adapter",
+      deleteTitle: "Delete the step {step} checkpoint?",
+      deleteDescription: "Its folder is removed from disk. The other checkpoints and the run's history stay.",
+      deleteFinalTitle: "Delete the final adapter?",
+      deleteFinalDescription:
+        "The run's finished adapter is removed from disk. Its checkpoints stay, but Chat, Export and share links will no longer find the finished model. This can't be undone.",
+      deleteFinalConfirm: "I understand the final adapter will be permanently deleted",
+      deleted: "Checkpoint deleted",
+      deleteFailed: "Couldn't delete the checkpoint",
+      blocked: {
+        noTrainerState: "No optimizer state was saved with this checkpoint, so training can't continue from it.",
+        finished: "Training already reached its last step here.",
+        s3Dataset: "Runs that read an S3 dataset can't be resumed.",
+        provenance: "The exact model or dataset this run used is no longer available.",
+        runActive: "Stop the run first.",
+        trainingActive: "Another training run is in progress.",
+      },
+    },
   },
   skills: {
     title: "Skills",
